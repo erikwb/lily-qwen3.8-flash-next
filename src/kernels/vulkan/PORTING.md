@@ -101,7 +101,10 @@ one beside its `.metal` before starting.
   `fast::`/`precise::` functions are the plain GLSL ones; `rsqrt` is
   `inversesqrt`; `INFINITY` is `1.0 / 0.0`; `fma`, `exp`, `log`, `tanh`,
   `clamp`, `select` (`mix` with a bool) exist. Do not write a `half`
-  through `packHalf2x16` or `float16_t(f)`: both truncate on this driver.
+  through `packHalf2x16`: it truncates on this driver. `float16_t(f)` rounds
+  when it is stored, but the compiler folds `float(float16_t(f))` of a
+  register value to `f`, unrounded: where a kernel needs the rounded value
+  back, round in integer math (attention_common.glsl).
   `precise` does not reach `exp` and the other extended instructions.
 - **Params are loads.** `arg(i)` is a push constant, read once per
   dispatch; `arg_u32(i)` loads through it unless the param came by value:

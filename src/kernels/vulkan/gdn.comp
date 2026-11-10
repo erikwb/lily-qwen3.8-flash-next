@@ -1,0 +1,749 @@
+#version 460
+// The kernels of src/kernels/metal/gdn.metal: the Gated DeltaNet recurrence
+// (decode step, token-serial prefill scan, chunked prefill scan on the
+// matrix units), the causal depthwise conv1d and the gated RMSNorm. The
+// comments there say why each is as it is; this is the same arithmetic in
+// the same order, and a comment here marks where the port differs.
+#include "common.glsl"
+#ifdef KERNEL_gdn_step_gated
+#define GDN_STEP_BODY
+#endif
+#include "gdn_common.glsl"
+
+// Output-gate activation of the gated norms: 0 = SiLU, 1 = sigmoid.
+#define GDN_GATE_SIGMOID 1u
+
+#if defined(KERNEL_gdn_step_gated) || defined(KERNEL_gated_rmsnorm_bf16)
+float gate_activation(float gate, uint gate_act) {
+    float sig = 1.0 / (1.0 + exp(-gate));
+    return gate_act == GDN_GATE_SIGMOID ? sig : gate * sig;
+}
+#endif
+
+// One GDN decode step per value head with the gated RMSNorm of its output;
+// one threadgroup of DIM threads per head.
+#ifdef KERNEL_gdn_step_gated
+shared bfloat16_t raw[DIM];
+shared float norm_part[DIM / 32];
+shared float inv_rms;
+void main() {
+    float scale = arg_f32(11), eps = arg_f32(13);
+    uint vpk = arg_u32(12), gate_act = arg_u32(14);
+    uint h = threadgroup_position_in_grid.x, tid = thread_index_in_threadgroup;
+    uint sg = simdgroup_index_in_threadgroup, lane = thread_index_in_simdgroup;
+    float o = gdn_step_body(BF16(arg(0)), BF16(arg(1)), BF16(arg(2)), BF16(arg(3)), BF16(arg(4)),
+                            F32(arg(5)), BF16(arg(6)), arg(7), scale, vpk, h, tid, sg, lane);
+    raw[tid] = bfloat16_t(o);
+    barrier();
+    float rv = float(raw[tid]);
+    float ss = subgroupAdd(rv * rv);
+    if (lane == 0) norm_part[sg] = ss;
+    barrier();
+    if (tid == 0) {
+        float total = 0.0;
+        for (uint i = 0; i < DIM / 32; ++i) total += norm_part[i];
+        inv_rms = inversesqrt(total / float(DIM) + eps);
+    }
+    barrier();
+    float gate = float(BF16(arg(8)).v[h * DIM + tid]);
+    float act = gate_activation(gate, gate_act);
+    BF16(arg(10)).v[h * DIM + tid] = bfloat16_t(F32(arg(9)).v[tid] * rv * inv_rms * act);
+}
+#endif
+
+// Normalizes q/k rows for the register scan.
+#ifdef KERNEL_gdn_qk_l2norm
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    float scale = arg_f32(2);
+    uint HK = arg_u32(3), H = arg_u32(4);
+    uint hk = thread_position_in_grid.y, lane = thread_index_in_simdgroup;
+    BF16 row = BF16(arg(0) + 2 * (uint64_t(thread_position_in_grid.z) * ((2 * HK + H) * DIM)));
+    BF16 out_row = BF16(arg(1) + 2 * (uint64_t(thread_position_in_grid.z) * (2 * HK * DIM)));
+    float qv[DIM / 32], kv[DIM / 32];
+    float sq = 0.0, sk = 0.0;
+    for (uint i = 0; i < DIM / 32; ++i) {
+        uint d = lane + 32 * i;
+        qv[i] = float(row.v[hk * DIM + d]);
+        kv[i] = float(row.v[(HK + hk) * DIM + d]);
+        sq += qv[i] * qv[i];
+        sk += kv[i] * kv[i];
+    }
+    float inv_q = 1.0 / max(sqrt(subgroupAdd(sq)), 1e-12);
+    float inv_k = 1.0 / max(sqrt(subgroupAdd(sk)), 1e-12);
+    for (uint i = 0; i < DIM / 32; ++i) {
+        uint d = lane + 32 * i;
+        out_row.v[hk * DIM + d] = bfloat16_t(qv[i] * inv_q * scale);
+        out_row.v[(HK + hk) * DIM + d] = bfloat16_t(kv[i] * inv_k);
+    }
+}
+#endif
+
+// Computes FP32 decay and beta gates.
+#ifdef KERNEL_gdn_gates
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    BF16 a = BF16(arg(0)), b = BF16(arg(1)), dt_bias = BF16(arg(3));
+    F32 a_log = F32(arg(2));
+    uint H = arg_u32(6), gid = thread_position_in_grid.x;
+    uint h = gid % H;
+    float x = float(a.v[gid]) + float(dt_bias.v[h]);
+    float softplus = x > 20.0 ? x : log(1.0 + exp(x));
+    F32(arg(4)).v[gid] = exp(-exp(a_log.v[h]) * softplus);
+    F32(arg(5)).v[gid] = 1.0 / (1.0 + exp(-float(b.v[gid])));
+}
+#endif
+
+// Register-resident prefill scan over tokens: a subgroup owns CS value
+// columns of one head's state (four in the shipped scan, two and one in the
+// comparison kernels), each lane NK rows of them. The Metal kernels hold a
+// column in scalars; here the lane's NK k and q values, and its CS columns
+// of a row, are one vector each, loaded and stored whole, with the Metal
+// arithmetic per column in its order.
+#if defined(KERNEL_gdn_prefill_regscan) || defined(KERNEL_gdn_prefill_regscan_c2) || defined(KERNEL_gdn_prefill_regscan_c1)
+#if defined(KERNEL_gdn_prefill_regscan)
+#define CS 4
+#define COLS vec4
+#define COLS_TO_BF(o) bf16(o)
+#define COLS_BF16 BF16x4
+#define COLS_F32 F32x4
+#elif defined(KERNEL_gdn_prefill_regscan_c2)
+layout(buffer_reference, scalar, buffer_reference_align = 4) buffer F32x2 { vec2 v[]; };
+#define CS 2
+#define COLS vec2
+#define COLS_TO_BF(o) bf16vec2(bf16(o.x), bf16(o.y))
+#define COLS_BF16 BF16x2
+#define COLS_F32 F32x2
+#else
+#define CS 1
+#define COLS float
+#define COLS_TO_BF(o) bf16(o)
+#define COLS_BF16 BF16
+#define COLS_F32 F32
+#endif
+void main() {
+    const uint NK = DIM / 32;  // state rows per lane
+    F32 decay = F32(arg(2)), beta = F32(arg(3));
+    uint M = arg_u32(7), H = arg_u32(8), vpk = arg_u32(9), mid_count = arg_u32(10);
+    uint h = threadgroup_position_in_grid.x, lane = thread_index_in_simdgroup;
+    uint dv = (threadgroup_position_in_grid.y * 4 + simdgroup_index_in_threadgroup) * CS;
+    uint HK = H / vpk, hk = h / vpk;
+    uint C = (2 * HK + H) * DIM;
+
+    // The lane's rows of its columns: row i of them is vector i * (DIM / CS).
+    uint64_t cell = 4 * ((uint64_t(h) * DIM + NK * lane) * DIM + dv);
+    COLS_F32 st = COLS_F32(arg(4) + cell);
+    COLS s[NK];
+    for (uint i = 0; i < NK; ++i) s[i] = st.v[i * (DIM / CS)];
+
+    // The token's operands, a row further every token.
+    uint64_t q_row = arg(1) + 2 * (hk * DIM + NK * lane);
+    uint64_t k_row = q_row + 2 * (HK * DIM);
+    uint64_t v_row = arg(0) + 2 * ((2 * HK + h) * DIM + dv);
+    uint64_t o_row = arg(5) + 2 * (h * DIM + dv);
+    uint64_t qk_step = 2 * uint64_t(2 * HK * DIM), v_step = 2 * uint64_t(C), o_step = 2 * uint64_t(H * DIM);
+    for (uint t = 0; t < M; ++t) {
+        vec4 kh = vec4(BF16x4(k_row).v[0]);
+        vec4 qh = vec4(BF16x4(q_row).v[0]);
+        float g = decay.v[t * H + h];
+        float b = beta.v[t * H + h];
+        COLS v = COLS(COLS_BF16(v_row).v[0]);
+        COLS kv = COLS(0.0);
+        for (uint i = 0; i < NK; ++i) {
+            s[i] *= g;
+            kv += kh[i] * s[i];
+        }
+        COLS v_new = (v - subgroupAdd(kv)) * b;
+        COLS o = COLS(0.0);
+        for (uint i = 0; i < NK; ++i) {
+            s[i] += kh[i] * v_new;
+            o += qh[i] * s[i];
+        }
+        o = subgroupAdd(o);
+        if (lane == 0) COLS_BF16(o_row).v[0] = COLS_TO_BF(o);
+        if (t < mid_count) {
+            COLS_F32 md = COLS_F32(arg(6) + 4 * (uint64_t(t) * H * (DIM * DIM)) + cell);
+            for (uint i = 0; i < NK; ++i) md.v[i * (DIM / CS)] = s[i];
+        }
+        q_row += qk_step;
+        k_row += qk_step;
+        v_row += v_step;
+        o_row += o_step;
+    }
+    for (uint i = 0; i < NK; ++i) st.v[i * (DIM / CS)] = s[i];
+}
+#endif
+
+// Causal depthwise conv1d + SiLU; window stores KD-1 inputs oldest first.
+#ifdef KERNEL_conv1d_step_bf16
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    BF16 window = BF16(arg(0)), x = BF16(arg(1)), w = BF16(arg(2)), dst = BF16(arg(3));
+    uint C = arg_u32(4), KD = arg_u32(5), c = thread_position_in_grid.x;
+    uint taps = KD - 1;
+    float acc = 0.0;
+    for (uint t = 0; t < taps; ++t) acc += float(window.v[c * taps + t]) * float(w.v[t * C + c]);
+    float xc = float(x.v[c]);
+    acc += xc * float(w.v[taps * C + c]);
+    dst.v[c] = bfloat16_t(acc / (1.0 + exp(-acc)));
+    for (uint t = 0; t + 1 < taps; ++t) window.v[c * taps + t] = window.v[c * taps + t + 1];
+    window.v[c * taps + taps - 1] = bfloat16_t(xc);  // exact: a bf16 value
+}
+#endif
+
+// Rewinds a conv window: `win_out` becomes the window after only the first
+// `n` rows of `x` followed `win_in`.
+#ifdef KERNEL_conv_window_rollback_bf16
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    BF16 win_in = BF16(arg(0)), win_out = BF16(arg(2));
+    uint C = arg_u32(3), S = arg_u32(4), n = arg_u32(5), c = thread_position_in_grid.x;
+    for (uint s = 0; s < S; ++s) {
+        uint i = n + s;  // index into win_in ++ x[0..n]
+        bfloat16_t value;
+        if (i < S) value = win_in.v[c * S + i];
+        else value = BF16(arg(1) + 2 * (uint64_t(i - S) * C)).v[c];
+        win_out.v[c * S + s] = value;
+    }
+}
+#endif
+
+// Tiled conv1d prefill; separate input/output windows avoid races.
+#ifdef KERNEL_conv1d_prefill_bf16
+#define CONV_TILE 64  // must match CONV1D_PREFILL_TILE in kernels/gdn.rs
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    BF16 win_in = BF16(arg(0)), win_out = BF16(arg(1)), w = BF16(arg(3));
+    uint64_t x = arg(2), dst = arg(4);
+    uint C = arg_u32(5), KD = arg_u32(6), M = arg_u32(7);
+    uint c = thread_position_in_grid.x;
+    uint m0 = thread_position_in_grid.y * CONV_TILE;
+    uint m1 = min(m0 + CONV_TILE, M);
+    uint taps = KD - 1;
+    // The register window (KD <= 9) and the taps' weights. The loops over
+    // the taps run to the window's size with the tap count as a condition:
+    // a count known only at run time would leave the window an array in
+    // memory here, not registers. The weights are loaded once (the Metal
+    // kernel reloads them for every row).
+    float win[8], wt[8];
+    for (uint t = 0; t < 8; ++t) {
+        win[t] = 0.0;
+        wt[t] = 0.0;
+        if (t < taps) {
+            uint i = m0 + t;
+            if (i >= taps) win[t] = float(BF16(x + 2 * (uint64_t(i - taps) * C)).v[c]);
+            else win[t] = float(win_in.v[c * taps + i]);
+            wt[t] = float(w.v[t * C + c]);
+        }
+    }
+    float w_x = float(w.v[taps * C + c]);
+    uint64_t row = 2 * (uint64_t(m0) * C);
+    for (uint m = m0; m < m1; ++m) {
+        // Bit-identical to the serial kernel of the unit tests.
+        precise float acc = 0.0;
+        for (uint t = 0; t < 8; ++t) {
+            if (t < taps) acc += win[t] * wt[t];
+        }
+        float xc = float(BF16(x + row).v[c]);
+        acc += xc * w_x;
+        precise float y = acc / (1.0 + exp(-acc));
+        BF16(dst + row).v[c] = bfloat16_t(y);
+        for (uint t = 0; t < 7; ++t) {
+            if (t + 1 < taps) win[t] = win[t + 1];
+        }
+        for (uint t = 0; t < 8; ++t) {
+            if (t + 1 == taps) win[t] = xc;
+        }
+        row += 2 * uint64_t(C);
+    }
+    // The final tile writes the post-chunk window.
+    if (m1 == M) {
+        for (uint t = 0; t < 8; ++t) {
+            if (t < taps) win_out.v[c * taps + t] = bfloat16_t(win[t]);  // exact: bf16 values
+        }
+    }
+}
+#endif
+
+// Gated RMSNorm, one threadgroup per row.
+#ifdef KERNEL_gated_rmsnorm_bf16
+#define TG 256
+shared float partial[TG / 32];
+shared float inv_rms;
+void main() {
+    BF16 x = BF16(arg(0)), gate = BF16(arg(1)), dst = BF16(arg(3));
+    F32 w = F32(arg(2));
+    uint D = arg_u32(4), gate_act = arg_u32(6);
+    float eps = arg_f32(5);
+    uint row = threadgroup_position_in_grid.x, tid = thread_index_in_threadgroup;
+    uint sg = simdgroup_index_in_threadgroup, lane = thread_index_in_simdgroup;
+
+    float acc = 0.0;
+    for (uint i = tid; i < D; i += TG) {
+        float v = float(x.v[row * D + i]);
+        acc += v * v;
+    }
+    acc = subgroupAdd(acc);
+    if (lane == 0) partial[sg] = acc;
+    barrier();
+    if (tid == 0) {
+        float total = 0.0;
+        for (uint i = 0; i < TG / 32; ++i) total += partial[i];
+        inv_rms = inversesqrt(total / float(D) + eps);
+    }
+    barrier();
+    for (uint i = tid; i < D; i += TG) {
+        float g = float(gate.v[row * D + i]);
+        float s = gate_activation(g, gate_act);
+        dst.v[row * D + i] = bfloat16_t(w.v[i] * float(x.v[row * D + i]) * inv_rms * s);
+    }
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// Chunked prefill scan on the matrix units: the WY pass (`gdn_chunk_wy3`, or
+// `gdn_chunk_wy` for more than three value heads per key head), then
+// `gdn_chunk_scan`. The Metal kernels' matmul2d tiles are walked in 16x16
+// blocks (matmul.glsl), K ascending; which blocks a subgroup owns is said at
+// each product. As the Metal kernels, these take whole chunks: M is a
+// multiple of GDN_CHUNK (the dispatch hands a ragged tail to the
+// token-serial scan), so no product has an edge to stage.
+#if defined(KERNEL_gdn_chunk_wy) || defined(KERNEL_gdn_chunk_wy3) || defined(KERNEL_gdn_chunk_scan)
+#include "matmul.glsl"
+
+#define GDN_CHUNK 64     // tokens per chunk
+#define GDN_CHUNK_NB 16  // state columns per `gdn_chunk_scan` threadgroup
+
+// A destination tile as bf16, on its way to memory.
+#define MatCb coopmat<bfloat16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+// matmul.glsl's loads are of a product with the right operand transposed.
+// The right operand as stored, 16 rows of a [K, N] tensor:
+#define MAT_LOAD_B_ROWS(b, rows, at, stride) coopMatLoad(b, rows, at, stride, gl_CooperativeMatrixLayoutRowMajor)
+// The left operand transposed, 16 rows of a [K, M] tensor:
+#define MAT_LOAD_A_COLS(a, rows, at, stride) coopMatLoad(a, rows, at, stride, gl_CooperativeMatrixLayoutColumnMajor)
+#define MAT_STORE_ROWS(c, rows, at, stride) coopMatStore(c, rows, at, stride, gl_CooperativeMatrixLayoutRowMajor)
+// An fp32 tile `c` rounded once to bf16 (by element: the driver's matrix
+// conversion truncates, as its scalar one does) and stored as rows.
+#define MAT_STORE_BF16(c, rows, at, stride)                                                       \
+    {                                                                                             \
+        MatCb mat_rounded;                                                                        \
+        for (uint mat_e = 0; mat_e < 8; ++mat_e) mat_rounded[mat_e] = bfloat16_t(c[mat_e]);          \
+        MAT_STORE_ROWS(mat_rounded, rows, at, stride);                                            \
+    }
+#endif
+
+#if defined(KERNEL_gdn_chunk_wy) || defined(KERNEL_gdn_chunk_wy3)
+float gdn_log_decay(float a, float a_log, float dt_bias) {
+    float x = a + dt_bias;
+    float softplus = x > 20.0 ? x : log(1.0 + exp(x));
+    return -exp(a_log) * softplus;
+}
+
+#ifdef KERNEL_gdn_chunk_wy3
+#define WY_SG 8
+#else
+#define WY_SG 4
+#endif
+// A 64x64 product of chunk rows over the threadgroup's subgroups: a subgroup
+// owns one block of columns, `wy_cb`, and WY_RB blocks of rows from `wy_rb0`
+// (all four of four subgroups, two of eight).
+#define WY_RB (16 / WY_SG)
+
+// acc = left . K^T: [C x DIM] . [C x DIM]^T of the chunk's rows, `left` the
+// address of its q or k rows.
+#define WY_ROWS_PRODUCT(acc, left)                                                                \
+    for (uint i = 0; i < WY_RB; ++i) acc[i] = MatC(0.0);                                          \
+    for (uint k0 = 0; k0 < DIM; k0 += 16) {                                                       \
+        MatB mb;                                                                                  \
+        MAT_LOAD_B(mb, BF16(k_rows + 2 * (uint64_t(16 * wy_cb) * qk_stride)).v, k0, qk_stride);   \
+        for (uint i = 0; i < WY_RB; ++i) {                                                        \
+            MatA ma;                                                                              \
+            MAT_LOAD_A(ma, BF16((left) + 2 * (uint64_t(16 * (wy_rb0 + i)) * qk_stride)).v, k0, qk_stride); \
+            acc[i] = coopMatMulAdd(ma, mb, acc[i]);                                               \
+        }                                                                                         \
+    }
+
+// P = causal Q K^T with the decay between the two tokens, for value head `h`
+// whose G is at wy_G[g_at..]. The Metal kernels stage the tile in threadgroup
+// memory to write whole rows; a lane here holds four neighbours of a row and
+// writes them straight to p_out as one word, with no staging.
+#define WY_STORE_P(qkp, g_at, h)                                                                  \
+    for (uint i = 0; i < WY_RB; ++i) {                                                            \
+        for (uint rh = 0; rh < 2; ++rh) {                                                         \
+            uint r = 16 * (wy_rb0 + i) + mat_row(4 * rh), j0 = 16 * wy_cb + mat_col(0);           \
+            float g_r = wy_G[(g_at) + r];                                                         \
+            vec4 pv;                                                                              \
+            for (uint cj = 0; cj < 4; ++cj) {                                                     \
+                float decayed = qkp[i][4 * rh + cj] * exp(g_r - wy_G[(g_at) + j0 + cj]);          \
+                pv[cj] = j0 + cj <= r ? decayed : 0.0;                                            \
+            }                                                                                     \
+            BF16x4(arg(8) + 2 * ((uint64_t(t0 + r) * H + (h)) * C + j0)).v[0] = bf16(pv);         \
+        }                                                                                         \
+    }
+
+// dest = T . right: [C x C] . [C x DIM], T at wy_T[t_at..], `right` the
+// chunk's k or v rows, the tile rounded once to bf16 into the chunk's rows of
+// w_out or u_out (`dest` their address for this head). A subgroup owns a
+// block of columns at a time and its four blocks of rows.
+#define WY_T_PRODUCT(t_at, right, right_stride, dest)                                             \
+    for (uint cb = sg; cb < DIM / 16; cb += WY_SG) {                                              \
+        MatC acc[4];                                                                              \
+        for (uint i = 0; i < 4; ++i) acc[i] = MatC(0.0);                                          \
+        for (uint k0 = 0; k0 < C; k0 += 16) {                                                     \
+            MatB mb;                                                                              \
+            MAT_LOAD_B_ROWS(mb, BF16((right) + 2 * (uint64_t(k0) * (right_stride))).v, 16 * cb, right_stride); \
+            for (uint i = 0; i < 4; ++i) {                                                        \
+                MatA ma;                                                                          \
+                MAT_LOAD_A(ma, wy_T, (t_at) + 16 * i * C + k0, C);                                \
+                acc[i] = coopMatMulAdd(ma, mb, acc[i]);                                           \
+            }                                                                                     \
+        }                                                                                         \
+        for (uint i = 0; i < 4; ++i) {                                                            \
+            MAT_STORE_BF16(acc[i], BF16((dest) + 2 * (uint64_t(16 * i) * wu_stride)).v, 16 * cb, wu_stride) \
+        }                                                                                         \
+    }
+#endif
+
+// A's strict lower triangle, which is all the solve reads of it, a row in
+// whole vectors of four columns: row r's columns 4 g.. are vector
+// WY_A_ROW(r) + g. The Metal kernels hold A square and lay T_w | T_u (and the
+// P tile) over it once it is solved; packed, it leaves room for the two T
+// tiles beside it, in memory of their own type (a matrix load wants bf16
+// memory), and a row is read four columns a load.
+#define WY_A_ROW(r) ((((r) - 1) / 4 + 1) * (2 * (((r) - 1) / 4) + ((r) - 1) % 4))
+#define WY_A_VECS 528  // WY_A_ROW(GDN_CHUNK)
+
+// A from the K K^T tile `kk`, for WY_A_HEADS value heads (head vv's gates at
+// wy_Bt and wy_G[vv * C..]): a lane's four neighbours of a row are one vector.
+#define WY_STORE_A(kk)                                                                            \
+    for (uint i = 0; i < WY_RB; ++i) {                                                            \
+        for (uint rh = 0; rh < 2; ++rh) {                                                         \
+            uint r = 16 * (wy_rb0 + i) + mat_row(4 * rh), j0 = 16 * wy_cb + mat_col(0);           \
+            if (j0 < r) {                                                                         \
+                uint at = WY_A_ROW(r) + (j0 >> 2);                                                \
+                for (uint vv = 0; vv < WY_A_HEADS; ++vv) {                                        \
+                    float b_r = wy_Bt[vv * C + r], g_r = wy_G[vv * C + r];                        \
+                    vec4 a;                                                                       \
+                    for (uint cj = 0; cj < 4; ++cj) {                                             \
+                        float decayed = b_r * kk[i][4 * rh + cj] * exp(g_r - wy_G[vv * C + j0 + cj]); \
+                        a[cj] = j0 + cj < r ? decayed : 0.0;                                      \
+                    }                                                                             \
+                    wy_A[vv * WY_A_VECS + at] = WY_A_VEC(a);                                      \
+                }                                                                                 \
+            }                                                                                     \
+        }                                                                                         \
+    }
+
+// T = (I + A)^-1 by forward substitution, one column per lane, the column
+// `t` in registers, four accumulation chains; the lane's A is at
+// wy_A[a_at..] and `c` is its column. The Metal kernels unroll a loop over
+// the rows; here the rows are written out, since the driver's compiler
+// leaves that loop (the trip counts inside it are each row's own) and the
+// column with it an array it indexes by comparisons. Within a row the bounds
+// are constants (and written `j < i - 3`, which that compiler counts;
+// `j + 3 < i` it does not).
+#define WY_SOLVE_ROW(i)                                                                           \
+    {                                                                                             \
+        float s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0;                                             \
+        for (int j = 0; j < (i) - 3; j += 4) {                                                    \
+            vec4 a = vec4(wy_A[a_at + WY_A_ROW(max((i), 1)) + (j >> 2)]);                         \
+            s0 = fma(a.x, t[j], s0);                                                              \
+            s1 = fma(a.y, t[j + 1], s1);                                                          \
+            s2 = fma(a.z, t[j + 2], s2);                                                          \
+            s3 = fma(a.w, t[j + 3], s3);                                                          \
+        }                                                                                         \
+        if (((i) & 3) != 0) {                                                                     \
+            vec4 a = vec4(wy_A[a_at + WY_A_ROW(max((i), 1)) + ((i) >> 2)]);                       \
+            for (int j = (i) & ~3; j < (i); ++j) s0 = fma(a[j & 3], t[j], s0);                    \
+        }                                                                                         \
+        float s = (s0 + s1) + (s2 + s3);                                                          \
+        t[(i)] = uint(i) == c ? 1.0 : (uint(i) < c ? 0.0 : -s);                                   \
+    }
+#define WY_SOLVE_ROWS4(i) WY_SOLVE_ROW(i) WY_SOLVE_ROW((i) + 1) WY_SOLVE_ROW((i) + 2) WY_SOLVE_ROW((i) + 3)
+#define WY_SOLVE_ROWS16(i) \
+    WY_SOLVE_ROWS4(i) WY_SOLVE_ROWS4((i) + 4) WY_SOLVE_ROWS4((i) + 8) WY_SOLVE_ROWS4((i) + 12)
+#define WY_SOLVE() WY_SOLVE_ROWS16(0) WY_SOLVE_ROWS16(16) WY_SOLVE_ROWS16(32) WY_SOLVE_ROWS16(48)
+
+// The lane's column of T_w and of T_u into their tiles, wy_T[0..] and
+// wy_T[C * C..]; its gates are at wy_Bt and wy_G[g_at + c].
+#define WY_STORE_T(g_at)                                                                          \
+    {                                                                                             \
+        float bw = wy_Bt[(g_at) + c] * exp(wy_G[(g_at) + c]);                                     \
+        float bu = wy_Bt[(g_at) + c];                                                             \
+        [[unroll]] for (int i = 0; i < int(C); ++i) {                                             \
+            wy_T[i * C + c] = bfloat16_t(t[i] * bw);                                                 \
+            wy_T[C * C + i * C + c] = bfloat16_t(t[i] * bu);                                         \
+        }                                                                                         \
+    }
+
+// The WY pass with one threadgroup per (chunk, key head), the value heads of
+// the key head in turn, one column of T per lane in registers.
+#ifdef KERNEL_gdn_chunk_wy
+#define WY_A_HEADS 1
+#define WY_A_VEC(a) (a)
+shared vec4 wy_A[WY_A_VECS];
+shared bfloat16_t wy_T[2 * GDN_CHUNK * GDN_CHUNK];  // T_w | T_u
+shared float wy_G[GDN_CHUNK], wy_Bt[GDN_CHUNK];
+shared float wy_g_total;
+void main() {
+    const uint C = GDN_CHUNK;
+    uint M = arg_u32(10), H = arg_u32(11), vpk = arg_u32(12);
+    uint tid = thread_index_in_threadgroup, sg = simdgroup_index_in_threadgroup;
+    uint lane = thread_index_in_simdgroup;
+    uint t0 = threadgroup_position_in_grid.x * C;
+    if (t0 >= M) return;
+    uint hk = threadgroup_position_in_grid.y;
+    uint HK = H / vpk;
+    uint CW = (2 * HK + H) * DIM;
+    uint qk_stride = 2 * HK * DIM, wu_stride = H * DIM;
+    uint64_t q_rows = arg(1) + 2 * (uint64_t(t0) * qk_stride + hk * DIM);
+    uint64_t k_rows = q_rows + 2 * (HK * DIM);
+    uint wy_cb = sg, wy_rb0 = 0;
+    uint c = tid;
+    const uint a_at = 0;
+
+    for (uint v = 0; v < vpk; ++v) {
+        uint h = hk * vpk + v;
+
+        // Local cumulative log-decay and beta.
+        {
+            float lg = 0.0;
+            float bt = 0.0;
+            if (tid < C) {
+                uint64_t r = uint64_t(t0 + tid) * H;
+                lg = gdn_log_decay(float(BF16(arg(2) + 2 * r).v[h]), F32(arg(4)).v[h], float(BF16(arg(5)).v[h]));
+                bt = 1.0 / (1.0 + exp(-float(BF16(arg(3) + 2 * r).v[h])));
+            }
+            float pre = subgroupInclusiveAdd(lg);
+            if (sg == 0 && lane == 31) wy_g_total = pre;
+            if (tid < C) wy_Bt[tid] = bt;
+            barrier();
+            if (tid < C) wy_G[tid] = pre + (sg == 1 ? wy_g_total : 0.0);
+        }
+        barrier();
+
+        // P, ahead of the solve (the Metal kernel computes it after): its
+        // product's tile is then not held across the rest.
+        {
+            MatC qkp[WY_RB];
+            WY_ROWS_PRODUCT(qkp, q_rows)
+            WY_STORE_P(qkp, 0, h)
+        }
+
+        // A from K K^T (recomputed per value head, cheaper than holding it).
+        {
+            MatC kk[WY_RB];
+            WY_ROWS_PRODUCT(kk, k_rows)
+            WY_STORE_A(kk)
+        }
+        barrier();
+
+        if (tid < C) {
+            float t[GDN_CHUNK];
+            WY_SOLVE()
+            WY_STORE_T(0)
+        }
+        barrier();
+
+        // W = T_w K and U = T_u V, rows of this chunk, stored as bf16 tiles
+        // (the accumulation stays fp32; the tile rounds once).
+        WY_T_PRODUCT(0, k_rows, qk_stride, arg(6) + 2 * ((uint64_t(t0) * H + h) * DIM))
+        WY_T_PRODUCT(C * C, arg(0) + 2 * (uint64_t(t0) * CW + (2 * HK + h) * DIM), CW,
+                     arg(7) + 2 * ((uint64_t(t0) * H + h) * DIM))
+
+        if (tid < C) F32(arg(9) + 4 * (uint64_t(t0 + tid) * H)).v[h] = wy_G[tid];
+        barrier();
+    }
+}
+#endif
+
+// The WY pass with the three value heads of a key head solved at once:
+// 256 threads, thread (v, c) owns column c of head v's T. The three A are
+// held as fp16 (|A| <= 1); the K K^T and Q K^T products are computed once.
+#ifdef KERNEL_gdn_chunk_wy3
+#define WY_A_HEADS 3
+#define WY_A_VEC(a) f16vec4(a)
+shared f16vec4 wy_A[3 * WY_A_VECS];
+shared bfloat16_t wy_T[2 * GDN_CHUNK * GDN_CHUNK];  // T_w | T_u
+shared float wy_G[3 * GDN_CHUNK], wy_Bt[3 * GDN_CHUNK];
+shared float wy_g_total[3];
+void main() {
+    const uint C = GDN_CHUNK;
+    uint M = arg_u32(10), H = arg_u32(11), vpk = arg_u32(12);
+    uint tid = thread_index_in_threadgroup, sg = simdgroup_index_in_threadgroup;
+    uint lane = thread_index_in_simdgroup;
+    uint t0 = threadgroup_position_in_grid.x * C;
+    if (t0 >= M) return;
+    uint hk = threadgroup_position_in_grid.y;
+    uint HK = H / vpk;
+    uint CW = (2 * HK + H) * DIM;
+    uint qk_stride = 2 * HK * DIM, wu_stride = H * DIM;
+    uint64_t q_rows = arg(1) + 2 * (uint64_t(t0) * qk_stride + hk * DIM);
+    uint64_t k_rows = q_rows + 2 * (HK * DIM);
+    uint wy_cb = sg & 3, wy_rb0 = (sg >> 2) * WY_RB;
+    uint v = tid / C;  // value head of this thread (3 = idle)
+    uint c = tid % C;
+
+    // Gates: thread (v, i); the prefix sum runs per head over its two
+    // subgroups.
+    {
+        float lg = 0.0;
+        float bt = 0.0;
+        if (v < vpk) {
+            uint64_t r = uint64_t(t0 + c) * H;
+            uint h = hk * vpk + v;
+            lg = gdn_log_decay(float(BF16(arg(2) + 2 * r).v[h]), F32(arg(4)).v[h], float(BF16(arg(5)).v[h]));
+            bt = 1.0 / (1.0 + exp(-float(BF16(arg(3) + 2 * r).v[h])));
+        }
+        float pre = subgroupInclusiveAdd(lg);
+        if ((sg & 1u) == 0u && lane == 31 && v < 3) wy_g_total[v] = pre;
+        if (v < 3) wy_Bt[v * C + c] = bt;
+        barrier();
+        if (v < 3) wy_G[v * C + c] = pre + ((sg & 1u) != 0u ? wy_g_total[v] : 0.0);
+    }
+    barrier();
+
+    // P of every head, ahead of the solve (the Metal kernel computes each
+    // after its head's T): the Q K^T tile is then not held across the solve
+    // and the T products, beside a T column a lane.
+    {
+        MatC qkp[WY_RB];
+        WY_ROWS_PRODUCT(qkp, q_rows)
+        for (uint vv = 0; vv < vpk; ++vv) {
+            WY_STORE_P(qkp, vv * C, hk * vpk + vv)
+        }
+    }
+
+    // The three A from one K K^T.
+    {
+        MatC kk[WY_RB];
+        WY_ROWS_PRODUCT(kk, k_rows)
+        WY_STORE_A(kk)
+    }
+    barrier();
+
+    float t[GDN_CHUNK];
+    if (v < 3) {
+        uint a_at = v * WY_A_VECS;
+        WY_SOLVE()
+    }
+
+    for (uint vv = 0; vv < vpk; ++vv) {
+        uint h = hk * vpk + vv;
+        if (v == vv) {
+            WY_STORE_T(v * C)
+        }
+        barrier();
+        WY_T_PRODUCT(0, k_rows, qk_stride, arg(6) + 2 * ((uint64_t(t0) * H + h) * DIM))
+        WY_T_PRODUCT(C * C, arg(0) + 2 * (uint64_t(t0) * CW + (2 * HK + h) * DIM), CW,
+                     arg(7) + 2 * ((uint64_t(t0) * H + h) * DIM))
+        if (tid < C) F32(arg(9) + 4 * (uint64_t(t0 + tid) * H)).v[h] = wy_G[vv * C + tid];
+        barrier();
+    }
+}
+#endif
+
+// One threadgroup of four subgroups per (block of NB state columns, value
+// head), the chunks in order. The fp32 state block lives in the accumulators
+// of the state update; its bf16 copy `scan_Sb` feeds the two reads of it.
+// Subgroup s owns rows 16 s.. of a chunk in the three products with the
+// chunk's rows on the left, and rows 32 s.. of the state block.
+#ifdef KERNEL_gdn_chunk_scan
+shared bfloat16_t scan_Sb[DIM * GDN_CHUNK_NB];         // [DIM, NB]
+shared bfloat16_t scan_Ut[GDN_CHUNK * GDN_CHUNK_NB];   // [C, NB]
+shared bfloat16_t scan_Ut2[GDN_CHUNK * GDN_CHUNK_NB];  // [C, NB]
+
+// acc += rows . right: 16 rows of an [n x K] device tensor times a [K x NB]
+// threadgroup one.
+#define SCAN_ROW_PRODUCT(acc, rows, stride, depth, right)                                         \
+    for (uint k0 = 0; k0 < (depth); k0 += 16) {                                                   \
+        MatA ma;                                                                                  \
+        MatB mb;                                                                                  \
+        MAT_LOAD_A(ma, BF16(rows).v, k0, stride);                                                 \
+        MAT_LOAD_B_ROWS(mb, right, k0 * NB, NB);                                                  \
+        acc = coopMatMulAdd(ma, mb, acc);                                                         \
+    }
+
+void main() {
+    const uint C = GDN_CHUNK, NB = GDN_CHUNK_NB;
+    uint M = arg_u32(7), H = arg_u32(8), vpk = arg_u32(9);
+    uint h = threadgroup_position_in_grid.y;
+    uint HK = H / vpk, hk = h / vpk;
+    uint col0 = threadgroup_position_in_grid.x * NB;
+    uint row0 = 16 * simdgroup_index_in_threadgroup, srow0 = 32 * simdgroup_index_in_threadgroup;
+    uint qk_stride = 2 * HK * DIM, wu_stride = H * DIM, p_stride = H * C;
+
+    F32 st = F32(arg(5) + 4 * (uint64_t(h) * (DIM * DIM) + col0));
+    MatC S[2];
+    for (uint i = 0; i < 2; ++i) {
+        coopMatLoad(S[i], st.v, (srow0 + 16 * i) * DIM, DIM, gl_CooperativeMatrixLayoutRowMajor);
+        MAT_STORE_BF16(S[i], scan_Sb, (srow0 + 16 * i) * NB, NB)
+    }
+    barrier();
+
+    for (uint t0 = 0; t0 < M; t0 += C) {
+        F32 gc = F32(arg(4) + 4 * (uint64_t(t0) * H + h));
+        float gC = gc.v[(C - 1) * H];
+        // The chunk's rows of q and k, and this subgroup's rows of it.
+        uint64_t q_chunk = arg(0) + 2 * (uint64_t(t0) * qk_stride + hk * DIM);
+        uint64_t k_chunk = q_chunk + 2 * (HK * DIM);
+        uint64_t head_rows = (uint64_t(t0 + row0) * H + h);
+
+        // u~ = U - W S_0, plain and decayed to the chunk's end.
+        MatC acc = MatC(0.0);
+        SCAN_ROW_PRODUCT(acc, arg(1) + 2 * (head_rows * DIM), wu_stride, DIM, scan_Sb)
+        {
+            MatCb ut, ut2;
+            for (uint rh = 0; rh < 2; ++rh) {
+                uint r = row0 + mat_row(4 * rh);
+                vec4 uv = vec4(BF16x4(arg(2) + 2 * ((uint64_t(t0 + r) * H + h) * DIM + col0 + mat_col(0))).v[0]);
+                float to_end = exp(gC - gc.v[r * H]);
+                for (uint cj = 0; cj < 4; ++cj) {
+                    float d = uv[cj] - acc[4 * rh + cj];
+                    ut[4 * rh + cj] = bfloat16_t(d);
+                    ut2[4 * rh + cj] = bfloat16_t(d * to_end);
+                }
+            }
+            MAT_STORE_ROWS(ut, scan_Ut, row0 * NB, NB);
+            MAT_STORE_ROWS(ut2, scan_Ut2, row0 * NB, NB);
+        }
+        barrier();
+
+        // S = exp(G_C) S_0 + K^T u~'.
+        {
+            float gamma = exp(gC);
+            for (uint i = 0; i < 2; ++i) {
+                for (uint e = 0; e < 8; ++e) S[i][e] *= gamma;
+            }
+            for (uint k0 = 0; k0 < C; k0 += 16) {
+                MatB mb;
+                MAT_LOAD_B_ROWS(mb, scan_Ut2, k0 * NB, NB);
+                for (uint i = 0; i < 2; ++i) {
+                    MatA ma;
+                    MAT_LOAD_A_COLS(ma, BF16(k_chunk + 2 * (uint64_t(k0) * qk_stride)).v, srow0 + 16 * i, qk_stride);
+                    S[i] = coopMatMulAdd(ma, mb, S[i]);
+                }
+            }
+        }
+
+        // o = exp(G_t) q_t S_0 + P u~.
+        acc = MatC(0.0);
+        SCAN_ROW_PRODUCT(acc, q_chunk + 2 * (uint64_t(row0) * qk_stride), qk_stride, DIM, scan_Sb)
+        for (uint rh = 0; rh < 2; ++rh) {
+            float to_row = exp(gc.v[(row0 + mat_row(4 * rh)) * H]);
+            for (uint cj = 0; cj < 4; ++cj) acc[4 * rh + cj] *= to_row;
+        }
+        SCAN_ROW_PRODUCT(acc, arg(3) + 2 * (head_rows * C), p_stride, C, scan_Ut)
+        MAT_STORE_BF16(acc, BF16(arg(6) + 2 * (head_rows * DIM)).v, col0, wu_stride)
+        barrier();
+
+        // The next chunk reads the updated state.
+        for (uint i = 0; i < 2; ++i) MAT_STORE_BF16(S[i], scan_Sb, (srow0 + 16 * i) * NB, NB)
+        barrier();
+    }
+
+    for (uint i = 0; i < 2; ++i) {
+        coopMatStore(S[i], st.v, (srow0 + 16 * i) * DIM, DIM, gl_CooperativeMatrixLayoutRowMajor);
+    }
+}
+#endif
