@@ -1,0 +1,104 @@
+#version 460
+// The kernels of src/kernels/metal/skinny.metal: small-M Q4/Q8 GEMMs with
+// fp32 accumulation. The staged-A variants round dequantized weights to bf16
+// like the dequant + GEMM fallback they replace; the register-A variants
+// (m <= 8) dot the raw codes like the decode GEMV. The comments there say why
+// each is as it is; the bodies (skinny_common.glsl) are the same arithmetic
+// in the same order.
+#include "common.glsl"
+#include "quant_common.glsl"
+
+// Staged variants: 128 threads (four weight rows) and one M block of 8 or 16
+// rows.
+#if defined(KERNEL_gemm_skinny_q4_bf16_m8) || defined(KERNEL_gemm_skinny_q4_f32_m8)
+#define SKINNY_STAGED 4
+#define SKINNY_MB 8
+#endif
+#if defined(KERNEL_gemm_skinny_q4_bf16_m16) || defined(KERNEL_gemm_skinny_q4_f32_m16)
+#define SKINNY_STAGED 4
+#define SKINNY_MB 16
+#endif
+#if defined(KERNEL_gemm_skinny_q8_bf16_m8) || defined(KERNEL_gemm_skinny_q8_f32_m8)
+#define SKINNY_STAGED 8
+#define SKINNY_MB 8
+#endif
+#if defined(KERNEL_gemm_skinny_q8_bf16_m16) || defined(KERNEL_gemm_skinny_q8_f32_m16)
+#define SKINNY_STAGED 8
+#define SKINNY_MB 16
+#endif
+
+// Register-A variants: M is the kernel's suffix.
+#if defined(KERNEL_gemm_skinny_q8_bf16_reg_m1) || defined(KERNEL_gemm_skinny_q8_f32_reg_m1)
+#define SKINNY_REG_Q8 1
+#endif
+#if defined(KERNEL_gemm_skinny_q8_bf16_reg_m2) || defined(KERNEL_gemm_skinny_q8_f32_reg_m2)
+#define SKINNY_REG_Q8 2
+#endif
+#if defined(KERNEL_gemm_skinny_q8_bf16_reg_m3) || defined(KERNEL_gemm_skinny_q8_f32_reg_m3)
+#define SKINNY_REG_Q8 3
+#endif
+#if defined(KERNEL_gemm_skinny_q8_bf16_reg_m4) || defined(KERNEL_gemm_skinny_q8_f32_reg_m4)
+#define SKINNY_REG_Q8 4
+#endif
+#if defined(KERNEL_gemm_skinny_q8_bf16_reg_m5) || defined(KERNEL_gemm_skinny_q8_f32_reg_m5)
+#define SKINNY_REG_Q8 5
+#endif
+#if defined(KERNEL_gemm_skinny_q8_bf16_reg_m6) || defined(KERNEL_gemm_skinny_q8_f32_reg_m6)
+#define SKINNY_REG_Q8 6
+#endif
+#if defined(KERNEL_gemm_skinny_q8_bf16_reg_m7) || defined(KERNEL_gemm_skinny_q8_f32_reg_m7)
+#define SKINNY_REG_Q8 7
+#endif
+#if defined(KERNEL_gemm_skinny_q8_bf16_reg_m8) || defined(KERNEL_gemm_skinny_q8_f32_reg_m8)
+#define SKINNY_REG_Q8 8
+#endif
+#if defined(KERNEL_gemm_skinny_q4_bf16_reg_m1) || defined(KERNEL_gemm_skinny_q4_f32_reg_m1)
+#define SKINNY_REG_Q4 1
+#endif
+#if defined(KERNEL_gemm_skinny_q4_bf16_reg_m2) || defined(KERNEL_gemm_skinny_q4_f32_reg_m2)
+#define SKINNY_REG_Q4 2
+#endif
+#if defined(KERNEL_gemm_skinny_q4_bf16_reg_m3) || defined(KERNEL_gemm_skinny_q4_f32_reg_m3)
+#define SKINNY_REG_Q4 3
+#endif
+#if defined(KERNEL_gemm_skinny_q4_bf16_reg_m4) || defined(KERNEL_gemm_skinny_q4_f32_reg_m4)
+#define SKINNY_REG_Q4 4
+#endif
+#if defined(KERNEL_gemm_skinny_q4_bf16_reg_m5) || defined(KERNEL_gemm_skinny_q4_f32_reg_m5)
+#define SKINNY_REG_Q4 5
+#endif
+#if defined(KERNEL_gemm_skinny_q4_bf16_reg_m6) || defined(KERNEL_gemm_skinny_q4_f32_reg_m6)
+#define SKINNY_REG_Q4 6
+#endif
+#if defined(KERNEL_gemm_skinny_q4_bf16_reg_m7) || defined(KERNEL_gemm_skinny_q4_f32_reg_m7)
+#define SKINNY_REG_Q4 7
+#endif
+#if defined(KERNEL_gemm_skinny_q4_bf16_reg_m8) || defined(KERNEL_gemm_skinny_q4_f32_reg_m8)
+#define SKINNY_REG_Q4 8
+#endif
+
+// f32 output (logits) instead of bf16.
+#if defined(KERNEL_gemm_skinny_q4_f32_m8) || \
+    defined(KERNEL_gemm_skinny_q4_f32_m16) || \
+    defined(KERNEL_gemm_skinny_q8_f32_m8) || \
+    defined(KERNEL_gemm_skinny_q8_f32_m16) || \
+    defined(KERNEL_gemm_skinny_q8_f32_reg_m1) || \
+    defined(KERNEL_gemm_skinny_q8_f32_reg_m2) || \
+    defined(KERNEL_gemm_skinny_q8_f32_reg_m3) || \
+    defined(KERNEL_gemm_skinny_q8_f32_reg_m4) || \
+    defined(KERNEL_gemm_skinny_q8_f32_reg_m5) || \
+    defined(KERNEL_gemm_skinny_q8_f32_reg_m6) || \
+    defined(KERNEL_gemm_skinny_q8_f32_reg_m7) || \
+    defined(KERNEL_gemm_skinny_q8_f32_reg_m8) || \
+    defined(KERNEL_gemm_skinny_q4_f32_reg_m1) || \
+    defined(KERNEL_gemm_skinny_q4_f32_reg_m2) || \
+    defined(KERNEL_gemm_skinny_q4_f32_reg_m3) || \
+    defined(KERNEL_gemm_skinny_q4_f32_reg_m4) || \
+    defined(KERNEL_gemm_skinny_q4_f32_reg_m5) || \
+    defined(KERNEL_gemm_skinny_q4_f32_reg_m6) || \
+    defined(KERNEL_gemm_skinny_q4_f32_reg_m7) || \
+    defined(KERNEL_gemm_skinny_q4_f32_reg_m8)
+#define SKINNY_F32
+#endif
+
+#include "skinny_common.glsl"

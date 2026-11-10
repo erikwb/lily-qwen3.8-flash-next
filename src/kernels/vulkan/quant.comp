@@ -1,0 +1,186 @@
+#version 460
+// The kernels of src/kernels/metal/quant.metal: affine Q4/Q8 GEMV, dequant
+// and embedding gather with bf16 activations and fp32 accumulation, and the
+// grouped Q4 GEMM. Q4 codes pack eight low-nibble-first values per word;
+// w = scale * q + bias. The comments there say why each kernel is as it is;
+// this is the same arithmetic in the same order.
+#include "common.glsl"
+#include "quant_common.glsl"
+
+// Q4 GEMV: one subgroup per row (gemv_q4_bf16_2row: half a subgroup); GS
+// must be divisible by 64.
+#if defined(KERNEL_gemv_q4_bf16) || defined(KERNEL_gemv_q4_bf16_f32out) || defined(KERNEL_gemv_q4_bf16_2row)
+#ifdef KERNEL_gemv_q4_bf16_2row
+#define LANES 16
+#else
+#define LANES 32
+#endif
+
+// Affine-dequantized dot product for one Q4 code word and its eight
+// activations (one 16-byte load).
+float dot_word_q4(uint word, float s, float b, uvec4 x) {
+    vec4 xlo = bf4_bits(x.xy), xhi = bf4_bits(x.zw);
+    float qx = dot(q4_lo(word), xlo) + dot(q4_hi(word), xhi);
+    float xs = dot(xlo, vec4(1.0)) + dot(xhi, vec4(1.0));
+    return s * qx + b * xs;
+}
+
+void main() {
+    BF16 scales = BF16(arg(1)), biases = BF16(arg(2));
+    U32x4 xv = U32x4(arg(3));
+    uint K = arg_u32(5), GS = arg_u32(6);
+    uint lane = thread_index_in_threadgroup;
+    uint sublane = lane % LANES;
+    uint row = threadgroup_position_in_grid.x * (32 / LANES) + lane / LANES;
+    uint words = K / 8, blocks = words / 4, bpg = GS / 32, groups = K / GS;
+    U32x4 wrow = U32x4(arg(0) + uint64_t(row) * (4 * words));
+    float sum = 0.0;
+    for (uint i = sublane; i < blocks; i += LANES) {
+        uint g = i / bpg;
+        float s = float(scales.v[row * groups + g]);
+        float b = float(biases.v[row * groups + g]);
+        uvec4 w4 = wrow.v[i];
+        sum += dot_word_q4(w4.x, s, b, xv.v[4 * i]) + dot_word_q4(w4.y, s, b, xv.v[4 * i + 1])
+             + dot_word_q4(w4.z, s, b, xv.v[4 * i + 2]) + dot_word_q4(w4.w, s, b, xv.v[4 * i + 3]);
+    }
+#if LANES == 16
+    // Each half's sum. Metal folds it into the half's first lane by four
+    // shuffles; a shuffle is a dozen instructions on this driver and the
+    // reduction one, so the halves are reduced apart (-0.0 adds nothing).
+    float lower = subgroupAdd(lane < 16 ? sum : -0.0);
+    float upper = subgroupAdd(lane < 16 ? -0.0 : sum);
+    sum = lane < 16 ? lower : upper;
+#else
+    sum = subgroupAdd(sum);
+#endif
+    if (sublane == 0) {
+#ifdef KERNEL_gemv_q4_bf16_f32out
+        F32(arg(4)).v[row] = sum;
+#else
+        BF16(arg(4)).v[row] = bfloat16_t(sum);
+#endif
+    }
+}
+#endif
+
+// Q8 GEMV: uint4 blocks of 16 elements (a code word holds four, low byte
+// first); GS must be divisible by 16.
+#if defined(KERNEL_gemv_q8_bf16) || defined(KERNEL_gemv_q8_bf16_f32out)
+float dot_word_q8(uint word, float s, float b, uvec2 xw) {
+    vec4 x = bf4_bits(xw);
+    return s * dot(q8_codes(word), x) + b * dot(x, vec4(1.0));
+}
+
+void main() {
+    BF16 scales = BF16(arg(1)), biases = BF16(arg(2));
+    U32x4 xv = U32x4(arg(3));
+    uint K = arg_u32(5), GS = arg_u32(6);
+    uint row = threadgroup_position_in_grid.x, lane = thread_index_in_threadgroup;
+    uint words = K / 4, blocks = words / 4, bpg = GS / 16, groups = K / GS;
+    U32x4 wrow = U32x4(arg(0) + uint64_t(row) * (4 * words));
+    float sum = 0.0;
+    for (uint i = lane; i < blocks; i += 32) {
+        uint g = i / bpg;
+        float s = float(scales.v[row * groups + g]);
+        float b = float(biases.v[row * groups + g]);
+        uvec4 w4 = wrow.v[i];
+        // The block's 16 activations: two 16-byte loads.
+        uvec4 xa = xv.v[2 * i], xb = xv.v[2 * i + 1];
+        sum += dot_word_q8(w4.x, s, b, xa.xy) + dot_word_q8(w4.y, s, b, xa.zw)
+             + dot_word_q8(w4.z, s, b, xb.xy) + dot_word_q8(w4.w, s, b, xb.zw);
+    }
+    sum = subgroupAdd(sum);
+    if (lane == 0) {
+#ifdef KERNEL_gemv_q8_bf16_f32out
+        F32(arg(4)).v[row] = sum;
+#else
+        BF16(arg(4)).v[row] = bfloat16_t(sum);
+#endif
+    }
+}
+#endif
+
+// Materializes weights, one thread per code word: dequant_* row by row,
+// gather_rows_* the embedding rows of `ids`.
+#if defined(KERNEL_dequant_q4_bf16) || defined(KERNEL_dequant_q8_bf16) || defined(KERNEL_gather_rows_q4_bf16) || defined(KERNEL_gather_rows_q8_bf16)
+#if defined(KERNEL_dequant_q8_bf16) || defined(KERNEL_gather_rows_q8_bf16)
+#define WORD_CODES 4
+#else
+#define WORD_CODES 8
+#endif
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    BF16 scales = BF16(arg(1)), biases = BF16(arg(2));
+    uint w = thread_position_in_grid.x;
+#if defined(KERNEL_gather_rows_q4_bf16) || defined(KERNEL_gather_rows_q8_bf16)
+    uint64_t dst = arg(4);
+    uint K = arg_u32(5), GS = arg_u32(6);
+    uint words = K / WORD_CODES;
+    if (w >= words) return;
+    uint row = U32(arg(3)).v[thread_position_in_grid.y];
+#else
+    uint64_t dst = arg(3);
+    uint K = arg_u32(4), GS = arg_u32(5);
+    uint words = K / WORD_CODES;
+    if (w >= words) return;
+    uint row = thread_position_in_grid.y;
+#endif
+    uint groups = K / GS;
+    uint g = w / (GS / WORD_CODES);
+    float s = float(scales.v[row * groups + g]);
+    float b = float(biases.v[row * groups + g]);
+    uint word = U32(arg(0) + uint64_t(row) * (4 * words)).v[w];
+    BF16x4 dst_row = BF16x4(dst + uint64_t(thread_position_in_grid.y) * (2 * K));
+#if WORD_CODES == 8
+    dst_row.v[2 * w] = bf16_weight(q4_lo(word) * s + b);
+    dst_row.v[2 * w + 1] = bf16_weight(q4_hi(word) * s + b);
+#else
+    dst_row.v[w] = bf16_weight(q8_codes(word) * s + b);
+#endif
+}
+#endif
+
+// Grouped Q4 GEMM (quant_grouped.glsl): per K step the threadgroup
+// dequantizes its expert's 64-row B tile into threadgroup memory and
+// accumulates the product of the block's A rows with it in fp32. K steps are
+// 128 deep (one 64-deep step closes a K that is an odd multiple of 64), and
+// the tile's rows are padded by 8 elements.
+#if defined(KERNEL_gemm_q4_nt_nax_grouped_t32x4) || defined(KERNEL_gemm_q4_nt_nax_grouped_t64x4)
+#ifdef KERNEL_gemm_q4_nt_nax_grouped_t32x4
+#define QG_BM 32
+#else
+#define QG_BM 64
+#endif
+#define QG_BK 128
+#define QG_LD (QG_BK + 8)
+#include "quant_grouped.glsl"
+
+// A thread dequantizes `runs` 32-code runs (one uint4 each) of weight row
+// tid / 2 into the tile, with one scale and bias: at a 128-deep step one
+// 64-code quant group. (Metal's threads take runs of two rows 32 apart, with
+// a scale and a bias each; a load from device memory is what costs here.)
+// GS must be a multiple of 64.
+void q4_tile_runs(uint64_t codes, BF16 scales, BF16 biases, uint words, uint groups, uint GS,
+                  uint b_row0, uint k0, uint tid, const uint runs) {
+    uint r = tid / 2, k = k0 + 32 * runs * (tid % 2);
+    uint row = b_row0 + r;
+    uint g = k / GS;
+    float s = float(scales.v[row * groups + g]);
+    float b = float(biases.v[row * groups + g]);
+    uvec4 w[2];
+    [[unroll]] for (uint j = 0; j < runs; ++j) w[j] = U32x4(codes).v[r * (words / 4) + k / 32 + j];
+    uint at = r * (QG_LD / 4) + (k - k0) / 4;
+    [[unroll]] for (uint j = 0; j < runs; ++j) {
+        [[unroll]] for (uint q = 0; q < 4; ++q) qg_store_word(w[j][q], s, b, at + 8 * j + 2 * q);
+    }
+}
+
+void qg_fill(uint64_t codes, BF16 scales, BF16 biases, uint words, uint groups, uint GS,
+             uint b_row0, uint k0, uint depth, uint tid) {
+    if (depth == QG_BK) {
+        q4_tile_runs(codes, scales, biases, words, groups, GS, b_row0, k0, tid, 2);
+    } else {
+        q4_tile_runs(codes, scales, biases, words, groups, GS, b_row0, k0, tid, 1);
+    }
+}
+#endif

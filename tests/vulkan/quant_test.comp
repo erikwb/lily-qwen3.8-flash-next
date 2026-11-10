@@ -1,0 +1,35 @@
+#version 460
+// The kernels of tests/metal/quant_test.metal: the grouped Q4 expert GEMM as
+// it shipped before 2026-10-01 (64-deep K steps, one 4-byte code word per
+// thread and step, an unpadded B tile), the reference the shipped kernel is
+// asserted bit-identical against. The product over the tile is the shipped
+// kernel's (quant_grouped.glsl).
+#include "common.glsl"
+#include "quant_common.glsl"
+
+#if defined(KERNEL_gemm_q4_nt_nax_grouped_ref_t32x4) || defined(KERNEL_gemm_q4_nt_nax_grouped_ref_t64x4)
+#ifdef KERNEL_gemm_q4_nt_nax_grouped_ref_t32x4
+#define QG_BM 32
+#else
+#define QG_BM 64
+#endif
+#define QG_BK 64
+#define QG_LD QG_BK
+#include "quant_grouped.glsl"
+
+// Dequantizes one 64x64 B tile across the threadgroup's 128 threads.
+void qg_fill(uint64_t codes, BF16 scales, BF16 biases, uint words, uint groups, uint GS,
+             uint b_row0, uint k0, uint depth, uint tid) {
+    for (uint i = tid; i < 64 * QG_BK / 8; i += 128) {
+        uint r = i / (QG_BK / 8);
+        uint wcol = i % (QG_BK / 8);
+        uint k = k0 + wcol * 8;
+        uint row = b_row0 + r;
+        uint word = U32(codes).v[r * words + k / 8];
+        uint g = k / GS;
+        float s = float(scales.v[row * groups + g]);
+        float b = float(biases.v[row * groups + g]);
+        qg_store_word(word, s, b, r * (QG_LD / 4) + wcol * 2);
+    }
+}
+#endif
