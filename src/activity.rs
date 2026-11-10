@@ -16,31 +16,49 @@
 //! (`metal::POLL_INTERVAL`). The engine holds one while a request runs and
 //! releases it in between, so an idle machine can still sleep.
 
-use objc2::rc::Retained;
-use objc2::runtime::{NSObjectProtocol, ProtocolObject};
-use objc2_foundation::{NSActivityOptions, NSProcessInfo, NSString};
+#[cfg(target_os = "macos")]
+mod imp {
+    use objc2::rc::Retained;
+    use objc2::runtime::{NSObjectProtocol, ProtocolObject};
+    use objc2_foundation::{NSActivityOptions, NSProcessInfo, NSString};
 
-/// The assertion, held until dropped. Begun and ended on the same thread.
-pub struct Activity {
-    token: Retained<ProtocolObject<dyn NSObjectProtocol>>,
-}
+    /// The assertion, held until dropped. Begun and ended on the same thread.
+    pub struct Activity {
+        token: Retained<ProtocolObject<dyn NSObjectProtocol>>,
+    }
 
-impl Activity {
-    /// Begins a user-initiated, latency-critical activity with `reason`
-    /// (shown by `pmset -g assertions` and Activity Monitor).
-    pub fn begin(reason: &str) -> Self {
-        let options =
-            NSActivityOptions::UserInitiated | NSActivityOptions::LatencyCritical;
-        let token = NSProcessInfo::processInfo()
-            .beginActivityWithOptions_reason(options, &NSString::from_str(reason));
-        Self { token }
+    impl Activity {
+        /// Begins a user-initiated, latency-critical activity with `reason`
+        /// (shown by `pmset -g assertions` and Activity Monitor).
+        pub fn begin(reason: &str) -> Self {
+            let options =
+                NSActivityOptions::UserInitiated | NSActivityOptions::LatencyCritical;
+            let token = NSProcessInfo::processInfo()
+                .beginActivityWithOptions_reason(options, &NSString::from_str(reason));
+            Self { token }
+        }
+    }
+
+    impl Drop for Activity {
+        fn drop(&mut self) {
+            // SAFETY: `token` is the object `beginActivityWithOptions_reason`
+            // returned for this activity.
+            unsafe { NSProcessInfo::processInfo().endActivity(&self.token) }
+        }
     }
 }
 
-impl Drop for Activity {
-    fn drop(&mut self) {
-        // SAFETY: `token` is the object `beginActivityWithOptions_reason`
-        // returned for this activity.
-        unsafe { NSProcessInfo::processInfo().endActivity(&self.token) }
+/// Linux has no App Nap: the assertion holds nothing.
+#[cfg(not(target_os = "macos"))]
+mod imp {
+    /// The assertion, held until dropped.
+    pub struct Activity;
+
+    impl Activity {
+        pub fn begin(_reason: &str) -> Self {
+            Self
+        }
     }
 }
+
+pub use imp::Activity;

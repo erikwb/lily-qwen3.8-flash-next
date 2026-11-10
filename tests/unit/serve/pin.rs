@@ -129,6 +129,7 @@ fn modes_parse() {
 
 /// The user wiring of the VM entry that holds `address`: nonzero while it
 /// is `mlock`ed (`mach_vm_region`, `VM_REGION_BASIC_INFO_64`).
+#[cfg(target_os = "macos")]
 fn user_wired_count(address: usize) -> u16 {
     #[repr(C, packed(4))]
     #[derive(Default)]
@@ -173,6 +174,27 @@ fn user_wired_count(address: usize) -> u16 {
     assert_eq!(rc, 0, "mach_vm_region");
     assert!(addr as usize <= address, "no region holds {address:#x}");
     info.user_wired_count
+}
+
+/// Linux: 1 while the mapping that holds `address` is `mlock`ed (its
+/// `VmFlags` in `/proc/self/smaps` carry `lo`, `VM_LOCKED`), 0 otherwise.
+/// Linux keeps no count, only the flag on the whole mapping.
+#[cfg(target_os = "linux")]
+fn user_wired_count(address: usize) -> u16 {
+    let smaps = std::fs::read_to_string("/proc/self/smaps").expect("smaps");
+    let mut inside = false;
+    for line in smaps.lines() {
+        let first = line.split_whitespace().next().unwrap_or("");
+        if let Some((start, end)) = first.split_once('-')
+            && let (Ok(start), Ok(end)) =
+                (usize::from_str_radix(start, 16), usize::from_str_radix(end, 16))
+        {
+            inside = (start..end).contains(&address);
+        } else if inside && let Some(flags) = line.strip_prefix("VmFlags:") {
+            return u16::from(flags.split_whitespace().any(|f| f == "lo"));
+        }
+    }
+    panic!("no mapping holds {address:#x}");
 }
 
 /// The Metal tests below run one at a time: small buffers of two tests can

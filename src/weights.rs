@@ -11,6 +11,7 @@ use std::collections::HashSet;
 
 use anyhow::{Context as _, Result, ensure};
 use half::bf16;
+#[cfg(target_os = "macos")]
 use objc2_metal::MTLBuffer;
 
 use crate::config::QuantizationConfig;

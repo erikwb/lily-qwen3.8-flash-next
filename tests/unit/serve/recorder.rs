@@ -1020,6 +1020,7 @@ fn the_tier_snapshot_counts_the_sessions_requests_hold() {
 
 // --- the flag and the read side ------------------------------------------------------
 
+#[cfg(target_os = "macos")]
 #[test]
 fn the_default_database_needs_an_absolute_home() {
     assert_eq!(
@@ -1031,13 +1032,38 @@ fn the_default_database_needs_an_absolute_home() {
     assert_eq!(default_path_in(Some("relative".into())), None);
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn the_default_database_is_xdg_state_or_needs_an_absolute_home() {
+    assert_eq!(
+        default_path_in_xdg(None, Some("/home/x".into())),
+        Some(PathBuf::from("/home/x/.local/state/lily/lily.sqlite"))
+    );
+    assert_eq!(
+        default_path_in_xdg(Some("/var/state".into()), Some("relative".into())),
+        Some(PathBuf::from("/var/state/lily/lily.sqlite"))
+    );
+    // A relative XDG directory is ignored, as the specification says.
+    assert_eq!(
+        default_path_in_xdg(Some("state".into()), Some("/home/x".into())),
+        Some(PathBuf::from("/home/x/.local/state/lily/lily.sqlite"))
+    );
+    assert_eq!(default_path_in_xdg(None, None), None);
+    assert_eq!(default_path_in_xdg(Some("".into()), Some("".into())), None);
+    assert_eq!(default_path_in_xdg(None, Some("relative".into())), None);
+}
+
 #[test]
 fn stats_db_takes_an_absolute_path_or_off() {
     assert_eq!(stats_db(Some("off")), Ok(None));
     assert_eq!(stats_db(Some("/x/y.sqlite")), Ok(Some(PathBuf::from("/x/y.sqlite"))));
-    assert!(stats_db(None).is_ok_and(|p| {
-        p.is_some_and(|p| p.ends_with("Application Support/lily/lily.sqlite"))
-    }));
+    #[cfg(target_os = "macos")]
+    let default_tail = "Application Support/lily/lily.sqlite";
+    // `$XDG_STATE_HOME/lily` or `~/.local/state/lily`, whichever the
+    // environment gives.
+    #[cfg(target_os = "linux")]
+    let default_tail = "lily/lily.sqlite";
+    assert!(stats_db(None).is_ok_and(|p| p.is_some_and(|p| p.ends_with(default_tail))));
     for bad in ["", "lily.sqlite", "./lily.sqlite", "~/lily.sqlite"] {
         let error = stats_db(Some(bad)).expect_err(bad);
         assert!(error.contains("--stats-db"), "{error}");

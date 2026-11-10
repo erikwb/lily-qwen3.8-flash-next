@@ -52,7 +52,25 @@ pub fn default_path() -> PathBuf {
 }
 
 /// [`default_path`] as a string, for messages.
+#[cfg(target_os = "macos")]
 pub const DEFAULT_PATH: &str = "/Users/Shared/lily-instance.lock";
+
+/// Linux: `/tmp/lily-instance.lock`. `/tmp` is the one directory every
+/// account can create a file in and that is world-writable with the sticky
+/// bit everywhere, as `/Users/Shared` is on macOS; `/run/lock` (`/var/lock`)
+/// is root's alone on systemd distributions. With `fs.protected_regular`
+/// (systemd's default), opening another account's file there with
+/// `O_CREAT` is refused even where its mode allows writing, so a lily of a
+/// second account opens the first one's lock read-only ([`acquire_at`]):
+/// the exclusion holds, its record is not written. `systemd-tmpfiles` ages
+/// files out of `/tmp` after 10 days but skips any file a BSD lock is held
+/// on (tmpfiles.d(5)), so the holder's file stays for as long as it runs;
+/// one left behind by a lily that exited may be removed, which costs
+/// nothing. `/tmp` is a tmpfs on most systems, emptied at boot.
+///
+/// [`acquire_at`]: InstanceLock::acquire_at
+#[cfg(target_os = "linux")]
+pub const DEFAULT_PATH: &str = "/tmp/lily-instance.lock";
 
 /// The account's home directory from the user database, not `HOME`: a
 /// process started without `HOME` used to lock `./Library/...` relative to
@@ -150,11 +168,16 @@ impl fmt::Display for AlreadyRunning {
             Some(h) => format!("pid {}", h.pid),
             None => "a process that has not written its pid yet".to_owned(),
         };
+        #[cfg(target_os = "macos")]
+        let stop = "If it is the background service, stop it with \
+                    `tools/service/lily-service.sh stop` (it stays down until `start`)";
+        // `lily-service.sh` manages the launchd agent, which Linux does not have.
+        #[cfg(not(target_os = "macos"))]
+        let stop = "Stop it first";
         write!(
             f,
             "another lily instance is running: {who} holds {}. Only one process may load the model \
-             at a time (two full models do not fit this machine). If it is the background service, \
-             stop it with `tools/service/lily-service.sh stop` (it stays down until `start`)",
+             at a time (two full models do not fit this machine). {stop}",
             self.path.display()
         )
     }

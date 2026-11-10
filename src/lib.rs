@@ -91,6 +91,9 @@ pub mod ablate {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod moe_ffn;
 pub mod npy;
+/// Linux: what macOS's quality-of-service classes become.
+#[cfg(target_os = "linux")]
+pub mod priority;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod qwen4exp;
 pub mod safetensors;

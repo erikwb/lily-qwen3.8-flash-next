@@ -876,6 +876,7 @@ impl Plan {
 /// n-gram page reads above all) and to interactive work, yet finishes in
 /// about the time it would take in the foreground on an idle machine.
 /// Best effort.
+#[cfg(target_os = "macos")]
 fn lower_writer_priority() {
     const QOS_CLASS_UTILITY: u32 = 0x11;
     const IOPOL_TYPE_DISK: std::ffi::c_int = 0;
@@ -897,6 +898,14 @@ fn lower_writer_priority() {
         pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
         setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD, IOPOL_UTILITY);
     }
+}
+
+/// Linux: nice 10 and the lowest best-effort I/O priority
+/// (`crate::priority`), the nearest to utility QoS with utility I/O. Best
+/// effort.
+#[cfg(target_os = "linux")]
+fn lower_writer_priority() {
+    crate::priority::lower_current_thread(crate::priority::Class::Utility);
 }
 
 impl<M: LanguageModel> Acquired<M> {

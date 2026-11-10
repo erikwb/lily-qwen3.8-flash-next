@@ -56,6 +56,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
+#[cfg(target_os = "macos")]
 use objc2_metal::MTLBuffer as _;
 
 use crate::metal::Buffer;

@@ -461,8 +461,11 @@ fn paged_gather_overhead() {
 }
 
 /// Writes a one-shard table of `rows` rows (20 code words, 5 groups) with
-/// `F_NOCACHE`, so its pages bypass the page cache and start cold. Returns
-/// the three tensors' byte lengths and the data they hold, in file order.
+/// `F_NOCACHE`, so its pages bypass the page cache and start cold (Linux:
+/// written through the cache, synced, then dropped from it with
+/// `POSIX_FADV_DONTNEED`; on a tmpfs temp directory the pages are the file
+/// and stay, which the callers allow for). Returns the three tensors' byte
+/// lengths and the data they hold, in file order.
 fn write_cold_shard(dir: &Path, rows: usize) -> ([usize; 3], Vec<u8>) {
     use std::os::fd::AsRawFd as _;
     std::fs::create_dir_all(dir).expect("temp dir");
@@ -490,11 +493,19 @@ fn write_cold_shard(dir: &Path, rows: usize) -> ([usize; 3], Vec<u8>) {
     let data: Vec<u8> = (0..offset).map(|i| (i % 251) as u8).collect();
     let mut f = std::fs::File::create(dir.join("model.safetensors")).unwrap();
     // SAFETY: an fcntl on a file this test owns.
-    unsafe { libc::fcntl(f.as_raw_fd(), libc::F_NOCACHE, 1) };
+    #[cfg(target_os = "macos")]
+    unsafe {
+        libc::fcntl(f.as_raw_fd(), libc::F_NOCACHE, 1)
+    };
     f.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
     f.write_all(&header).unwrap();
     f.write_all(&data).unwrap();
     f.sync_all().unwrap();
+    // SAFETY: advice on a file this test owns; its pages are clean now.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED)
+    };
     (lens, data)
 }
 

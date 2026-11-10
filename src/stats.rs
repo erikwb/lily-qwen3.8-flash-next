@@ -20,6 +20,13 @@
 //! [`own_energy_nj`] is lily's own CPU energy, which the machine sampler
 //! (`serve::machine`) turns into lily's CPU power; it needs a newer
 //! `rusage_info` revision than `libc` declares.
+//!
+//! On Linux the same figures come from `/proc` (`procfs` below): the paging
+//! counters from `/proc/vmstat`, the pressure level from the kernel's
+//! pressure stall information, the machine's memory and swap from
+//! `/proc/meminfo`, the CPU ticks from `/proc/stat`, the process's footprint
+//! from `/proc/self/status` and the lock limit from `RLIMIT_MEMLOCK`. Linux
+//! keeps no per-process energy account, so [`own_energy_nj`] is `None` there.
 
 use std::cell::Cell;
 
@@ -182,6 +189,7 @@ impl VmCounters {
 }
 
 /// The system's paging counters now, `None` when the call fails.
+#[cfg(target_os = "macos")]
 pub fn vm_counters() -> Option<VmCounters> {
     let mut info = sys::VmStatistics64::default();
     let mut count = sys::VmStatistics64::COUNT;
@@ -207,6 +215,7 @@ pub fn vm_counters() -> Option<VmCounters> {
 
 /// The memorystatus pressure level (`kern.memorystatus_vm_pressure_level`):
 /// 1 normal, 2 warning, 4 critical. `None` when the sysctl fails.
+#[cfg(target_os = "macos")]
 pub fn pressure_level() -> Option<u32> {
     let mut level: std::ffi::c_int = 0;
     let mut len = std::mem::size_of::<std::ffi::c_int>();
@@ -227,6 +236,7 @@ pub fn pressure_level() -> Option<u32> {
 /// `vm.user_wire_limit` (per process) and `vm.global_user_wire_limit` (every
 /// process's user wirings plus what the system has wired already, e.g.
 /// 116.8 GB each on a 128 GB machine). `None` when neither can be read.
+#[cfg(target_os = "macos")]
 pub fn user_wire_limit() -> Option<u64> {
     let per_process = sysctl_u64(c"vm.user_wire_limit");
     let global = sysctl_u64(c"vm.global_user_wire_limit");
@@ -237,6 +247,7 @@ pub fn user_wire_limit() -> Option<u64> {
 }
 
 /// A 32- or 64-bit unsigned sysctl, `None` when it cannot be read.
+#[cfg(target_os = "macos")]
 fn sysctl_u64(name: &std::ffi::CStr) -> Option<u64> {
     let mut value: u64 = 0;
     let mut len = std::mem::size_of::<u64>();
@@ -283,6 +294,7 @@ impl CpuTicks {
 }
 
 /// The host's CPU ticks now, `None` when the call fails.
+#[cfg(target_os = "macos")]
 pub fn cpu_ticks() -> Option<CpuTicks> {
     let mut ticks = [0u32; 4];
     let mut count = 4u32;
@@ -317,6 +329,7 @@ pub struct MemoryUse {
 }
 
 /// The machine's memory use now, `None` when a call fails.
+#[cfg(target_os = "macos")]
 pub fn memory_use() -> Option<MemoryUse> {
     let total = sysctl_u64(c"hw.memsize")?;
     let page = sysctl_u64(c"hw.pagesize")?;
@@ -341,6 +354,7 @@ pub fn memory_use() -> Option<MemoryUse> {
 }
 
 /// Bytes of swap in use (`vm.swapusage`), `None` when the sysctl fails.
+#[cfg(target_os = "macos")]
 pub fn swap_used() -> Option<u64> {
     /// `struct xsw_usage`.
     #[repr(C)]
@@ -391,6 +405,7 @@ pub struct TaskMemory {
 }
 
 /// This process's footprint now, `None` when the call fails.
+#[cfg(target_os = "macos")]
 pub fn task_memory() -> Option<TaskMemory> {
     let mut info = sys::TaskVmInfo::default();
     let mut count = sys::TaskVmInfo::COUNT;
@@ -416,6 +431,7 @@ pub fn task_memory() -> Option<TaskMemory> {
 /// next to it, `ri_penergy_nj`, is the performance cores' share). `None` when
 /// the call fails. Two readings give lily's CPU power between them; the
 /// dashboard labels it an estimate (docs/dashboard.md § 6).
+#[cfg(target_os = "macos")]
 pub fn own_energy_nj() -> Option<u64> {
     let mut info = sys::RusageInfoV6::default();
     // SAFETY: `info` is laid out as the SDK's `struct rusage_info_v6` (its
@@ -435,6 +451,7 @@ pub fn own_energy_nj() -> Option<u64> {
 /// `vm_statistics64` and `task_vm_info` (checked against the headers with
 /// `offsetof`: `pageins` at 32, `swapouts` at 120; `compressed` at 120,
 /// `phys_footprint` at 144).
+#[cfg(target_os = "macos")]
 mod sys {
     use std::ffi::{c_char, c_int, c_void};
     use std::sync::OnceLock;
@@ -611,6 +628,229 @@ mod sys {
         static HOST: OnceLock<u32> = OnceLock::new();
         // SAFETY: no preconditions.
         *HOST.get_or_init(|| unsafe { mach_host_self() })
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub use procfs::{
+    cpu_ticks, memory_use, own_energy_nj, pressure_level, swap_used, task_memory,
+    user_wire_limit, vm_counters,
+};
+
+/// The Linux sources of the figures above, read from `/proc`. Each reading
+/// is a read of one small text file, tens of microseconds, at the same
+/// phase boundaries and status requests as on macOS. The figures keep the
+/// meanings the callers were written for where Linux has the same thing, and
+/// say below where they are the nearest Linux has.
+#[cfg(target_os = "linux")]
+mod procfs {
+    use super::{CpuTicks, MemoryUse, TaskMemory, VmCounters};
+
+    /// The pressure stall share (percent of the last 10 s) from which
+    /// [`pressure_level`] reports warning: some task waited for memory a
+    /// tenth of the time.
+    pub(super) const PSI_WARNING_PCT: f64 = 10.0;
+    /// ... and from which it reports critical, read from the `full` line:
+    /// every runnable task waited for memory at once a tenth of the time.
+    pub(super) const PSI_CRITICAL_PCT: f64 = 10.0;
+    /// `CAP_IPC_LOCK` (`linux/capability.h`): `mlock` without the
+    /// `RLIMIT_MEMLOCK` limit.
+    const CAP_IPC_LOCK: u32 = 14;
+
+    /// The values of `keys` in a `/proc` file of `name value [kB]` lines
+    /// (`/proc/vmstat`, `/proc/meminfo`, `/proc/self/status`; a colon after
+    /// the name is ignored), in bytes where the line gives `kB`; `None` for a
+    /// key the text does not have.
+    pub(super) fn proc_values<const N: usize>(
+        text: &str,
+        keys: [&str; N],
+    ) -> [Option<u64>; N] {
+        let mut out = [None; N];
+        for line in text.lines() {
+            let mut words = line.split_whitespace();
+            let (Some(name), Some(value)) = (words.next(), words.next()) else {
+                continue;
+            };
+            let name = name.strip_suffix(':').unwrap_or(name);
+            if let Some(i) = keys.iter().position(|&k| k == name) {
+                let scale = if words.next() == Some("kB") { 1024 } else { 1 };
+                out[i] = value.parse::<u64>().ok().and_then(|v| v.checked_mul(scale));
+            }
+        }
+        out
+    }
+
+    /// [`proc_values`] of the file at `path`, `None` when it cannot be read.
+    fn read_values<const N: usize>(
+        path: &str,
+        keys: [&str; N],
+    ) -> Option<[Option<u64>; N]> {
+        std::fs::read_to_string(path).ok().map(|text| proc_values(&text, keys))
+    }
+
+    fn page_size() -> Option<u64> {
+        // SAFETY: sysconf has no preconditions.
+        u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+            .ok()
+            .filter(|&p| p > 0)
+    }
+
+    /// The system's paging counters from `/proc/vmstat`, in pages of the
+    /// kernel's page size. `pageins` is `pgpgin` (kilobytes read from block
+    /// devices, files and swap alike, converted to pages): Linux counts
+    /// reads, not file page-ins. `pageouts` is `nr_vmscan_write`, the pages
+    /// reclaim wrote out to make room (to files or to swap); plain write-back
+    /// of written files is not in it. Swap is `pswpin`/`pswpout`. The
+    /// compressor is zswap: `zswpout` pages compressed into it, `zswpin`
+    /// pages read back out (0 on a kernel without zswap or swap).
+    pub fn vm_counters() -> Option<VmCounters> {
+        let [pgpgin, vmscan_write, pswpin, pswpout, zswpout, zswpin] = read_values(
+            "/proc/vmstat",
+            ["pgpgin", "nr_vmscan_write", "pswpin", "pswpout", "zswpout", "zswpin"],
+        )?;
+        let page = page_size()?;
+        Some(VmCounters {
+            pageins: pgpgin?.saturating_mul(1024) / page,
+            pageouts: vmscan_write?,
+            swapins: pswpin.unwrap_or(0),
+            swapouts: pswpout.unwrap_or(0),
+            compressions: zswpout.unwrap_or(0),
+            decompressions: zswpin.unwrap_or(0),
+        })
+    }
+
+    /// The memory pressure level on macOS's scale (1 normal, 2 warning,
+    /// 4 critical) from the kernel's pressure stall information
+    /// (`/proc/pressure/memory`), which is what Linux has instead of a
+    /// level: the share of the last 10 s that tasks waited for memory
+    /// (reclaim, refaults, swap-ins). `None` without PSI (`CONFIG_PSI` off
+    /// or `psi=0`).
+    pub fn pressure_level() -> Option<u32> {
+        psi_level(&std::fs::read_to_string("/proc/pressure/memory").ok()?)
+    }
+
+    /// [`pressure_level`] of the file's text: critical from
+    /// [`PSI_CRITICAL_PCT`] on the `full` line, warning from
+    /// [`PSI_WARNING_PCT`] on the `some` line, normal otherwise.
+    pub(super) fn psi_level(text: &str) -> Option<u32> {
+        let avg10 = |kind: &str| {
+            text.lines()
+                .find(|line| line.split_whitespace().next() == Some(kind))?
+                .split_whitespace()
+                .find_map(|field| field.strip_prefix("avg10="))?
+                .parse::<f64>()
+                .ok()
+                .filter(|v| v.is_finite())
+        };
+        let some = avg10("some")?;
+        // The `full` line is missing on kernels before 5.13 for some
+        // resources; for memory it has been there from the start, but a
+        // missing one reads as no stall.
+        let full = avg10("full").unwrap_or(0.0);
+        Some(if full >= PSI_CRITICAL_PCT {
+            4
+        } else if some >= PSI_WARNING_PCT {
+            2
+        } else {
+            1
+        })
+    }
+
+    /// How much memory this process may lock with `mlock`: the soft
+    /// `RLIMIT_MEMLOCK` (8 MB on a stock Arch system, raised with `ulimit -l`
+    /// or `LimitMEMLOCK=` in a unit). Without a limit (`unlimited`, or
+    /// `CAP_IPC_LOCK`, which lifts it) only the physical memory bounds it,
+    /// and that is what is returned. `None` when neither can be read.
+    pub fn user_wire_limit() -> Option<u64> {
+        let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        // SAFETY: a valid out-parameter for a resource the kernel knows.
+        let rc = unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut limit) };
+        let unlimited = rc == 0 && limit.rlim_cur == libc::RLIM_INFINITY;
+        if rc != 0 || unlimited || has_ipc_lock() {
+            return crate::qwen4exp::weights::physical_memory();
+        }
+        Some(limit.rlim_cur)
+    }
+
+    /// Whether this process holds `CAP_IPC_LOCK` (`CapEff` in
+    /// `/proc/self/status`, a hexadecimal mask).
+    fn has_ipc_lock() -> bool {
+        let Ok(text) = std::fs::read_to_string("/proc/self/status") else {
+            return false;
+        };
+        text.lines()
+            .find_map(|line| line.strip_prefix("CapEff:"))
+            .and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
+            .is_some_and(|mask| mask & (1 << CAP_IPC_LOCK) != 0)
+    }
+
+    /// The host's CPU ticks (`USER_HZ`) from the `cpu` line of `/proc/stat`:
+    /// `user` and `nice` as they are, `system` with the interrupt and
+    /// steal time (busy, not idle), `idle` with the time waiting for I/O.
+    pub fn cpu_ticks() -> Option<CpuTicks> {
+        let text = std::fs::read_to_string("/proc/stat").ok()?;
+        cpu_line(text.lines().next()?)
+    }
+
+    /// [`cpu_ticks`] of the `cpu` line. Fields after `steal` (guest time,
+    /// already in `user` and `nice`) are not added.
+    pub(super) fn cpu_line(line: &str) -> Option<CpuTicks> {
+        let mut words = line.split_whitespace();
+        (words.next()? == "cpu").then_some(())?;
+        let mut v = [0u64; 8];
+        for (slot, word) in v.iter_mut().zip(&mut words) {
+            *slot = word.parse().ok()?;
+        }
+        let [user, nice, system, idle, iowait, irq, softirq, steal] = v;
+        Some(CpuTicks {
+            user,
+            system: system + irq + softirq + steal,
+            idle: idle + iowait,
+            nice,
+        })
+    }
+
+    /// The machine's memory from `/proc/meminfo`: `MemTotal`, and as used
+    /// what the kernel cannot hand out without swapping, `MemTotal` minus
+    /// `MemAvailable` (the page cache and reclaimable slabs are available;
+    /// GPU buffers, which are pinned shared memory, are not).
+    pub fn memory_use() -> Option<MemoryUse> {
+        let [total, available] =
+            read_values("/proc/meminfo", ["MemTotal", "MemAvailable"])?;
+        let total = total.filter(|&t| t > 0)?;
+        Some(MemoryUse { total, used: total.saturating_sub(available?) })
+    }
+
+    /// Bytes of swap in use, `SwapTotal` minus `SwapFree` (0 without swap).
+    /// Pages zswap holds count: each keeps its swap slot.
+    pub fn swap_used() -> Option<u64> {
+        let [total, free] = read_values("/proc/meminfo", ["SwapTotal", "SwapFree"])?;
+        Some(total?.saturating_sub(free?))
+    }
+
+    /// This process's memory from `/proc/self/status`. The footprint is its
+    /// anonymous and shared-memory resident pages (`RssAnon` + `RssShmem`),
+    /// not the file pages it maps (the n-gram table's page cache), as on
+    /// macOS. The GPU buffers are in `RssShmem` only on a kernel whose GPU
+    /// driver charges the pages it holds to the process that created them
+    /// (the Asahi driver of the aurora kernels does); on another, the
+    /// buffers' pages are mapped as device memory and this figure leaves them
+    /// out. `compressed` is `VmSwap`: the process's pages in swap, zswap's
+    /// compressed pool included, the nearest to macOS's compressor.
+    pub fn task_memory() -> Option<TaskMemory> {
+        let [anon, shmem, swap] =
+            read_values("/proc/self/status", ["RssAnon", "RssShmem", "VmSwap"])?;
+        Some(TaskMemory {
+            phys_footprint: anon?.saturating_add(shmem.unwrap_or(0)),
+            compressed: swap.unwrap_or(0),
+        })
+    }
+
+    /// Linux keeps no per-process energy estimate (RAPL-style counters are
+    /// per package, and this machine exposes none), so lily's CPU power is
+    /// unknown: always `None`.
+    pub fn own_energy_nj() -> Option<u64> {
+        None
     }
 }
 

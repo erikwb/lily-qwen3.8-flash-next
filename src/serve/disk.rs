@@ -675,6 +675,7 @@ fn eviction_line(entry: &DiskEntry, why: &str) -> String {
 }
 
 /// Bytes available to this user on the volume holding `path`.
+#[cfg(target_os = "macos")]
 fn available_bytes(path: &Path) -> Option<u64> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
@@ -713,6 +714,26 @@ fn available_bytes(path: &Path) -> Option<u64> {
     // SAFETY: valid NUL-terminated path and a properly sized out-struct.
     let rc = unsafe { statvfs(c.as_ptr(), &mut st) };
     (rc == 0).then(|| u64::from(st.f_bavail) * st.f_frsize)
+}
+
+/// Bytes available to this user on the volume holding `path`, from the
+/// `libc` crate's `statvfs` (Linux's layout: 64-bit block counts, unlike
+/// Darwin's 32-bit ones above).
+#[cfg(target_os = "linux")]
+fn available_bytes(path: &Path) -> Option<u64> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let c = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut st = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: a valid NUL-terminated path and an out-struct of the type the
+    // function writes; it is read only after a successful call filled it.
+    let rc = unsafe { libc::statvfs(c.as_ptr(), st.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
+    }
+    // SAFETY: the call succeeded, so the struct is initialised.
+    let st = unsafe { st.assume_init() };
+    st.f_bavail.checked_mul(st.f_frsize)
 }
 
 #[cfg(test)]
