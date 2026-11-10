@@ -11,8 +11,10 @@
 //!   through specialization constants 0 to 2, so there is one pipeline per
 //!   kernel and threadgroup size.
 //! - **Arguments** bind by GPU address, as on Metal 4: a dispatch's buffer
-//!   and param addresses are a table in the pass's arena, whose address and
-//!   the thread grid are the push constants (`common.glsl`).
+//!   and param addresses, with its thread grid, are its push constants
+//!   (`common.glsl`), which the compiler reads once per dispatch, not per
+//!   thread. A four-byte host param can travel as its value in place of an
+//!   address ([`INLINE_PARAMS`]).
 //! - **Ordering.** Dispatches of one command buffer overlap unless a barrier
 //!   separates them (Honeykrisp encodes a barrier in the compute stream), so
 //!   serial passes place one after every dispatch and concurrent passes at
@@ -87,9 +89,9 @@ pub enum MslVersion {
 /// Largest `params` slice any dispatch passes.
 const MAX_KERNEL_PARAMS: usize = 16;
 
-/// Metal's buffer-argument limit, kept: the kernels' binding indices are
-/// Metal's.
-const MAX_BUFFER_BINDINGS: usize = 31;
+/// The arguments of a dispatch (Metal allows 31; the kernels use at most
+/// 20): what the push constants hold beside the grid.
+const MAX_BUFFER_BINDINGS: usize = 30;
 
 /// Alignment of every inline param and address table in the arena.
 const PARAM_ALIGN: usize = 16;
@@ -97,9 +99,19 @@ const PARAM_ALIGN: usize = 16;
 /// First arena chunk; a pass that outgrows it gets a larger one appended.
 const ARENA_CHUNK: usize = 1 << 20;
 
-/// The push constants of every kernel (`common.glsl`): the address of the
-/// dispatch's address table and its thread grid.
-const PUSH_BYTES: u32 = 32;
+/// The push constants of every kernel (`common.glsl`): the thread grid, the
+/// mask of the arguments that are values, and the arguments.
+const PUSH_HEADER: usize = 16;
+const PUSH_BYTES: u32 = (PUSH_HEADER + 8 * MAX_BUFFER_BINDINGS) as u32;
+
+/// Whether a four-byte host param is passed as its value (`LILY_VK_INLINE_PARAMS=1`):
+/// the shader then reads it from the push constants, once per dispatch,
+/// where through its address every thread loads it. Off until every shader
+/// reads its four-byte params through `arg_u32`/`arg_f32`/`arg_i32`.
+fn inline_params() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LILY_VK_INLINE_PARAMS").is_some_and(|v| v == "1"))
+}
 
 /// Dispatches per command buffer of a serial and of a concurrent pass
 /// (`LILY_VK_BATCH` sets both), and command buffers in flight
@@ -234,14 +246,19 @@ impl Dev {
                 .push_next(&mut v13)
                 .push_next(&mut cooperative);
             instance.get_physical_device_features2(physical, &mut features);
-            // Robust buffer access costs a bounds check per access and the
-            // kernels address memory by pointer anyway.
-            features.features.robust_buffer_access = vk::FALSE;
             let core = features.features;
             ensure!(
                 core.shader_int64 == vk::TRUE && core.shader_int16 == vk::TRUE,
                 "the Vulkan device lacks 64-bit or 16-bit integers"
             );
+            // Of the core features only the integer widths: a feature that
+            // is enabled is paid for whether it is used or not. With sparse
+            // residency on, Honeykrisp compiles a residency lookup around
+            // every load through a pointer (measured on the MoE gathers,
+            // 2026-11-10); robust buffer access is a bounds check each.
+            features.features = vk::PhysicalDeviceFeatures::default()
+                .shader_int64(true)
+                .shader_int16(true);
 
             let queues = [vk::DeviceQueueCreateInfo::default()
                 .queue_family_index(queue_family)
@@ -1541,18 +1558,32 @@ impl<'a> ComputePass<'a> {
         let dev = &self.ctx.dev;
         self.with_cmd(|device, seg, inner| {
             let mut table = [0u64; MAX_BUFFER_BINDINGS];
+            let mut inline = 0u32;
+            let by_value = inline_params();
             for (slot, (buf, offset)) in table.iter_mut().zip(buffers) {
                 *slot = buf.address() + *offset as u64;
             }
-            for (slot, param) in table[buffers.len()..].iter_mut().zip(params) {
-                *slot = match param {
+            for (i, param) in params.iter().enumerate() {
+                let at = buffers.len() + i;
+                let word = |bytes: [u8; 4]| u64::from(u32::from_ne_bytes(bytes));
+                let value = match param {
                     Param::Bytes(bytes) => {
                         ensure!(!bytes.is_empty(), "empty kernel param");
-                        inner.arena.push(dev, bytes)?
+                        (*bytes).try_into().ok().map(word)
                     }
-                    Param::U32(v) => inner.arena.push(dev, &v.to_ne_bytes())?,
-                    Param::F32(v) => inner.arena.push(dev, &v.to_ne_bytes())?,
-                    Param::Gpu(buf, offset) => {
+                    Param::U32(v) => Some(word(v.to_ne_bytes())),
+                    Param::F32(v) => Some(word(v.to_ne_bytes())),
+                    Param::Gpu(..) => None,
+                };
+                table[at] = match (param, value) {
+                    (_, Some(value)) if by_value => {
+                        inline |= 1 << at;
+                        value
+                    }
+                    (Param::Bytes(bytes), _) => inner.arena.push(dev, bytes)?,
+                    (Param::U32(v), _) => inner.arena.push(dev, &v.to_ne_bytes())?,
+                    (Param::F32(v), _) => inner.arena.push(dev, &v.to_ne_bytes())?,
+                    (Param::Gpu(buf, offset), _) => {
                         ensure!(
                             offset.is_multiple_of(4) && *offset + 4 <= buf.length(),
                             "GPU param at byte {offset} is not a word of its buffer"
@@ -1562,13 +1593,14 @@ impl<'a> ComputePass<'a> {
                 };
             }
             let bound = buffers.len() + params.len();
-            let address =
-                inner.arena.push(dev, bytemuck::cast_slice(&table[..bound.max(1)]))?;
             let mut push = [0u8; PUSH_BYTES as usize];
-            push[..8].copy_from_slice(&address.to_ne_bytes());
-            push[8..12].copy_from_slice(&(threads.0 as u32).to_ne_bytes());
-            push[12..16].copy_from_slice(&(threads.1 as u32).to_ne_bytes());
-            push[16..20].copy_from_slice(&(threads.2 as u32).to_ne_bytes());
+            push[0..4].copy_from_slice(&(threads.0 as u32).to_ne_bytes());
+            push[4..8].copy_from_slice(&(threads.1 as u32).to_ne_bytes());
+            push[8..12].copy_from_slice(&(threads.2 as u32).to_ne_bytes());
+            push[12..16].copy_from_slice(&inline.to_ne_bytes());
+            push[PUSH_HEADER..PUSH_HEADER + 8 * bound]
+                .copy_from_slice(bytemuck::cast_slice(&table[..bound]));
+            let push = &push[..PUSH_HEADER + 8 * bound];
             // SAFETY: the command buffer is recording; the pipeline and its
             // layout are the device's.
             unsafe {
@@ -1585,7 +1617,7 @@ impl<'a> ComputePass<'a> {
                     dev.layout,
                     vk::ShaderStageFlags::COMPUTE,
                     0,
-                    &push,
+                    push,
                 );
                 device.cmd_dispatch(
                     seg.cmd,

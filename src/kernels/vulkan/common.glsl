@@ -38,18 +38,48 @@ layout(buffer_reference, scalar, buffer_reference_align = 4) buffer F32 { float 
 layout(buffer_reference, scalar, buffer_reference_align = 4) buffer F32x4 { vec4 v[]; };
 layout(buffer_reference, scalar, buffer_reference_align = 8) buffer U64 { uint64_t v[]; };
 
-// A dispatch's arguments: `table` is the address of its address table,
-// entry i the address Metal binds at [[buffer(i)]] (a buffer at its offset,
-// or a `constant T&` param's value), and `grid` its thread grid.
+// float to bfloat, rounded to nearest even as Metal's bfloat(f) is. The
+// driver's own conversion truncates (Vulkan leaves the rounding of a float
+// conversion to the implementation), so `bfloat16_t(f)` is this function
+// everywhere: the macro takes the constructor's place, the type's other
+// uses stay. A vector is `bf16(v)`; `bf16vec4(v)` of a vec4 would truncate.
+bfloat16_t bf16(float f) {
+    uint u = floatBitsToUint(f);
+    uint r = u + 0x7FFFu + ((u >> 16) & 1u);
+    // A NaN keeps its high bits: rounding up could carry it into infinity.
+    if ((u & 0x7FFFFFFFu) > 0x7F800000u) r = u;
+    return uintBitsToBFloat16EXT(uint16_t(r >> 16));
+}
+bf16vec4 bf16(vec4 f) {
+    uvec4 u = floatBitsToUint(f);
+    uvec4 r = u + 0x7FFFu + ((u >> 16) & 1u);
+    r = mix(r, u, greaterThan(u & 0x7FFFFFFFu, uvec4(0x7F800000u)));
+    return uintBitsToBFloat16EXT(u16vec4(r >> 16));
+}
+bfloat16_t bf16(bfloat16_t f) { return f; }
+#define bfloat16_t(f) bf16(f)
+
+// A dispatch's arguments: `grid` is its thread grid and `args[i]` the address
+// Metal binds at [[buffer(i)]]: a buffer at its offset, or a `constant T&`
+// param's value. The compiler reads push constants once per dispatch, so
+// arg(i) costs a thread nothing; what it points at is a load.
 layout(push_constant, scalar) uniform LilyDispatch {
-    uint64_t table;
     uvec3 grid;
+    // Bit i: args[i] is a four-byte param's value itself, not its address.
+    uint by_value;
+    uint64_t args[30];
 } lily_dispatch;
 
-uint64_t arg(uint index) { return U64(lily_dispatch.table).v[index]; }
-// A `constant uint&` / `constant float&` param at binding `index`.
-uint arg_u32(uint index) { return U32(arg(index)).v[0]; }
-float arg_f32(uint index) { return F32(arg(index)).v[0]; }
+uint64_t arg(uint index) { return lily_dispatch.args[index]; }
+// A `constant uint&`, `constant int&` or `constant float&` param at binding
+// `index`. Read a four-byte param through these and nothing else: it may
+// arrive by value.
+uint arg_u32(uint index) {
+    if ((lily_dispatch.by_value >> index & 1u) != 0u) return uint(lily_dispatch.args[index]);
+    return U32(lily_dispatch.args[index]).v[0];
+}
+int arg_i32(uint index) { return int(arg_u32(index)); }
+float arg_f32(uint index) { return uintBitsToFloat(arg_u32(index)); }
 
 // Metal's dispatchThreads runs exactly the grid's threads; Vulkan runs whole
 // threadgroups. False for a thread past the grid of a Grid::Threads dispatch,

@@ -30,8 +30,11 @@ one beside its `.metal` before starting.
   change.
 - **Arguments.** `arg(i)` (common.glsl) is the 64-bit GPU address of what
   Metal binds at `[[buffer(i)]]`: a `device T*` pointer (already at its
-  offset), or the value of a `constant T&` param (`arg_u32(i)`, `arg_f32(i)`,
-  or a struct through a buffer reference you declare). Read and write memory
+  offset), or the value of a `constant T&` param. A four-byte param (`uint`,
+  `int`, `float`) is read with `arg_u32(i)`, `arg_i32(i)` or `arg_f32(i)`
+  and in no other way: the backend may pass it by value in place of its
+  address. A larger one (a `uint4`, a struct) is read through a buffer
+  reference at `arg(i)`. Read and write memory
   through the buffer references of common.glsl: `BF16(arg(0)).v[i]`,
   `U32(address).v[i]`, `F32x4(...)`, ...; declare more where a kernel has a
   struct. All are `scalar` layout: fields at their C offsets (declare the
@@ -45,7 +48,11 @@ one beside its `.metal` before starting.
   reach tens of GB.
 - **Types.** `bfloat` is `bfloat16_t` (GL_EXT_bfloat16): `float(x)` widens
   exactly and `bfloat16_t(f)` rounds to nearest even, as Metal's `bfloat`
-  does. `half` is `float16_t`. `bfloat4`/`float4`/`uint4` are
+  does. That rounding is common.glsl's: the driver's own conversion
+  truncates, so `bfloat16_t(f)` is a macro for the function `bf16(f)`. A
+  vector conversion must be written `bf16(v)` (`bf16vec4(v)` of a `vec4`
+  truncates; `bf16vec4(a, b, c, d)` of four bfloats is fine), and a constant
+  initializer cannot use either (write the bits). `half` is `float16_t`. `bfloat4`/`float4`/`uint4` are
   `bf16vec4`/`vec4`/`uvec4`. Metal `uchar`/`ushort`/`ulong` are
   `uint8_t`/`uint16_t`/`uint64_t`. `as_type<T>(x)` is the
   `floatBitsToUint`/`uintBitsToFloat` family (for bfloat:
@@ -93,9 +100,12 @@ one beside its `.metal` before starting.
   reassociate or contract it differently between two kernels). Metal's
   `fast::`/`precise::` functions are the plain GLSL ones; `rsqrt` is
   `inversesqrt`; `INFINITY` is `1.0 / 0.0`; `fma`, `exp`, `log`, `tanh`,
-  `clamp`, `select` (`mix` with a bool) exist. Do not write a `half`/bf16
-  through `packHalf2x16`: it truncates on this driver. `bfloat16_t(f)` and
-  `float16_t(f)` are right.
+  `clamp`, `select` (`mix` with a bool) exist. Do not write a `half`
+  through `packHalf2x16` or `float16_t(f)`: both truncate on this driver.
+  `precise` does not reach `exp` and the other extended instructions.
+- **Params are loads.** `arg(i)` is a push constant, read once per
+  dispatch; `arg_u32(i)` loads through it unless the param came by value:
+  take each once, outside loops (the compiler does not hoist the load).
 - **Templates and macros.** MSL is C++: templates, lambdas, references,
   `static inline` helpers. GLSL has none of that: functions take
   `in`/`out`/`inout` parameters, families become `#define`d constants per
