@@ -8,15 +8,19 @@
 pub mod activity;
 pub mod chat;
 pub mod config;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod engine;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod generate;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod instance;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod kernels;
 #[cfg(target_os = "macos")]
+pub mod metal;
+/// Linux: the Vulkan backend under the Metal backend's name and API.
+#[cfg(target_os = "linux")]
+#[path = "vulkan.rs"]
 pub mod metal;
 
 /// Diagnostic ablation of decode kernel groups: `LILY_ABLATE=a,b,c` skips the
@@ -84,28 +88,28 @@ pub mod ablate {
         mask & (1 << group as u32) != 0
     }
 }
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod moe_ffn;
 pub mod npy;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod qwen4exp;
 pub mod safetensors;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod serve;
 pub mod sha256;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod stats;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod tensor;
 pub mod thinking;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod tokenizer;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod weights;
 
-#[cfg(all(target_os = "macos", test))]
+#[cfg(all(any(target_os = "macos", target_os = "linux"), test))]
 #[path = "../tests/support/cpu_ref.rs"]
 pub mod cpu_ref;
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 use anyhow::bail;

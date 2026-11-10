@@ -1,0 +1,125 @@
+#version 460
+// The kernels of src/kernels/metal/norm.metal: row-wise weighted RMSNorm and
+// LayerNorm with fp32 reduction. The comments there say why each is as it
+// is; this is the same arithmetic in the same order.
+#include "common.glsl"
+
+#define TG 256
+const uint RESIDUAL_H = 2048;
+
+shared float partial[TG / 32];
+
+#ifdef KERNEL_add_rmsnorm_bf16
+shared float inv_rms;
+void main() {
+    BF16 x = BF16(arg(0)), b = BF16(arg(1)), w = BF16(arg(2)), dst = BF16(arg(3));
+    float eps = arg_f32(4), w_bias = arg_f32(5);
+    uint row = threadgroup_position_in_grid.x, tid = thread_index_in_threadgroup;
+    uint sg = simdgroup_index_in_threadgroup, lane = thread_index_in_simdgroup;
+    bfloat16_t cached[8];
+
+    float acc = 0.0;
+    for (uint j = 0; j < 8; ++j) {
+        uint i = tid + j * TG;
+        bfloat16_t y = bfloat16_t(float(x.v[row * RESIDUAL_H + i]) + float(b.v[row * RESIDUAL_H + i]));
+        cached[j] = y;
+        x.v[row * RESIDUAL_H + i] = y;
+        float v = float(y);
+        acc += v * v;
+    }
+    acc = subgroupAdd(acc);
+    if (lane == 0) partial[sg] = acc;
+    barrier();
+    if (tid == 0) {
+        float total = 0.0;
+        for (uint i = 0; i < TG / 32; ++i) total += partial[i];
+        inv_rms = inversesqrt(total / float(RESIDUAL_H) + eps);
+    }
+    barrier();
+    for (uint j = 0; j < 8; ++j) {
+        uint i = tid + j * TG;
+        float gain = w_bias + float(w.v[i]);
+        dst.v[row * RESIDUAL_H + i] = bfloat16_t(float(cached[j]) * inv_rms * gain);
+    }
+}
+#endif
+
+#ifdef KERNEL_rmsnorm_bf16
+shared float inv_rms;
+void main() {
+    BF16 x = BF16(arg(0)), w = BF16(arg(1)), dst = BF16(arg(2));
+    uint H = arg_u32(3);
+    float eps = arg_f32(4), w_bias = arg_f32(5);
+    uint row = threadgroup_position_in_grid.x, tid = thread_index_in_threadgroup;
+    uint sg = simdgroup_index_in_threadgroup, lane = thread_index_in_simdgroup;
+
+    float acc = 0.0;
+    for (uint i = tid; i < H; i += TG) {
+        float v = float(x.v[row * H + i]);
+        acc += v * v;
+    }
+    acc = subgroupAdd(acc);
+    if (lane == 0) partial[sg] = acc;
+    barrier();
+    if (tid == 0) {
+        float total = 0.0;
+        for (uint i = 0; i < TG / 32; ++i) total += partial[i];
+        inv_rms = inversesqrt(total / float(H) + eps);
+    }
+    barrier();
+    for (uint i = tid; i < H; i += TG) {
+        float gain = w_bias + float(w.v[i]);
+        dst.v[row * H + i] = bfloat16_t(float(x.v[row * H + i]) * inv_rms * gain);
+    }
+}
+#endif
+
+#ifdef KERNEL_layernorm_bf16
+shared float stat;
+void main() {
+    BF16 x = BF16(arg(0)), w = BF16(arg(1)), b = BF16(arg(2)), dst = BF16(arg(3));
+    uint H = arg_u32(4);
+    float eps = arg_f32(5);
+    uint row = threadgroup_position_in_grid.x, tid = thread_index_in_threadgroup;
+    uint sg = simdgroup_index_in_threadgroup, lane = thread_index_in_simdgroup;
+
+    // The row's elements: a 64-bit offset goes into the address (an array
+    // index is 32 bits).
+    x = BF16(arg(0) + 2 * uint64_t(row) * H);
+    dst = BF16(arg(3) + 2 * uint64_t(row) * H);
+    float acc = 0.0;
+    for (uint i = tid; i < H; i += TG) acc += float(x.v[i]);
+    acc = subgroupAdd(acc);
+    if (lane == 0) partial[sg] = acc;
+    barrier();
+    if (tid == 0) {
+        float total = 0.0;
+        for (uint i = 0; i < TG / 32; ++i) total += partial[i];
+        stat = total / float(H);
+    }
+    barrier();
+    float mean = stat;
+
+    float sq = 0.0;
+    for (uint i = tid; i < H; i += TG) {
+        float d = float(x.v[i]) - mean;
+        sq += d * d;
+    }
+    sq = subgroupAdd(sq);
+    barrier();
+    if (lane == 0) partial[sg] = sq;
+    barrier();
+    if (tid == 0) {
+        float total = 0.0;
+        for (uint i = 0; i < TG / 32; ++i) total += partial[i];
+        stat = inversesqrt(total / float(H) + eps);
+    }
+    barrier();
+    float inv_std = stat;
+
+    for (uint i = tid; i < H; i += TG) {
+        float v = (float(x.v[i]) - mean) * inv_std;
+        dst.v[i] = bfloat16_t(v * float(w.v[i]) + float(b.v[i]));
+    }
+}
+#endif

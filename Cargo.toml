@@ -92,6 +92,13 @@ objc2-metal = "0.3.2"
 # root. Library only: the default `app` feature is the TUI.
 macmon = { version = "=0.9.0", default-features = false }
 
+# Vulkan (Honeykrisp on Apple GPUs under Linux): `src/vulkan.rs` is this
+# system's `crate::metal`. `ash` is the thin binding; it loads the system's
+# Vulkan loader at run time. The kernels are built by `build.rs` with `glslc`.
+[target.'cfg(target_os = "linux")'.dependencies]
+ash = { version = "0.38", features = ["loaded"] }
+libc = "0.2.189"
+
 [dev-dependencies]
 rand = { version = "0.8.5", features = ["small_rng"] }
 
