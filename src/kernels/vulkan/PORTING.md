@@ -130,6 +130,11 @@ one beside its `.metal` before starting.
 
 Things this driver and compiler do that a plain translation trips over:
 
+- **Wide bfloat loads.** A `bf16vec4` read through `BF16x4` is four 16-bit
+  loads (the reference is 2-byte aligned). Where the Metal kernel reads
+  `bfloat4`s for speed, load `uvec4` words through `U32x4` (16 bytes, eight
+  bfloats) and widen them: `uintBitsToFloat(w << 16)` and
+  `uintBitsToFloat(w & 0xffff0000u)` are a word's two bfloats, exactly.
 - **Lookup tables.** Declare a table as a global with an initializer
   (`uint kTable[256] = uint[256](...);`), not as a `const` array: indexing a
   `const` array copies it into every function that does, and so into every
