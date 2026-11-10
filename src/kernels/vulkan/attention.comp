@@ -1,0 +1,1077 @@
+#version 460
+// The kernels of src/kernels/metal/attention.metal: RoPE, q/gate splitting,
+// KV-cache appends and scaled dot-product attention, each the same
+// arithmetic in the same order. The comments there say why each is as it is.
+#include "common.glsl"
+#include "attention_common.glsl"
+#ifdef KERNEL_sdpa_prefill_nax_qdev128
+#include "matmul.glsl"
+#endif
+
+#define TG 256
+#define MAX_T 4096
+#define NEG_INFINITY (-1.0 / 0.0)
+
+// float4(as_type<bfloat4>(u)): the four bfloats two words hold, widened (a
+// bfloat is the high half of its float).
+vec4 bf4(uvec2 u) {
+    return uintBitsToFloat(uvec4(u.x << 16, u.x & 0xFFFF0000u, u.y << 16, u.y & 0xFFFF0000u));
+}
+// float4(as_type<char4>(u)).
+vec4 char4(uint u) {
+    int s = int(u);
+    return vec4(ivec4(s << 24, s << 16, s << 8, s) >> 24);
+}
+
+// An index within one head of a K/V cache fits 32 bits (the wrappers check
+// max_seq <= MAX_SEQ = 2^18 and D <= 256), so the decode loops index a head's
+// rows with 32-bit math where the Metal kernels write (ulong)row * D; a
+// head's own offset and the other tensors' go into the address.
+
+float rope_position(uint seq_index, int rope_delta) {
+    return float(int(seq_index) + rope_delta);
+}
+
+uint mrope_axis(uint j, uint sec_h_end, uint sec_w_end) {
+    uint axis = j % 3;
+    if (axis == 1) return j < sec_h_end ? 1u : 0u;
+    if (axis == 2) return j < sec_w_end ? 2u : 0u;
+    return 0u;
+}
+
+// Pair j of a row, (lo, hi), rotated to `position`: the one copy of what
+// each RoPE kernel computes, so that those the tests hold bit-identical are.
+void rope_rotate(float position, uint j, uint rot, float theta, float lo, float hi,
+                 out bfloat16_t out_lo, out bfloat16_t out_hi) {
+    float inv_freq = pow(theta, -2.0 * float(j) / float(rot));
+    float ang = position * inv_freq;
+    float c = cos(ang);
+    float s = sin(ang);
+    precise float r_lo = lo * c - hi * s;
+    precise float r_hi = hi * c + lo * s;
+    out_lo = bfloat16_t(r_lo);
+    out_hi = bfloat16_t(r_hi);
+}
+
+#if defined(KERNEL_rope_neox_bf16) || defined(KERNEL_rope_neox_mrope_bf16)
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    uvec2 gid = thread_position_in_grid.xy;
+#ifdef KERNEL_rope_neox_mrope_bf16
+    U32 positions = U32(arg(1));
+    uint D = arg_u32(2), rot = arg_u32(3), base_pos = arg_u32(4);
+    float theta = arg_f32(5);
+    uint row_elems = arg_u32(6), pos_base = arg_u32(7);
+    uint sec_h_end = arg_u32(8), sec_w_end = arg_u32(9);
+#else
+    uint D = arg_u32(1), rot = arg_u32(2), base_pos = arg_u32(3);
+    float theta = arg_f32(4);
+    uint row_elems = arg_u32(5);
+    int rope_delta = arg_i32(6);
+#endif
+    uint half_rot = rot / 2;
+    uint h = gid.x / half_rot;
+    uint j = gid.x % half_rot;
+#ifdef KERNEL_rope_neox_mrope_bf16
+    uint axis = mrope_axis(j, sec_h_end, sec_w_end);
+    float position = float(positions.v[(base_pos + gid.y - pos_base) * 3 + axis]);
+#else
+    float position = rope_position(base_pos + gid.y, rope_delta);
+#endif
+    BF16 x = BF16(arg(0) + 2 * (uint64_t(gid.y) * row_elems + uint64_t(h) * D));
+    bfloat16_t lo, hi;
+    rope_rotate(position, j, rot, theta, float(x.v[j]), float(x.v[half_rot + j]), lo, hi);
+    x.v[j] = lo;
+    x.v[half_rot + j] = hi;
+}
+#endif
+
+#ifdef KERNEL_split_q_gate_bf16
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    uint D = arg_u32(3), gid = thread_position_in_grid.x;
+    uint h = gid / D;
+    uint d = gid % D;
+    BF16 qg = BF16(arg(0) + 2 * (uint64_t(h) * 2 * D));
+    BF16(arg(1)).v[gid] = qg.v[d];
+    BF16(arg(2)).v[gid] = qg.v[D + d];
+}
+#endif
+
+#ifdef KERNEL_scatter_kv_bf16
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    uint D = arg_u32(2), max_seq = arg_u32(3), base_pos = arg_u32(4), kvh = arg_u32(5);
+    uint gid = thread_position_in_grid.x;
+    uint d = gid % D;
+    uint h = (gid / D) % kvh;
+    uint m = gid / (D * kvh);
+    BF16(arg(0) + 2 * ((uint64_t(h) * max_seq + base_pos + m) * D)).v[d] = BF16(arg(1)).v[gid];
+}
+#endif
+
+// --- 8-bit K/V cache (q8) ------------------------------------------------------
+#define KV_Q8_GROUP 32
+#define KV_Q8_SCALE_MAX 65504.0
+
+// kv_q8_store: the value of this lane quantized, and the bits of its group's
+// scale (the subgroup's 32 lanes hold one group), which lane 0 stores.
+int8_t kv_q8(float x, out uint d) {
+    precise float step = subgroupMax(abs(x)) / 127.0;
+    d = f16_rne_bits(min(step, KV_Q8_SCALE_MAX));
+    float step_h = f16_bits_value(d);
+    float id = step_h != 0.0 ? 1.0 / step_h : 0.0;
+    return int8_t(int(clamp(roundEven(x * id), -127.0, 127.0)));
+}
+
+// Threads past the grid are whole subgroups (the Metal kernel's comment: the
+// grid is a multiple of 32), so every subgroup that runs is a whole group
+// and has its lane 0.
+#ifdef KERNEL_scatter_kv_q8
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    uint D = arg_u32(3), max_seq = arg_u32(4), base_pos = arg_u32(5), kvh = arg_u32(6);
+    uint gid = thread_position_in_grid.x, lane = thread_index_in_simdgroup;
+    uint d = gid % D;
+    uint h = (gid / D) % kvh;
+    uint m = gid / (D * kvh);
+    uint64_t row = uint64_t(h) * max_seq + base_pos + m;
+    uint scale;
+    I8(arg(0) + row * D).v[d] = kv_q8(float(BF16(arg(2)).v[gid]), scale);
+    if (lane == 0) U16(arg(1) + 2 * (row * (D / KV_Q8_GROUP))).v[d / KV_Q8_GROUP] = uint16_t(scale);
+}
+#endif
+
+#ifdef KERNEL_kv_dequant_q8
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    uint D = arg_u32(3), max_seq = arg_u32(4), len = arg_u32(5), out_cap = arg_u32(6);
+    uint gid = thread_position_in_grid.x;
+    uint d = gid % D;
+    uint t = (gid / D) % len;
+    uint h = gid / (D * len);
+    uint64_t row = uint64_t(h) * max_seq + t;
+    float x = float(I8(arg(0) + row * D).v[d]) *
+        float(F16(arg(1) + 2 * (row * (D / KV_Q8_GROUP))).v[d / KV_Q8_GROUP]);
+    BF16(arg(2) + 2 * ((uint64_t(h) * out_cap + t) * D)).v[d] = bfloat16_t(x);
+}
+#endif
+
+// --- Decode-step Q and K prep --------------------------------------------------
+#if defined(KERNEL_q_norm_rope_split_decode_bf16) || defined(KERNEL_k_norm_rope_scatter_decode_bf16) || \
+    defined(KERNEL_k_norm_rope_scatter_decode_q8)
+shared float partial[8];
+shared float inv_rms;
+shared bfloat16_t normed[256];
+
+// The RMSNorm of the threadgroup's row, of which this thread holds `value`,
+// into normed[].
+void prep_norm(float value, BF16 w, uint D, float eps) {
+    uint tid = thread_index_in_threadgroup;
+    float acc = value * value;
+    acc = subgroupAdd(acc);
+    if (thread_index_in_simdgroup == 0) partial[simdgroup_index_in_threadgroup] = acc;
+    barrier();
+    if (tid == 0) {
+        float total = 0.0;
+        for (uint i = 0; i < 8; ++i) total += partial[i];
+        inv_rms = inversesqrt(total / float(D) + eps);
+    }
+    barrier();
+    precise float n = value * inv_rms * (1.0 + float(w.v[tid]));
+    normed[tid] = bfloat16_t(n);
+    barrier();
+}
+
+// The RoPE of normed[] at `pos`: this thread's pair or, past the rotary
+// dims, its one element, stored through the lvalue macro DST(i).
+#define PREP_ROPE(DST)                                                              \
+    {                                                                               \
+        uint half_rot = rot / 2;                                                    \
+        if (tid < half_rot) {                                                       \
+            bfloat16_t lo, hi;                                                      \
+            rope_rotate(rope_position(pos, rope_delta), tid, rot, theta,            \
+                        float(normed[tid]), float(normed[half_rot + tid]), lo, hi); \
+            DST(tid) = lo;                                                          \
+            DST(half_rot + tid) = hi;                                               \
+        } else if (tid >= rot) {                                                    \
+            DST(tid) = normed[tid];                                                 \
+        }                                                                           \
+    }
+#endif
+
+#ifdef KERNEL_q_norm_rope_split_decode_bf16
+void main() {
+    uint D = arg_u32(4), rot = arg_u32(5), pos = arg_u32(6);
+    float theta = arg_f32(7), eps = arg_f32(8);
+    int rope_delta = arg_i32(9);
+    uint head = threadgroup_position_in_grid.x, tid = thread_index_in_threadgroup;
+    BF16 qg = BF16(arg(0) + 2 * (uint64_t(head) * 2 * D));
+    BF16 q = BF16(arg(2) + 2 * (uint64_t(head) * D));
+    BF16 gate = BF16(arg(3) + 2 * (uint64_t(head) * D));
+    float value = float(qg.v[tid]);
+    gate.v[tid] = qg.v[D + tid];
+    prep_norm(value, BF16(arg(1)), D, eps);
+#define Q_AT(i) q.v[i]
+    PREP_ROPE(Q_AT)
+}
+#endif
+
+#ifdef KERNEL_k_norm_rope_scatter_decode_bf16
+void main() {
+    uint D = arg_u32(3), rot = arg_u32(4), pos = arg_u32(5);
+    float theta = arg_f32(6), eps = arg_f32(7);
+    uint max_seq = arg_u32(8);
+    int rope_delta = arg_i32(9);
+    uint head = threadgroup_position_in_grid.x, tid = thread_index_in_threadgroup;
+    BF16 k = BF16(arg(0) + 2 * (uint64_t(head) * D));
+    BF16 cache = BF16(arg(2) + 2 * ((uint64_t(head) * max_seq + pos) * D));
+    prep_norm(float(k.v[tid]), BF16(arg(1)), D, eps);
+#define CACHE_AT(i) cache.v[i]
+    PREP_ROPE(CACHE_AT)
+}
+#endif
+
+#ifdef KERNEL_k_norm_rope_scatter_decode_q8
+shared bfloat16_t roped[256];
+void main() {
+    uint D = arg_u32(4), rot = arg_u32(5), pos = arg_u32(6);
+    float theta = arg_f32(7), eps = arg_f32(8);
+    uint max_seq = arg_u32(9);
+    int rope_delta = arg_i32(10);
+    uint head = threadgroup_position_in_grid.x, tid = thread_index_in_threadgroup;
+    BF16 k = BF16(arg(0) + 2 * (uint64_t(head) * D));
+    uint64_t row = uint64_t(head) * max_seq + pos;
+    prep_norm(float(k.v[tid]), BF16(arg(1)), D, eps);
+#define ROPED_AT(i) roped[i]
+    PREP_ROPE(ROPED_AT)
+    barrier();
+    uint scale;
+    I8(arg(2) + row * D).v[tid] = kv_q8(float(roped[tid]), scale);
+    if (thread_index_in_simdgroup == 0) {
+        U16(arg(3) + 2 * (row * (D / KV_Q8_GROUP))).v[tid / KV_Q8_GROUP] = uint16_t(scale);
+    }
+}
+#endif
+
+// --- Causal prefill attention on the matrix units ------------------------------
+//
+// sdpa_nax_body<BQ, BK, SG, QDEV>: a threadgroup of FA_SG subgroups takes a
+// tile of FA_BQ query rows of one head through the keys FA_BK at a time. The
+// two matmul2d of the Metal kernel are 16x16x16 blocks here:
+//   S[BQ, BK] = Q K^T    subgroup s computes the tile's key blocks 2s and
+//                        2s + 1, each a walk over the head dim;
+//   acc[BQ, D] += P V    subgroup s holds the accumulators of the head dims
+//                        64s .. 64s + 63 as four blocks, each walked over the
+//                        tile's eight key blocks.
+// A key block wholly at or past the tile's causal end (k_end) is not
+// computed: its scores are masked and its probabilities zero, which add
+// nothing. Blocks that reach past the tensors (keys past len_total, query
+// rows past M) are staged, as the Metal tensors' extents bound them.
+#ifdef KERNEL_sdpa_prefill_nax_qdev128
+#define FA_BQ 16
+#define FA_BK 128
+#define FA_SG 4
+#endif
+
+#ifdef FA_BQ
+const uint FA_D = 256; // head dim (the model's, fixed)
+const uint FA_LANES = 32 * FA_SG / FA_BQ;
+
+shared float s_tile[FA_BQ * FA_BK];
+shared bfloat16_t p_tile[FA_BQ * FA_BK];
+shared float row_max[FA_BQ], row_sum[FA_BQ], row_alpha[FA_BQ];
+// Not in the Metal kernel: the edge blocks' staging (matmul.glsl).
+shared bfloat16_t mat_stage[MAT_STAGE_ELEMENTS(FA_SG)];
+
+// The right operand of P V: V's rows are the product's K, not transposed.
+#define MAT_LOAD_B_ROWS(b, rows, at, stride) coopMatLoad(b, rows, at, stride, gl_CooperativeMatrixLayoutRowMajor)
+
+void main() {
+    uint max_seq = arg_u32(4), base_len = arg_u32(5), M = arg_u32(6), nq = arg_u32(7), group = arg_u32(8);
+    float scale = arg_f32(9);
+    uint parallel_softmax = arg_u32(10), descending_blocks = arg_u32(11);
+    uvec2 tg = threadgroup_position_in_grid.xy;
+    uint tid = thread_index_in_threadgroup, sg = simdgroup_index_in_threadgroup;
+
+    uint qb = descending_blocks != 0u ? ((M + FA_BQ - 1) / FA_BQ) - 1u - tg.x : tg.x;
+    int q0 = int(qb) * FA_BQ;
+    uint hq = tg.y;
+    int len_total = int(base_len) + int(M);
+
+    // Tile layout requires SG * 32 threads.
+    if (threads_per_threadgroup.x != 32 * FA_SG) return;
+    if (tid < FA_BQ) {
+        row_max[tid] = NEG_INFINITY;
+        row_sum[tid] = 0.0;
+    }
+    barrier();
+
+    uint64_t k_head = arg(1) + 2 * (uint64_t(hq / group) * max_seq * FA_D);
+    uint64_t v_head = arg(2) + 2 * (uint64_t(hq / group) * max_seq * FA_D);
+    // The tile's query rows: row r of it is q_stride elements after row r - 1.
+    uint64_t q_rows = arg(0) + 2 * (uint64_t(uint(q0) * nq + hq) * FA_D);
+    uint q_stride = nq * FA_D;
+    uint q_valid = min(uint(FA_BQ), M - uint(q0));
+
+    MatC acc[4];
+    for (uint i = 0; i < 4; ++i) acc[i] = MatC(0.0);
+
+    int k_end = min(len_total, int(base_len) + q0 + FA_BQ);
+    for (int k0 = 0; k0 < k_end; k0 += FA_BK) {
+        // S = Q K^T.
+        MatC s_acc[2];
+        s_acc[0] = MatC(0.0);
+        s_acc[1] = MatC(0.0);
+        int key_s = k0 + 32 * int(sg);
+        if (key_s < k_end) {
+            for (uint d0 = 0; d0 < FA_D; d0 += 16) {
+                MatA mq;
+                if (q_valid < 16) {
+                    MAT_STAGE(q_rows + 2 * d0, q_stride, q_valid, 16u)
+                    MAT_LOAD_STAGED_A(mq);
+                } else {
+                    MAT_LOAD_A(mq, BF16(q_rows).v, d0, q_stride);
+                }
+                for (uint b = 0; b < 2; ++b) {
+                    int key0 = key_s + 16 * int(b);
+                    if (key0 >= k_end) break;
+                    uint keys = min(16u, uint(len_total - key0));
+                    uint64_t k_rows = k_head + 2 * (uint64_t(key0) * FA_D);
+                    MatB mk;
+                    if (keys < 16) {
+                        MAT_STAGE(k_rows + 2 * d0, FA_D, keys, 16u)
+                        MAT_LOAD_STAGED_B(mk);
+                    } else {
+                        MAT_LOAD_B(mk, BF16(k_rows).v, d0, FA_D);
+                    }
+                    s_acc[b] = coopMatMulAdd(mq, mk, s_acc[b]);
+                }
+            }
+            for (uint b = 0; b < 2; ++b) {
+                if (key_s + 16 * int(b) >= k_end) break;
+                coopMatStore(s_acc[b], s_tile, 32 * sg + 16 * b, FA_BK, gl_CooperativeMatrixLayoutRowMajor);
+            }
+        }
+        barrier();
+
+        // The parallel reduction is not bit-identical to the serial path.
+        if (parallel_softmax != 0u) {
+            uint row = tid / FA_LANES;
+            uint lane8 = tid % FA_LANES;
+            const uint cols = FA_BK / FA_LANES;
+            uint j0 = lane8 * cols;
+            int grow = q0 + int(row);
+            int limit = min(min(int(base_len) + grow + 1, len_total) - k0, FA_BK);
+            float prev_max = row_max[row];
+            float local = prev_max;
+            // This lane's scores, read once for both loops of the Metal kernel.
+            float sv[cols];
+            for (uint j = 0; j < cols; ++j) {
+                sv[j] = s_tile[row * FA_BK + j0 + j] * scale;
+                if (int(j0 + j) < limit) local = max(local, sv[j]);
+            }
+            for (uint off = 1u; off < FA_LANES; off <<= 1) local = max(local, subgroupShuffleXor(local, off));
+            float mx = local;
+            float alpha = exp(prev_max - mx);
+            float psum = 0.0;
+            for (uint j = 0; j < cols; ++j) {
+                float p = int(j0 + j) < limit ? exp(sv[j] - mx) : 0.0;
+                p_tile[row * FA_BK + j0 + j] = bfloat16_t(p);
+                psum += p;
+            }
+            for (uint off = 1u; off < FA_LANES; off <<= 1) psum += subgroupShuffleXor(psum, off);
+            if (lane8 == 0u) {
+                row_sum[row] = row_sum[row] * alpha + psum;
+                row_max[row] = mx;
+                row_alpha[row] = alpha;
+            }
+        } else if (tid < FA_BQ) {
+            int grow = q0 + int(tid);
+            int limit = min(min(int(base_len) + grow + 1, len_total) - k0, FA_BK);
+            float mx = row_max[tid];
+            for (int j = 0; j < limit; ++j) mx = max(mx, s_tile[tid * FA_BK + j] * scale);
+            float alpha = exp(row_max[tid] - mx);
+            float s = row_sum[tid] * alpha;
+            for (int j = 0; j < FA_BK; ++j) {
+                float p = j < limit ? exp(s_tile[tid * FA_BK + j] * scale - mx) : 0.0;
+                p_tile[tid * FA_BK + j] = bfloat16_t(p);
+                s += j < limit ? p : 0.0;
+            }
+            row_max[tid] = mx;
+            row_sum[tid] = s;
+            row_alpha[tid] = alpha;
+        }
+        barrier();
+
+        // acc = acc * alpha[row] + P V. A lane's elements of a block are in
+        // two rows, four each.
+        {
+            float alpha0 = row_alpha[mat_row(0)], alpha1 = row_alpha[mat_row(4)];
+            for (uint i = 0; i < 4; ++i) {
+                for (uint e = 0; e < 4; ++e) acc[i][e] *= alpha0;
+                for (uint e = 4; e < 8; ++e) acc[i][e] *= alpha1;
+            }
+        }
+        for (uint b = 0; b < FA_BK / 16; ++b) {
+            int key0 = k0 + 16 * int(b);
+            if (key0 >= k_end) break;
+            uint keys = min(16u, uint(len_total - key0));
+            uint64_t v_rows = v_head + 2 * (uint64_t(key0) * FA_D);
+            MatA mp;
+            MAT_LOAD_A(mp, p_tile, 16 * b, FA_BK);
+            for (uint i = 0; i < 4; ++i) {
+                uint d0 = 64 * sg + 16 * i;
+                MatB mv;
+                if (keys < 16) {
+                    MAT_STAGE(v_rows + 2 * d0, FA_D, keys, 16u)
+                    MAT_LOAD_B_ROWS(mv, mat_stage, gl_SubgroupID * 256, 16);
+                } else {
+                    MAT_LOAD_B_ROWS(mv, BF16(v_rows).v, d0, FA_D);
+                }
+                acc[i] = coopMatMulAdd(mp, mv, acc[i]);
+            }
+        }
+        // Finish the matrix ops before reusing p_tile and s_tile.
+        barrier();
+    }
+
+    {
+        float sum0 = row_sum[mat_row(0)], sum1 = row_sum[mat_row(4)];
+        for (uint i = 0; i < 4; ++i) {
+            for (uint e = 0; e < 8; ++e) {
+                uint row = mat_row(e), col = 64 * sg + 16 * i + mat_col(e);
+                if (uint(q0) + row < M) {
+                    BF16(arg(3) + 2 * (uint64_t((uint(q0) + row) * nq + hq) * FA_D)).v[col] =
+                        bfloat16_t(acc[i][e] / (e < 4 ? sum0 : sum1));
+                }
+            }
+        }
+    }
+}
+#endif
+
+// --- Decode attention ------------------------------------------------------------
+
+// Single-token GQA SDPA with one threadgroup per query head.
+#ifdef KERNEL_sdpa_decode_bf16
+shared float scores[MAX_T];
+shared float q_s[TG]; // D <= TG assumed
+shared float part[TG / 32];
+shared float red;
+void main() {
+    uint D = arg_u32(4), max_seq = arg_u32(5), len = arg_u32(6), group = arg_u32(7);
+    float scale = arg_f32(8);
+    uint hq = threadgroup_position_in_grid.x, tid = thread_index_in_threadgroup;
+    uint sg = simdgroup_index_in_threadgroup, lane = thread_index_in_simdgroup;
+
+    BF16 k_head = BF16(arg(1) + 2 * (uint64_t(hq / group) * max_seq * D));
+    BF16 v_head = BF16(arg(2) + 2 * (uint64_t(hq / group) * max_seq * D));
+
+    if (tid < D) q_s[tid] = float(BF16(arg(0)).v[hq * D + tid]);
+    barrier();
+
+    float local_max = NEG_INFINITY;
+    for (uint pos = tid; pos < len; pos += TG) {
+        float dp = 0.0;
+        for (uint d = 0; d < D; ++d) dp += q_s[d] * float(k_head.v[pos * D + d]);
+        float s = dp * scale;
+        scores[pos] = s;
+        local_max = max(local_max, s);
+    }
+
+    local_max = subgroupMax(local_max);
+    if (lane == 0) part[sg] = local_max;
+    barrier();
+    if (tid == 0) {
+        float m = NEG_INFINITY;
+        for (uint i = 0; i < TG / 32; ++i) m = max(m, part[i]);
+        red = m;
+    }
+    barrier();
+    float global_max = red;
+
+    float local_sum = 0.0;
+    for (uint pos = tid; pos < len; pos += TG) {
+        float e = exp(scores[pos] - global_max);
+        scores[pos] = e;
+        local_sum += e;
+    }
+    local_sum = subgroupAdd(local_sum);
+    barrier();
+    if (lane == 0) part[sg] = local_sum;
+    barrier();
+    if (tid == 0) {
+        float s = 0.0;
+        for (uint i = 0; i < TG / 32; ++i) s += part[i];
+        red = s;
+    }
+    barrier();
+    float inv_sum = 1.0 / red;
+
+    for (uint d = tid; d < D; d += TG) {
+        float acc = 0.0;
+        for (uint pos = 0; pos < len; ++pos) acc += scores[pos] * float(v_head.v[pos * D + d]);
+        BF16(arg(3)).v[hq * D + d] = bfloat16_t(acc * inv_sum);
+    }
+}
+#endif
+
+// Split-K decode emits local softmax statistics and weighted-V partials.
+#define SDPA_SPLIT 256
+
+// sdpa_decode_split_t<CPT, STRIDED>.
+#ifdef KERNEL_sdpa_decode_split_bf16
+#define SPLIT_CPT 1
+#define SPLIT_STRIDED 0
+#endif
+
+#ifdef SPLIT_CPT
+shared float scores[SDPA_SPLIT];
+shared float q_s[TG];
+shared float part[TG / 32];
+shared float red;
+shared float v_stage[(TG / 32) * 256];
+void main() {
+    uint D = arg_u32(5), max_seq = arg_u32(6), len = arg_u32(7), splits = arg_u32(8), group = arg_u32(9);
+    float scale = arg_f32(10);
+    uvec2 tg = threadgroup_position_in_grid.xy;
+    uint tid = thread_index_in_threadgroup;
+    uint sg = simdgroup_index_in_threadgroup, lane = thread_index_in_simdgroup;
+    F32 stats = F32(arg(4));
+
+    uint hq = tg.x;
+    uint64_t k_head = arg(1) + 2 * (uint64_t(hq / group) * max_seq * D);
+    uint64_t v_head = arg(2) + 2 * (uint64_t(hq / group) * max_seq * D);
+
+    for (uint cc = 0; cc < SPLIT_CPT; ++cc) {
+        uint split = SPLIT_STRIDED != 0 ? (tg.y + cc * ((splits + SPLIT_CPT - 1) / SPLIT_CPT))
+                                        : (tg.y * SPLIT_CPT + cc);
+        if (split >= splits) continue;
+        uint base = split * SDPA_SPLIT;
+        uint count = base < len ? min(uint(SDPA_SPLIT), len - base) : 0;
+
+        if (count == 0) {
+            if (tid == 0) {
+                stats.v[(hq * splits + split) * 2] = NEG_INFINITY;
+                stats.v[(hq * splits + split) * 2 + 1] = 0.0;
+            }
+            barrier();
+            continue;
+        }
+
+        if (tid < D) q_s[tid] = float(BF16(arg(0)).v[hq * D + tid]);
+        barrier();
+
+        float local_max = NEG_INFINITY;
+        if (D % 8 == 0) {
+            // With D <= TG the Metal loop over i has the one step i = lane
+            // (none for a lane past D / 8), so the lane's eight q come out
+            // of threadgroup memory once, not per key row.
+            bool has = lane * 8 < D;
+            vec4 qa = vec4(0.0), qb = vec4(0.0);
+            if (has) {
+                qa = vec4(q_s[lane * 8], q_s[lane * 8 + 1], q_s[lane * 8 + 2], q_s[lane * 8 + 3]);
+                qb = vec4(q_s[lane * 8 + 4], q_s[lane * 8 + 5], q_s[lane * 8 + 6], q_s[lane * 8 + 7]);
+            }
+            U32x4 k_rows = U32x4(k_head);
+            for (uint p = sg; p < count; p += TG / 32) {
+                float dp = 0.0;
+                if (has) {
+                    uvec4 kq = k_rows.v[(base + p) * (D / 8) + lane];
+                    dp += dot(bf4(kq.xy), qa);
+                    dp += dot(bf4(kq.zw), qb);
+                }
+                dp = subgroupAdd(dp);
+                float s = dp * scale;
+                if (lane == 0) scores[p] = s;
+                local_max = max(local_max, s);
+            }
+        } else {
+            if (tid < count) {
+                float dp = 0.0;
+                for (uint d = 0; d < D; ++d) dp += q_s[d] * float(BF16(k_head).v[(base + tid) * D + d]);
+                float s = dp * scale;
+                scores[tid] = s;
+                local_max = s;
+            }
+        }
+        local_max = subgroupMax(local_max);
+        if (lane == 0) part[sg] = local_max;
+        barrier();
+        if (tid == 0) {
+            float m = NEG_INFINITY;
+            for (uint i = 0; i < TG / 32; ++i) m = max(m, part[i]);
+            red = m;
+        }
+        barrier();
+        float chunk_max = red;
+
+        float e = 0.0;
+        if (tid < count) {
+            e = exp(scores[tid] - chunk_max);
+            scores[tid] = e;
+        }
+        float local_sum = subgroupAdd(e);
+        barrier();
+        if (lane == 0) part[sg] = local_sum;
+        barrier();
+        if (tid == 0) {
+            float s = 0.0;
+            for (uint i = 0; i < TG / 32; ++i) s += part[i];
+            stats.v[(hq * splits + split) * 2] = chunk_max;
+            stats.v[(hq * splits + split) * 2 + 1] = s;
+        }
+        barrier();
+
+        // Reduce per-simdgroup weighted-V accumulators.
+        F32 partials = F32(arg(3) + 4 * ((uint64_t(hq) * splits + split) * D));
+        if (D % 8 == 0 && D <= 8 * 32) {
+            vec4 acc0 = vec4(0.0);
+            vec4 acc1 = vec4(0.0);
+            U32x4 v_rows = U32x4(v_head);
+            for (uint p = sg; p < count; p += TG / 32) {
+                float wgt = scores[p];
+                if (lane * 8 < D) {
+                    uvec4 vq = v_rows.v[(base + p) * (D / 8) + lane];
+                    acc0 += wgt * bf4(vq.xy);
+                    acc1 += wgt * bf4(vq.zw);
+                }
+            }
+            if (lane * 8 < D) {
+                for (uint j = 0; j < 4; ++j) {
+                    v_stage[sg * D + lane * 8 + j] = acc0[j];
+                    v_stage[sg * D + lane * 8 + 4 + j] = acc1[j];
+                }
+            }
+            barrier();
+            for (uint d = tid; d < D; d += TG) {
+                float acc = 0.0;
+                for (uint s = 0; s < TG / 32; ++s) acc += v_stage[s * D + d];
+                partials.v[d] = acc;
+            }
+        } else {
+            for (uint d = tid; d < D; d += TG) {
+                float acc = 0.0;
+                for (uint p = 0; p < count; ++p) acc += scores[p] * float(BF16(v_head).v[(base + p) * D + d]);
+                partials.v[d] = acc;
+            }
+        }
+        barrier();
+    }
+}
+#endif
+
+// sdpa_decode_split_bf16 over a q8 cache (D = 256: lane l holds dims
+// 8l..8l+7, inside group l / 4).
+#ifdef KERNEL_sdpa_decode_split_q8
+shared float scores[SDPA_SPLIT];
+shared float q_s[TG];
+shared float part[TG / 32];
+shared float red;
+shared float v_stage[(TG / 32) * 256];
+void main() {
+    uint D = arg_u32(7), max_seq = arg_u32(8), len = arg_u32(9), splits = arg_u32(10), group = arg_u32(11);
+    float scale = arg_f32(12);
+    uvec2 tg = threadgroup_position_in_grid.xy;
+    uint tid = thread_index_in_threadgroup;
+    uint sg = simdgroup_index_in_threadgroup, lane = thread_index_in_simdgroup;
+    F32 stats = F32(arg(6));
+
+    uint hq = tg.x;
+    uint split = tg.y;
+    uint groups = D / KV_Q8_GROUP;
+    uint64_t head_row = uint64_t(hq / group) * max_seq;
+    // This lane's eight bytes of a head's row t: k_head.v[t * D / 8].
+    U32x2 k_head = U32x2(arg(1) + head_row * D + lane * 8);
+    U32x2 v_head = U32x2(arg(3) + head_row * D + lane * 8);
+    F16 ks_head = F16(arg(2) + 2 * (head_row * groups));
+    F16 vs_head = F16(arg(4) + 2 * (head_row * groups));
+    uint base = split * SDPA_SPLIT;
+    uint count = base < len ? min(uint(SDPA_SPLIT), len - base) : 0;
+
+    if (count == 0) {
+        if (tid == 0) {
+            stats.v[(hq * splits + split) * 2] = NEG_INFINITY;
+            stats.v[(hq * splits + split) * 2 + 1] = 0.0;
+        }
+        return;
+    }
+
+    if (tid < D) q_s[tid] = float(BF16(arg(0)).v[hq * D + tid]);
+    barrier();
+
+    float local_max = NEG_INFINITY;
+    vec4 qa = vec4(q_s[lane * 8], q_s[lane * 8 + 1], q_s[lane * 8 + 2], q_s[lane * 8 + 3]);
+    vec4 qb = vec4(q_s[lane * 8 + 4], q_s[lane * 8 + 5], q_s[lane * 8 + 6], q_s[lane * 8 + 7]);
+    for (uint p = sg; p < count; p += TG / 32) {
+        uint t = base + p;
+        uvec2 kq = k_head.v[t * (D / 8)];
+        float ks = float(ks_head.v[t * groups + lane / 4]);
+        float dp = dot(char4(kq.x), qa) + dot(char4(kq.y), qb);
+        dp = subgroupAdd(dp * ks);
+        float s = dp * scale;
+        if (lane == 0) scores[p] = s;
+        local_max = max(local_max, s);
+    }
+    local_max = subgroupMax(local_max);
+    if (lane == 0) part[sg] = local_max;
+    barrier();
+    if (tid == 0) {
+        float m = NEG_INFINITY;
+        for (uint i = 0; i < TG / 32; ++i) m = max(m, part[i]);
+        red = m;
+    }
+    barrier();
+    float chunk_max = red;
+
+    float e = 0.0;
+    if (tid < count) {
+        e = exp(scores[tid] - chunk_max);
+        scores[tid] = e;
+    }
+    float local_sum = subgroupAdd(e);
+    barrier();
+    if (lane == 0) part[sg] = local_sum;
+    barrier();
+    if (tid == 0) {
+        float s = 0.0;
+        for (uint i = 0; i < TG / 32; ++i) s += part[i];
+        stats.v[(hq * splits + split) * 2] = chunk_max;
+        stats.v[(hq * splits + split) * 2 + 1] = s;
+    }
+    barrier();
+
+    vec4 acc0 = vec4(0.0);
+    vec4 acc1 = vec4(0.0);
+    for (uint p = sg; p < count; p += TG / 32) {
+        uint t = base + p;
+        float wgt = scores[p] * float(vs_head.v[t * groups + lane / 4]);
+        uvec2 vq = v_head.v[t * (D / 8)];
+        acc0 += wgt * char4(vq.x);
+        acc1 += wgt * char4(vq.y);
+    }
+    for (uint j = 0; j < 4; ++j) {
+        v_stage[sg * D + lane * 8 + j] = acc0[j];
+        v_stage[sg * D + lane * 8 + 4 + j] = acc1[j];
+    }
+    barrier();
+    F32 partials = F32(arg(5) + 4 * ((uint64_t(hq) * splits + split) * D));
+    for (uint d = tid; d < D; d += TG) {
+        float acc = 0.0;
+        for (uint s = 0; s < TG / 32; ++s) acc += v_stage[s * D + d];
+        partials.v[d] = acc;
+    }
+}
+#endif
+
+// Folded GQA reuses each K/V row across query heads:
+// sdpa_decode_split_gqa_t<HPP, GCPT, HPT, RIF, SERIAL, FIXED>.
+#ifdef KERNEL_sdpa_decode_split_gqa_h4u_bf16
+#define GQA_HPP 4
+#define GQA_GCPT 1
+#define GQA_HPT 4
+#define GQA_RIF 1
+#define GQA_SERIAL 0
+#define GQA_FIXED 1
+#endif
+
+#ifdef GQA_HPP
+#define MAX_GQA 8
+shared float scores[GQA_HPP][SDPA_SPLIT];
+shared float part[GQA_HPP][TG / 32];
+shared float red[GQA_HPP];
+shared float v_stage[(TG / 32) * 256];
+void main() {
+    uint D = arg_u32(5), max_seq = arg_u32(6), len = arg_u32(7), splits = arg_u32(8), group = arg_u32(9);
+    float scale = arg_f32(10);
+    uint chunk = arg_u32(11); // <= SDPA_SPLIT
+    uvec2 tg = threadgroup_position_in_grid.xy;
+    uint tid = thread_index_in_threadgroup;
+    uint sg = simdgroup_index_in_threadgroup, lane = thread_index_in_simdgroup;
+    F32 stats = F32(arg(4));
+
+    uint gfull = min(group, uint(MAX_GQA));
+    uint sub = GQA_HPT != 0 ? max(1u, gfull / uint(GQA_HPT)) : 1u;
+    uint kh = tg.x / sub;
+    uint hbase = (tg.x % sub) * (GQA_HPT != 0 ? uint(GQA_HPT) : gfull);
+    uint g = GQA_HPT != 0 ? min(uint(GQA_HPT), gfull - hbase) : gfull;
+    for (uint gcc = 0; gcc < GQA_GCPT; ++gcc) {
+        uint split = tg.y + gcc * ((splits + GQA_GCPT - 1) / GQA_GCPT);
+        if (split >= splits) continue;
+        uint c = min(chunk, uint(SDPA_SPLIT));
+        uint base = split * c;
+        uint count = base < len ? min(c, len - base) : 0;
+        // A head's rows by uint4: row t, dims 8 lane.. is at t * D / 8 + lane.
+        U32x4 k_head = U32x4(arg(1) + 2 * (uint64_t(kh) * max_seq * D));
+        U32x4 v_head = U32x4(arg(2) + 2 * (uint64_t(kh) * max_seq * D));
+
+        if (count == 0) {
+            if (tid == 0) {
+                for (uint h = 0; h < g; ++h) {
+                    uint hq = kh * gfull + hbase + h;
+                    stats.v[(hq * splits + split) * 2] = NEG_INFINITY;
+                    stats.v[(hq * splits + split) * 2 + 1] = 0.0;
+                }
+            }
+            barrier();
+            continue;
+        }
+
+        // Each lane holds eight Q dimensions per head.
+        for (uint h0 = 0; h0 < g; h0 += GQA_HPP) {
+            uint gh = GQA_FIXED != 0 ? uint(GQA_HPP) : min(uint(GQA_HPP), g - h0);
+            vec4 qa[GQA_HPP];
+            vec4 qb[GQA_HPP];
+            for (uint h = 0; h < gh; ++h) {
+                uint hq = kh * gfull + hbase + h0 + h;
+                BF16x4 qh = BF16x4(arg(0) + 2 * (uint64_t(hq) * D + lane * 8));
+                qa[h] = vec4(qh.v[0]);
+                qb[h] = vec4(qh.v[1]);
+            }
+
+            float local_max[GQA_HPP];
+            for (uint h = 0; h < gh; ++h) local_max[h] = NEG_INFINITY;
+
+            // Uniform tail guards preserve full-simdgroup reductions.
+            const uint kstride = TG / 32;
+            for (uint p0 = sg; p0 < count; p0 += GQA_RIF * kstride) {
+#define GQA_ROW(HEAD, P) HEAD.v[(base + (P)) * (D / 8) + lane]
+                uvec4 r0 = GQA_ROW(k_head, p0);
+                uvec4 r1, r2, r3;
+                bool h1 = GQA_RIF > 1 && p0 + kstride < count;
+                bool h2 = GQA_RIF > 2 && p0 + 2 * kstride < count;
+                bool h3 = GQA_RIF > 3 && p0 + 3 * kstride < count;
+                uint dep1 = GQA_SERIAL != 0 ? uint(r0.x == 0xFFFFFFFFu) : 0u;
+                if (h1) r1 = GQA_ROW(k_head, p0 + kstride + dep1);
+                uint dep2 = GQA_SERIAL != 0 ? uint(r1.x == 0xFFFFFFFFu) : 0u;
+                if (h2) r2 = GQA_ROW(k_head, p0 + 2 * kstride + dep2);
+                uint dep3 = GQA_SERIAL != 0 ? uint(r2.x == 0xFFFFFFFFu) : 0u;
+                if (h3) r3 = GQA_ROW(k_head, p0 + 3 * kstride + dep3);
+#define GQA_K_CONSUME(P, ROW)                              \
+    {                                                      \
+        vec4 ka = bf4((ROW).xy);                           \
+        vec4 kb = bf4((ROW).zw);                           \
+        for (uint h = 0; h < gh; ++h) {                    \
+            float dp = 0.0;                                \
+            dp += dot(ka, qa[h]);                          \
+            dp += dot(kb, qb[h]);                          \
+            dp = subgroupAdd(dp);                          \
+            float s = dp * scale;                          \
+            if (lane == 0) scores[h][(P)] = s;             \
+            local_max[h] = max(local_max[h], s);           \
+        }                                                  \
+    }
+                GQA_K_CONSUME(p0, r0)
+                if (h1) GQA_K_CONSUME(p0 + kstride, r1)
+                if (h2) GQA_K_CONSUME(p0 + 2 * kstride, r2)
+                if (h3) GQA_K_CONSUME(p0 + 3 * kstride, r3)
+            }
+
+            for (uint h = 0; h < gh; ++h) {
+                float m = subgroupMax(local_max[h]);
+                if (lane == 0) part[h][sg] = m;
+            }
+            barrier();
+            if (tid == 0) {
+                for (uint h = 0; h < gh; ++h) {
+                    float m = NEG_INFINITY;
+                    for (uint i = 0; i < TG / 32; ++i) m = max(m, part[h][i]);
+                    red[h] = m;
+                }
+            }
+            barrier();
+
+            for (uint h = 0; h < gh; ++h) {
+                float chunk_max = red[h];
+                float e = 0.0;
+                if (tid < count) {
+                    e = exp(scores[h][tid] - chunk_max);
+                    scores[h][tid] = e;
+                }
+                float local_sum = subgroupAdd(e);
+                barrier();
+                if (lane == 0) part[h][sg] = local_sum;
+                barrier();
+                if (tid == 0) {
+                    float s = 0.0;
+                    for (uint i = 0; i < TG / 32; ++i) s += part[h][i];
+                    uint hq = kh * gfull + hbase + h0 + h;
+                    stats.v[(hq * splits + split) * 2] = chunk_max;
+                    stats.v[(hq * splits + split) * 2 + 1] = s;
+                }
+                barrier();
+            }
+
+            // Stage one head at a time while reusing V rows.
+            vec4 acc0[GQA_HPP];
+            vec4 acc1[GQA_HPP];
+            for (uint h = 0; h < gh; ++h) {
+                acc0[h] = vec4(0.0);
+                acc1[h] = vec4(0.0);
+            }
+            const uint vstride = TG / 32;
+            for (uint p0 = sg; p0 < count; p0 += GQA_RIF * vstride) {
+                uvec4 s0 = GQA_ROW(v_head, p0);
+                uvec4 s1, s2, s3;
+                bool g1 = GQA_RIF > 1 && p0 + vstride < count;
+                bool g2 = GQA_RIF > 2 && p0 + 2 * vstride < count;
+                bool g3 = GQA_RIF > 3 && p0 + 3 * vstride < count;
+                uint vdep1 = GQA_SERIAL != 0 ? uint(s0.x == 0xFFFFFFFFu) : 0u;
+                if (g1) s1 = GQA_ROW(v_head, p0 + vstride + vdep1);
+                uint vdep2 = GQA_SERIAL != 0 ? uint(s1.x == 0xFFFFFFFFu) : 0u;
+                if (g2) s2 = GQA_ROW(v_head, p0 + 2 * vstride + vdep2);
+                uint vdep3 = GQA_SERIAL != 0 ? uint(s2.x == 0xFFFFFFFFu) : 0u;
+                if (g3) s3 = GQA_ROW(v_head, p0 + 3 * vstride + vdep3);
+#define GQA_V_WEIGH(P, ROW)                                \
+    {                                                      \
+        vec4 va = bf4((ROW).xy);                           \
+        vec4 vb = bf4((ROW).zw);                           \
+        for (uint h = 0; h < gh; ++h) {                    \
+            float wgt = scores[h][(P)];                    \
+            acc0[h] += wgt * va;                           \
+            acc1[h] += wgt * vb;                           \
+        }                                                  \
+    }
+                GQA_V_WEIGH(p0, s0)
+                if (g1) GQA_V_WEIGH(p0 + vstride, s1)
+                if (g2) GQA_V_WEIGH(p0 + 2 * vstride, s2)
+                if (g3) GQA_V_WEIGH(p0 + 3 * vstride, s3)
+            }
+            for (uint h = 0; h < gh; ++h) {
+                for (uint j = 0; j < 4; ++j) {
+                    v_stage[sg * D + lane * 8 + j] = acc0[h][j];
+                    v_stage[sg * D + lane * 8 + 4 + j] = acc1[h][j];
+                }
+                barrier();
+                uint hq = kh * gfull + hbase + h0 + h;
+                F32 partials = F32(arg(3) + 4 * ((uint64_t(hq) * splits + split) * D));
+                for (uint d = tid; d < D; d += TG) {
+                    float acc = 0.0;
+                    for (uint s = 0; s < TG / 32; ++s) acc += v_stage[s * D + d];
+                    partials.v[d] = acc;
+                }
+                barrier();
+            }
+        }
+    }
+}
+#endif
+
+// Fixed-block decode (adapted from MLX sdpa_vector_2pass_1; see NOTICE): a
+// subgroup takes two query heads through every 128th cache row from its
+// block, two rows a step.
+#ifdef KERNEL_sdpa_decode_mlx_b128h2r2
+#define MLX_DECL(j)                                                                    \
+    vec4 qa##j, qb##j, aa##j = vec4(0.0), ab##j = vec4(0.0);                           \
+    float m##j = NEG_INFINITY, l##j = 0.0;                                             \
+    {                                                                                  \
+        BF16x4 qh = BF16x4(arg(0) + 2 * (uint64_t(hq0 + j) * D + lane * 8));           \
+        qa##j = vec4(qh.v[0]);                                                         \
+        qb##j = vec4(qh.v[1]);                                                         \
+    }
+
+#define MLX_SCORE2(j)                                                                  \
+    float w##j##_0, w##j##_1;                                                          \
+    {                                                                                  \
+        float s0 = subgroupAdd(dot(ka0, qa##j) + dot(kb0, qb##j)) * scale;             \
+        float s1 = NEG_INFINITY;                                                       \
+        if (have1) s1 = subgroupAdd(dot(ka1, qa##j) + dot(kb1, qb##j)) * scale;        \
+        float nm = max(m##j, max(s0, s1));                                             \
+        float c = exp(m##j - nm);                                                      \
+        w##j##_0 = exp(s0 - nm);                                                       \
+        w##j##_1 = have1 ? exp(s1 - nm) : 0.0;                                         \
+        l##j = l##j * c + w##j##_0 + w##j##_1;                                         \
+        m##j = nm;                                                                     \
+        aa##j *= c;                                                                    \
+        ab##j *= c;                                                                    \
+    }
+
+#define MLX_ACC2(j)                                                                    \
+    aa##j += w##j##_0 * va0 + w##j##_1 * va1;                                          \
+    ab##j += w##j##_0 * vb0 + w##j##_1 * vb1;
+
+#define MLX_STORE(j)                                                                   \
+    {                                                                                  \
+        uint hq = hq0 + j;                                                             \
+        F32x4 o = F32x4(arg(3) + 4 * ((uint64_t(hq) * splits + block) * D + lane * 8)); \
+        o.v[0] = aa##j;                                                                \
+        o.v[1] = ab##j;                                                                \
+        if (lane == 0) {                                                               \
+            stats.v[(hq * splits + block) * 2] = m##j;                                 \
+            stats.v[(hq * splits + block) * 2 + 1] = l##j;                             \
+        }                                                                              \
+    }
+
+#define MLX_EACH2(M) M(0) M(1)
+
+void main() {
+    uint D = arg_u32(5), max_seq = arg_u32(6), len = arg_u32(7), splits = arg_u32(8), group = arg_u32(9);
+    float scale = arg_f32(10);
+    uvec2 tg = threadgroup_position_in_grid.xy;
+    uint sg = simdgroup_index_in_threadgroup, lane = thread_index_in_simdgroup;
+    F32 stats = F32(arg(4));
+
+    uint kh = tg.x;
+    uint block = tg.y;
+    uint hq0 = kh * group + sg * 2;
+    MLX_EACH2(MLX_DECL)
+    // A head's rows by uint4: row p, dims 8 lane.. is at p * D / 8 + lane.
+    U32x4 k_rows = U32x4(arg(1) + 2 * (uint64_t(kh) * max_seq * D));
+    U32x4 v_rows = U32x4(arg(2) + 2 * (uint64_t(kh) * max_seq * D));
+    for (uint p = block; p < len; p += 256) {
+        uint p1 = p + 128;
+        bool have1 = p1 < len;
+        uvec4 kq0 = k_rows.v[p * (D / 8) + lane];
+        uvec4 kq1 = k_rows.v[(have1 ? p1 : p) * (D / 8) + lane];
+        vec4 ka0 = bf4(kq0.xy);
+        vec4 kb0 = bf4(kq0.zw);
+        vec4 ka1 = bf4(kq1.xy);
+        vec4 kb1 = bf4(kq1.zw);
+        MLX_EACH2(MLX_SCORE2)
+        uvec4 vq0 = v_rows.v[p * (D / 8) + lane];
+        uvec4 vq1 = v_rows.v[(have1 ? p1 : p) * (D / 8) + lane];
+        vec4 va0 = bf4(vq0.xy);
+        vec4 vb0 = bf4(vq0.zw);
+        vec4 va1 = bf4(vq1.xy);
+        vec4 vb1 = bf4(vq1.zw);
+        MLX_EACH2(MLX_ACC2)
+    }
+    MLX_EACH2(MLX_STORE)
+}
+#endif
+
+#ifdef KERNEL_sdpa_decode_combine
+// Combine split statistics without per-split scratch.
+shared float m_max;
+shared float inv_l;
+void main() {
+    uint D = arg_u32(3), splits = arg_u32(4);
+    uint hq = threadgroup_position_in_grid.x, tid = thread_index_in_threadgroup;
+    F32 stats = F32(arg(1));
+
+    if (tid == 0) {
+        float m = NEG_INFINITY;
+        for (uint s = 0; s < splits; ++s) m = max(m, stats.v[(hq * splits + s) * 2]);
+        float l = 0.0;
+        for (uint s = 0; s < splits; ++s) {
+            float w = stats.v[(hq * splits + s) * 2 + 1] * exp(stats.v[(hq * splits + s) * 2] - m);
+            l += w;
+        }
+        m_max = m;
+        inv_l = 1.0 / l;
+    }
+    barrier();
+
+    float m = m_max;
+    // Split s of the head, element d: partials.v[s * D + d].
+    F32 partials = F32(arg(0) + 4 * (uint64_t(hq) * splits * D));
+    for (uint d = tid; d < D; d += TG) {
+        float acc = 0.0;
+        for (uint s = 0; s < splits; ++s) {
+            acc += exp(stats.v[(hq * splits + s) * 2] - m) * partials.v[s * D + d];
+        }
+        BF16(arg(2)).v[hq * D + d] = bfloat16_t(acc * inv_l);
+    }
+}
+#endif
