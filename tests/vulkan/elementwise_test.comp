@@ -1,0 +1,43 @@
+#version 460
+// The kernels of tests/metal/elementwise_test.metal: the binary-op harness's
+// test primitive and the memory-bandwidth probes.
+#include "common.glsl"
+
+#ifdef KERNEL_mul_bf16
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    uint gid = thread_position_in_grid.x;
+    BF16(arg(2)).v[gid] = bfloat16_t(float(BF16(arg(0)).v[gid]) * float(BF16(arg(1)).v[gid]));
+}
+#endif
+
+#ifdef KERNEL_bw_fill_u4
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    uint gid = thread_position_in_grid.x;
+    uint h = gid * 2654435761u;
+    U32x4(arg(0)).v[gid] = uvec4(h, h ^ 0x9e3779b9u, h * 3u + 1u, ~h);
+}
+#endif
+
+#ifdef KERNEL_bw_read_u4
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    U32x4 src = U32x4(arg(0));
+    uint per_thread = arg_u32(2), gid = thread_position_in_grid.x, gsz = lily_dispatch.grid.x;
+    uvec4 acc = uvec4(0);
+    for (uint i = 0; i < per_thread; ++i) acc ^= src.v[gid + i * gsz];
+    uint r = acc.x ^ acc.y ^ acc.z ^ acc.w;
+    // Practically never true; keeps the loads observable.
+    if (r == 0x12345678u) U32(arg(1)).v[gid & 1023u] = r;
+}
+#endif
+
+#ifdef KERNEL_bw_copy_u4
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    U32x4 src = U32x4(arg(0)), dst = U32x4(arg(1));
+    uint per_thread = arg_u32(2), gid = thread_position_in_grid.x, gsz = lily_dispatch.grid.x;
+    for (uint i = 0; i < per_thread; ++i) dst.v[gid + i * gsz] = src.v[gid + i * gsz];
+}
+#endif

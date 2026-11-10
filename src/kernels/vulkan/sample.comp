@@ -1,0 +1,548 @@
+#version 460
+// The kernels of src/kernels/metal/sample.metal: token sampling on the GPU
+// (penalties and temperature, top-k by a two-level bucket search, top-p /
+// min-p, an inverse-CDF draw from a counter-based hash RNG). The comments
+// there say why each step is as it is; this is the same arithmetic in the
+// same order, with the same fixed thread order for ties.
+#include "common.glsl"
+
+#define SAMPLE_TG 1024
+#define SAMPLE_PREP_TG 256
+#define SAMPLE_PREP_GROUPS 64
+#define SAMPLE_K_CAP 1024
+#define SAMPLE_BINS 4096
+
+#ifdef KERNEL_sample_prepare_f32
+shared float partial[SAMPLE_PREP_TG / 32];
+void main() {
+    F32 logits = F32(arg(0)), adjusted = F32(arg(1)), maxima = F32(arg(3));
+    U32 counts = U32(arg(2));
+    float temperature = arg_f32(4), presence = arg_f32(5), frequency = arg_f32(6);
+    float repetition = arg_f32(7);
+    uint V = arg_u32(8), use_penalties = arg_u32(9);
+    uint gid = threadgroup_position_in_grid.x, tid = thread_index_in_threadgroup;
+    uint sg = simdgroup_index_in_threadgroup, lane = thread_index_in_simdgroup;
+
+    float inv_t = 1.0 / temperature;
+    uint chunk = (V + SAMPLE_PREP_GROUPS - 1) / SAMPLE_PREP_GROUPS;
+    uint begin = gid * chunk;
+    uint end = min(begin + chunk, V);
+    float local_max = -1.0 / 0.0;
+    for (uint i = begin + tid; i < end; i += SAMPLE_PREP_TG) {
+        float l = logits.v[i];
+        if (use_penalties != 0u) {
+            uint c = counts.v[i];
+            if (c > 0u) {
+                l = l > 0.0 ? l / repetition : l * repetition;
+                l -= presence + frequency * float(c);
+            }
+        }
+        l *= inv_t;
+        adjusted.v[i] = l;
+        local_max = max(local_max, l);
+    }
+    local_max = subgroupMax(local_max);
+    if (lane == 0) partial[sg] = local_max;
+    barrier();
+    if (tid == 0) {
+        float m = partial[0];
+        for (uint s = 1; s < SAMPLE_PREP_TG / 32; ++s) m = max(m, partial[s]);
+        maxima.v[gid] = m;
+    }
+}
+#endif
+
+#if defined(KERNEL_sample_f32) || defined(KERNEL_sample_draft_f32) || \
+    defined(KERNEL_sample_spec_f32) || defined(KERNEL_sample_local_topk_f32)
+// Metal's SAMPLE_TG_STATE. `hist` is the atomic histogram (its relaxed
+// stores and loads are plain ones, ordered by the barriers around them).
+shared uint hist[SAMPLE_BINS];
+shared uint sums[SAMPLE_TG / 32];
+shared uint total;
+shared uint bin_s;
+shared uint before_s;
+shared uint cand_key[SAMPLE_K_CAP];
+shared uint cand_id[SAMPLE_K_CAP];
+shared float cum[SAMPLE_K_CAP];
+shared float sg_sums[SAMPLE_TG / 32];
+
+const float SAMPLE_INF = 1.0 / 0.0;
+
+uint sample_key(float v) {
+    uint u = floatBitsToUint(v);
+    return (u & 0x80000000u) != 0u ? ~u : (u | 0x80000000u);
+}
+
+// Exclusive prefix sum of `flag` over the threadgroup; `total` receives the
+// sum (Metal's `*total`; the keep count, which Metal scans into n_keep_s, is
+// read from `total` here).
+uint sample_scan(uint flag) {
+    uint tid = thread_index_in_threadgroup, sg = simdgroup_index_in_threadgroup;
+    uint local = subgroupExclusiveAdd(flag);
+    uint sg_total = subgroupAdd(flag);
+    if (thread_index_in_simdgroup == 0) sums[sg] = sg_total;
+    barrier();
+    // Metal sums sums[0..sg) and, in thread 0, all of sums in serial loops of
+    // shared loads; the subgroup's lanes hold the 32 subgroups' sums here
+    // instead (the same integers).
+    uint mine = sums[thread_index_in_simdgroup];
+    uint before = subgroupShuffle(subgroupExclusiveAdd(mine), sg);
+    uint t = subgroupAdd(mine);
+    if (tid == 0) total = t;
+    barrier();
+    return before + local;
+}
+
+uint sample_bin(float d, float inv_w) {
+    return min(uint(d * inv_w), uint(SAMPLE_BINS - 1));
+}
+
+// Finds the bin in which the cumulative count reaches `k` into bin_s and
+// before_s, the grand total into `total`. Each thread owns 4 bins.
+void sample_locate(uint k) {
+    uint tid = thread_index_in_threadgroup;
+    uint c[4];
+    uint mine = 0;
+    for (uint j = 0; j < 4; ++j) {
+        c[j] = hist[tid * 4 + j];
+        mine += c[j];
+    }
+    uint before = sample_scan(mine);
+    if (before < k && before + mine >= k) {
+        uint cum_c = before;
+        for (uint j = 0; j < 4; ++j) {
+            if (cum_c + c[j] >= k) {
+                bin_s = tid * 4 + j;
+                before_s = cum_c;
+                break;
+            }
+            cum_c += c[j];
+        }
+    }
+    barrier();
+}
+
+// splitmix64 finalizer over (seed, step).
+float sample_uniform(uint seed_lo, uint seed_hi, uint step) {
+    uint64_t z = (uint64_t(seed_hi) << 32) | uint64_t(seed_lo);
+    z += uint64_t(step) * 0x9E3779B97F4A7C15ul;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ul;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBul;
+    z ^= z >> 31;
+    return float(uint(z >> 40)) * (1.0 / 16777216.0);
+}
+
+// Inclusive prefix sum of one float per thread over the threadgroup; the
+// total goes to `sum_total`. Callers separate consecutive scans by a barrier.
+float sample_scan_f(float v, out float sum_total) {
+    uint sg = simdgroup_index_in_threadgroup;
+    float local = subgroupInclusiveAdd(v);
+    if (thread_index_in_simdgroup == 31) sg_sums[sg] = local;
+    barrier();
+    float before = 0.0;
+    for (uint s = 0; s < sg; ++s) before += sg_sums[s];
+    sum_total = before;
+    for (uint s = sg; s < SAMPLE_TG / 32; ++s) sum_total += sg_sums[s];
+    return before + local;
+}
+
+// Metal's template `sample_at<mapped>`: `mapped` is a constant at every call
+// site of sample_select, so after inlining each instantiation keeps one path.
+float sample_at(bool mapped, F32 adjusted, U32 map, uint i) {
+    if (!mapped) return adjusted.v[i];
+    uint id = map.v[i];
+    if (id == 0xFFFFFFFFu) return -SAMPLE_INF;
+    return adjusted.v[id];
+}
+
+// sample_at for element j of a sweep, `past` for j >= V. The direct path
+// loads unconditionally at an index clamped into the input, so the four
+// loads of an iteration overlap (guarded loads measured slower there; the
+// mapped path's dependent loads are faster guarded).
+float sample_sweep_at(bool mapped, F32 adjusted, U32 map, uint j, uint V, float past) {
+    if (mapped) {
+        if (j >= V) return past;
+        return sample_at(true, adjusted, map, j);
+    }
+    float v = adjusted.v[min(j, V - 1)];
+    return j < V ? v : past;
+}
+
+uint sample_id(U32 map, bool mapped, uint i) {
+    if (mapped) return map.v[i];
+    return i;
+}
+
+// Every subgroup reduces the 64 partials (Metal: a serial loop per thread).
+// Called in uniform control flow by whole subgroups.
+float sample_top(F32 maxima) {
+    uint lane = gl_SubgroupInvocationID;
+    return subgroupMax(max(maxima.v[lane], maxima.v[lane + 32]));
+}
+
+// The kept candidate set (sample.metal's sample_select): on return
+// cand_id[0..n_keep) holds the ids sorted descending, cum[] the inclusive
+// prefix of exp(adjusted - top), and each thread tid < n_keep its `p`, `c`.
+void sample_select(bool mapped, F32 adjusted, U32 map, float top, float top_p, float min_p,
+                   uint top_k, uint V, out float p, out float c, out uint n_keep) {
+    uint tid = thread_index_in_threadgroup, sg = simdgroup_index_in_threadgroup;
+    uint lane = thread_index_in_simdgroup;
+    uint k = min(min(top_k == 0u ? uint(SAMPLE_K_CAP) : top_k, uint(SAMPLE_K_CAP)), V);
+
+    // 2. Coarse search.
+    float range = 32.0;
+    float inv_w = float(SAMPLE_BINS) / range;
+    for (uint attempt = 0; attempt < 4; ++attempt) {
+        for (uint i = tid; i < SAMPLE_BINS; i += SAMPLE_TG) hist[i] = 0u;
+        if (tid == 0) {
+            bin_s = SAMPLE_BINS;
+            before_s = 0;
+        }
+        barrier();
+        for (uint i = tid; i < V; i += 4 * SAMPLE_TG) {
+            float d[4];
+            [[unroll]] for (uint u = 0; u < 4; ++u) {
+                uint j = i + u * SAMPLE_TG;
+                d[u] = top - sample_sweep_at(mapped, adjusted, map, j, V, -SAMPLE_INF);
+            }
+            [[unroll]] for (uint u = 0; u < 4; ++u) {
+                if (d[u] < range) atomicAdd(hist[sample_bin(d[u], inv_w)], 1u);
+            }
+        }
+        barrier();
+        sample_locate(k);
+        if (total >= k) break;
+        if (attempt == 3) {
+            k = total;
+            sample_locate(k);
+            break;
+        }
+        range *= 8.0;
+        inv_w = float(SAMPLE_BINS) / range;
+    }
+    uint coarse_bin = bin_s;
+    uint before_coarse = before_s;
+    float lo = float(coarse_bin) / inv_w;
+    float inv_w2 = inv_w * float(SAMPLE_BINS);
+
+    // 3. Refine the boundary bucket.
+    for (uint i = tid; i < SAMPLE_BINS; i += SAMPLE_TG) hist[i] = 0u;
+    barrier();
+    for (uint i = tid; i < V; i += 4 * SAMPLE_TG) {
+        float d[4];
+        [[unroll]] for (uint u = 0; u < 4; ++u) {
+            uint j = i + u * SAMPLE_TG;
+            d[u] = top - sample_sweep_at(mapped, adjusted, map, j, V, -SAMPLE_INF);
+        }
+        [[unroll]] for (uint u = 0; u < 4; ++u) {
+            if (d[u] < range && sample_bin(d[u], inv_w) == coarse_bin) {
+                atomicAdd(hist[sample_bin(d[u] - lo, inv_w2)], 1u);
+            }
+        }
+    }
+    barrier();
+    sample_locate(k - before_coarse);
+    uint fine_bin = bin_s;
+    uint n_definite = before_coarse + before_s;
+
+    // 4. Compaction.
+    uint my_def = 0, my_tie = 0;
+    for (uint i = tid; i < V; i += 4 * SAMPLE_TG) {
+        float d[4];
+        [[unroll]] for (uint u = 0; u < 4; ++u) {
+            uint j = i + u * SAMPLE_TG;
+            d[u] = top - sample_sweep_at(mapped, adjusted, map, j, V, -SAMPLE_INF);
+        }
+        [[unroll]] for (uint u = 0; u < 4; ++u) {
+            if (d[u] < range) {
+                uint b = sample_bin(d[u], inv_w);
+                if (b < coarse_bin) {
+                    ++my_def;
+                } else if (b == coarse_bin) {
+                    uint f = sample_bin(d[u] - lo, inv_w2);
+                    my_def += f < fine_bin ? 1u : 0u;
+                    my_tie += f == fine_bin ? 1u : 0u;
+                }
+            }
+        }
+    }
+    uint def_base = sample_scan(my_def);
+    uint tie_base = sample_scan(my_tie);
+    uint def_at = def_base;
+    uint tie_at = n_definite + tie_base;
+    for (uint i = tid; i < V; i += 4 * SAMPLE_TG) {
+        float val[4];
+        [[unroll]] for (uint u = 0; u < 4; ++u) {
+            uint j = i + u * SAMPLE_TG;
+            val[u] = sample_sweep_at(mapped, adjusted, map, j, V, -SAMPLE_INF);
+        }
+        [[unroll]] for (uint u = 0; u < 4; ++u) {
+            uint j = i + u * SAMPLE_TG;
+            float d = top - val[u];
+            if (d < range) {
+                uint b = sample_bin(d, inv_w);
+                uint cls = 0;
+                if (b < coarse_bin) {
+                    cls = 1;
+                } else if (b == coarse_bin) {
+                    uint f = sample_bin(d - lo, inv_w2);
+                    cls = f < fine_bin ? 1u : (f == fine_bin ? 2u : 0u);
+                }
+                if (cls == 1) {
+                    cand_key[def_at] = sample_key(val[u]);
+                    cand_id[def_at] = j;
+                    ++def_at;
+                } else if (cls == 2 && tie_at < k) {
+                    cand_key[tie_at] = sample_key(val[u]);
+                    cand_id[tie_at] = j;
+                    ++tie_at;
+                }
+            }
+        }
+    }
+    uint n = k;
+    uint sort_size = 1;
+    while (sort_size < n) sort_size <<= 1;
+    for (uint i = n + tid; i < sort_size; i += SAMPLE_TG) {
+        cand_key[i] = 0u;
+        cand_id[i] = 0xFFFFFFFFu;
+    }
+    barrier();
+
+    // 5. Bitonic sort, descending by key.
+    if (sort_size <= 32u) {
+        if (sg == 0) {
+            uint key = lane < sort_size ? cand_key[lane] : 0u;
+            uint id = lane < sort_size ? cand_id[lane] : 0xFFFFFFFFu;
+            for (uint size = 2; size <= sort_size; size <<= 1) {
+                for (uint stride = size >> 1; stride > 0; stride >>= 1) {
+                    uint partner = lane ^ stride;
+                    uint okey = subgroupShuffleXor(key, stride);
+                    uint oid = subgroupShuffleXor(id, stride);
+                    bool descending = (lane & size) == 0;
+                    bool lower = lane < partner;
+                    bool take_other = lower == descending ? okey > key : okey < key;
+                    if (take_other) {
+                        key = okey;
+                        id = oid;
+                    }
+                }
+            }
+            if (lane < sort_size) {
+                cand_key[lane] = key;
+                cand_id[lane] = id;
+            }
+        }
+        barrier();
+    } else {
+        for (uint size = 2; size <= sort_size; size <<= 1) {
+            for (uint stride = size >> 1; stride > 0; stride >>= 1) {
+                uint partner = tid ^ stride;
+                if (tid < sort_size && partner > tid) {
+                    bool descending = (tid & size) == 0;
+                    uint a = cand_key[tid];
+                    uint b = cand_key[partner];
+                    bool swap = descending ? (a < b) : (a > b);
+                    if (swap) {
+                        uint ia = cand_id[tid];
+                        cand_key[tid] = b;
+                        cand_key[partner] = a;
+                        cand_id[tid] = cand_id[partner];
+                        cand_id[partner] = ia;
+                    }
+                }
+                barrier();
+            }
+        }
+    }
+
+    // 6. Softmax over the candidates and inclusive prefix sums.
+    float top_val = sample_at(mapped, adjusted, map, cand_id[0]);
+    p = 0.0;
+    if (tid < n) p = exp(sample_at(mapped, adjusted, map, cand_id[tid]) - top_val);
+    float mass;
+    c = sample_scan_f(p, mass);
+    if (tid < SAMPLE_K_CAP) cum[tid] = c;
+    barrier();
+    float total_mass = cum[n - 1];
+
+    // 7. Nucleus / min-p truncation.
+    bool keep = tid < n && (tid == 0 || ((c - p) < top_p * total_mass && p >= min_p));
+    sample_scan(keep ? 1u : 0u);
+    n_keep = total;
+}
+
+// Inverse-CDF draw over the inclusive prefix sums: `cum`, or (residual) the
+// residual's sums that sample_spec_f32 keeps in cand_key's storage (Metal
+// casts the threadgroup pointer; GLSL cannot alias, so they are float bits).
+float sample_prefix(bool residual, uint i) {
+    return residual ? uintBitsToFloat(cand_key[i]) : cum[i];
+}
+uint sample_pick(float target, bool residual, uint n_keep, uint tid) {
+    if (tid < n_keep) {
+        float lo_c = 0.0;
+        if (tid > 0) lo_c = sample_prefix(residual, tid - 1);
+        float c = sample_prefix(residual, tid);
+        bool last = tid == n_keep - 1;
+        if ((lo_c <= target && target < c) || (last && target >= lo_c)) return tid;
+    }
+    return SAMPLE_K_CAP;
+}
+
+// Metal's SAMPLE_SELECT: the mapped and the direct selection, each its own
+// inlined instantiation.
+#define SAMPLE_SELECT(MAPPED, ADJ, MAP, MAXIMA, TOP_P, MIN_P, TOP_K, V, P, C, N_KEEP)          \
+    if (MAPPED) {                                                                          \
+        sample_select(true, ADJ, MAP, sample_top(MAXIMA), TOP_P, MIN_P, TOP_K, V, P, C, N_KEEP); \
+    } else {                                                                               \
+        sample_select(false, ADJ, MAP, sample_top(MAXIMA), TOP_P, MIN_P, TOP_K, V, P, C, N_KEEP); \
+    }
+#endif
+
+#ifdef KERNEL_sample_f32
+void main() {
+    F32 adjusted = F32(arg(0)), maxima = F32(arg(1));
+    U32 counts = U32(arg(2)), out_id = U32(arg(3)), map = U32(arg(4));
+    float top_p = arg_f32(5), min_p = arg_f32(6);
+    uint top_k = arg_u32(7), V = arg_u32(8), seed_lo = arg_u32(9), seed_hi = arg_u32(10);
+    uint step = arg_u32(11), use_penalties = arg_u32(12), mapped = arg_u32(13);
+    uint tid = thread_index_in_threadgroup;
+    float p, c;
+    uint n_keep;
+    SAMPLE_SELECT(mapped != 0u, adjusted, map, maxima, top_p, min_p, top_k, V, p, c, n_keep)
+
+    // 8. Inverse-CDF draw within the kept mass.
+    float target = sample_uniform(seed_lo, seed_hi, step) * cum[n_keep - 1];
+    if (sample_pick(target, false, n_keep, tid) == tid) {
+        uint chosen = sample_id(map, mapped != 0u, cand_id[tid]);
+        out_id.v[0] = chosen;
+        if (use_penalties != 0u) counts.v[chosen] += 1u;
+    }
+}
+#endif
+
+#ifdef KERNEL_sample_draft_f32
+void main() {
+    F32 adjusted = F32(arg(0)), maxima = F32(arg(1));
+    U32 counts = U32(arg(2)), out_id = U32(arg(3));
+    U32 q_ids = U32(arg(4));
+    F32 q_probs = F32(arg(5));
+    U32 q_n = U32(arg(6)), map = U32(arg(7));
+    float top_p = arg_f32(8), min_p = arg_f32(9);
+    uint top_k = arg_u32(10), V = arg_u32(11), seed_lo = arg_u32(12), seed_hi = arg_u32(13);
+    uint step = arg_u32(14), use_penalties = arg_u32(15), mapped = arg_u32(16);
+    uint tid = thread_index_in_threadgroup;
+    float p, c;
+    uint n_keep;
+    bool via = mapped != 0u;
+    SAMPLE_SELECT(via, adjusted, map, maxima, top_p, min_p, top_k, V, p, c, n_keep)
+    float mass = cum[n_keep - 1];
+    if (tid < n_keep) {
+        q_ids.v[tid] = sample_id(map, via, cand_id[tid]);
+        q_probs.v[tid] = p / mass;
+    }
+    if (tid == 0) q_n.v[0] = n_keep;
+    float target = sample_uniform(seed_lo, seed_hi, step) * mass;
+    if (sample_pick(target, false, n_keep, tid) == tid) {
+        uint chosen = sample_id(map, via, cand_id[tid]);
+        out_id.v[0] = chosen;
+        if (use_penalties != 0u) counts.v[chosen] += 1u;
+    }
+}
+#endif
+
+#ifdef KERNEL_sample_spec_f32
+shared float p_d_s;
+shared float q_d_s;
+void main() {
+    F32 adjusted = F32(arg(0)), maxima = F32(arg(1));
+    U32 counts = U32(arg(2)), out_id = U32(arg(3));
+    U32 q_ids = U32(arg(4));
+    F32 q_probs = F32(arg(5));
+    U32 q_n = U32(arg(6)), draft = U32(arg(7)), map = U32(arg(8));
+    float top_p = arg_f32(9), min_p = arg_f32(10);
+    uint top_k = arg_u32(11), V = arg_u32(12), seed_lo = arg_u32(13), seed_hi = arg_u32(14);
+    uint step = arg_u32(15), use_penalties = arg_u32(16), mapped = arg_u32(17);
+    uint tid = thread_index_in_threadgroup;
+    float p, c;
+    uint n_keep;
+    bool via = mapped != 0u;
+    SAMPLE_SELECT(via, adjusted, map, maxima, top_p, min_p, top_k, V, p, c, n_keep)
+    float mass = cum[n_keep - 1];
+    uint d = draft.v[0];
+    uint qn = min(q_n.v[0], uint(SAMPLE_K_CAP));
+
+    // p(d) from the kept set (0 outside it) and q(d) from the draft's set.
+    if (tid == 0) {
+        p_d_s = 0.0;
+        q_d_s = 0.0;
+    }
+    barrier();
+    if (tid < n_keep && sample_id(map, via, cand_id[tid]) == d) p_d_s = p / mass;
+    if (tid < qn && q_ids.v[tid] == d) q_d_s = q_probs.v[tid];
+    barrier();
+    float p_d = p_d_s;
+    float q_d = q_d_s;
+    float u1 = sample_uniform(seed_lo, seed_hi, step);
+    if (u1 * q_d < p_d) {
+        if (tid == 0) {
+            out_id.v[0] = d;
+            if (use_penalties != 0u) counts.v[d] += 1u;
+        }
+        return;
+    }
+
+    // Rejected: the residual over the kept set.
+    float q_i = 0.0;
+    if (tid < n_keep) {
+        uint id = sample_id(map, via, cand_id[tid]);
+        for (uint j = 0; j < qn; ++j) {
+            if (q_ids.v[j] == id) {
+                q_i = q_probs.v[j];
+                break;
+            }
+        }
+    }
+    float r = tid < n_keep ? max(0.0, p / mass - q_i) : 0.0;
+    barrier();
+    float r_total;
+    float rc = sample_scan_f(r, r_total);
+    // The residual's prefix sums, in the sorted keys' storage (free now).
+    if (tid < SAMPLE_K_CAP) cand_key[tid] = floatBitsToUint(rc);
+    barrier();
+    float u2 = sample_uniform(seed_lo, seed_hi, step | 0x80000000u);
+    uint slot = r_total > 0.0 ? sample_pick(u2 * r_total, true, n_keep, tid)
+                              : sample_pick(u2 * mass, false, n_keep, tid);
+    if (slot == tid) {
+        uint chosen = sample_id(map, via, cand_id[tid]);
+        out_id.v[0] = chosen;
+        if (use_penalties != 0u) counts.v[chosen] += 1u;
+    }
+}
+#endif
+
+#ifdef KERNEL_sample_local_topk_f32
+void main() {
+    uint64_t adjusted = arg(0);
+    F32 maxima = F32(arg(1));
+    uint64_t local_ids = arg(2);
+    uint top_k = arg_u32(3), V = arg_u32(4), groups = arg_u32(5);
+    uint g = threadgroup_position_in_grid.x, tid = thread_index_in_threadgroup;
+    uint chunk = (V + groups - 1) / groups;
+    uint begin = g * chunk;
+    uint count = begin < V ? min(chunk, V - begin) : 0u;
+    U32 ids = U32(local_ids + 4 * uint64_t(g * top_k));
+    if (count == 0u) {
+        if (tid < top_k) ids.v[tid] = 0xFFFFFFFFu;
+        return;
+    }
+    float top;
+    if (groups == SAMPLE_PREP_GROUPS) top = maxima.v[g];
+    else top = sample_top(maxima);
+    float p, c;
+    uint n_keep;
+    sample_select(false, F32(adjusted + 4 * uint64_t(begin)), U32(local_ids), top, 1.0, 0.0,
+                  top_k, count, p, c, n_keep);
+    if (tid < top_k) ids.v[tid] = tid < n_keep ? begin + cand_id[tid] : 0xFFFFFFFFu;
+}
+#endif
