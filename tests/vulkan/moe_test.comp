@@ -1,0 +1,330 @@
+#version 460
+// The kernels of tests/metal/moe_test.metal: the test-only expert-major
+// small-M GEMV chain (the union map kernel and the expert-major GEMVs the
+// fused small-m kernels replaced), the pair-major variants, the reference
+// router top-k kernels and the pair-parallelism variants of the fused down
+// kernel. The same arithmetic in the same order.
+#include "common.glsl"
+
+#ifdef KERNEL_moe_smallm_q4_down_combine_p1
+#define MOE_SMALLM_DOWN_R4 4
+#define MOE_SMALLM_DOWN_PSG 1
+#endif
+#ifdef KERNEL_moe_smallm_q4_down_combine_p4
+#define MOE_SMALLM_DOWN_R4 4
+#define MOE_SMALLM_DOWN_PSG 4
+#endif
+#include "moe_common.glsl"
+
+const uint MOE_SMALLM_MAX_ROWS = 16;
+
+// Builds an expert-major union map; S must not exceed MOE_SMALLM_MAX_S.
+#ifdef KERNEL_moe_union_experts
+shared uint pairs[MOE_SMALLM_MAX_S];
+shared uint first[MOE_SMALLM_MAX_S];
+shared uint slot[MOE_SMALLM_MAX_S];
+void main() {
+    U32 indices = U32(arg(0)), umap = U32(arg(1));
+    uint S = arg_u32(2), tid = thread_index_in_threadgroup;
+    if (tid < S) pairs[tid] = indices.v[tid];
+    barrier();
+    if (tid < S) {
+        uint f = 1;
+        for (uint jj = 0; jj < tid; ++jj) {
+            if (pairs[jj] == pairs[tid]) {
+                f = 0;
+                break;
+            }
+        }
+        first[tid] = f;
+    }
+    barrier();
+    if (tid == 0) {
+        uint u = 0;
+        for (uint j = 0; j < S; ++j) {
+            slot[j] = u;
+            u += first[j];
+        }
+        umap.v[0] = u;
+    }
+    barrier();
+    if (tid < S && first[tid] != 0) {
+        uint u = slot[tid];
+        uint e = pairs[tid];
+        uint nr = 0;
+        for (uint jj = tid; jj < S && nr < MOE_SMALLM_MAX_ROWS; ++jj) {
+            if (pairs[jj] == e) {
+                umap.v[1 + 2 * MOE_SMALLM_MAX_S + u * MOE_SMALLM_MAX_ROWS + nr] = jj;
+                ++nr;
+            }
+        }
+        umap.v[1 + u] = e;
+        umap.v[1 + MOE_SMALLM_MAX_S + u] = nr;
+    }
+}
+#endif
+
+// MOE_GEMV_SMALLM_EM_KERNEL(NAME, MAXR, R4): expert ids and routed rows from
+// the union map. MOE_GEMV_SMALLM_KERNEL(NAME, MAXR, R4): the pair-major and
+// extended-row variants, the union built from the staged pair list.
+#if defined(KERNEL_moe_gemv_smallm_q4_em_r8) || defined(KERNEL_moe_gemv_smallm_q4_r8)
+#define MAXR 8
+#define R4 4
+#endif
+#if defined(KERNEL_moe_gemv_smallm_q4_em_r8_w) || defined(KERNEL_moe_gemv_smallm_q4_r8_w)
+#define MAXR 8
+#define R4 8
+#endif
+#if defined(KERNEL_moe_gemv_smallm_q4_em_r16) || defined(KERNEL_moe_gemv_smallm_q4_r16)
+#define MAXR 16
+#define R4 2
+#endif
+#if defined(KERNEL_moe_gemv_smallm_q4_em_r16_w) || defined(KERNEL_moe_gemv_smallm_q4_r16_w)
+#define MAXR 16
+#define R4 4
+#endif
+#if defined(KERNEL_moe_gemv_smallm_q4_em_r8_n2) || defined(KERNEL_moe_gemv_smallm_q4_r8_n2)
+#define MAXR 8
+#define R4 1
+#endif
+#if defined(KERNEL_moe_gemv_smallm_q4_em_r16_n2) || defined(KERNEL_moe_gemv_smallm_q4_r16_n2)
+#define MAXR 16
+#define R4 1
+#endif
+#if defined(KERNEL_moe_gemv_smallm_q4_em_r8) || defined(KERNEL_moe_gemv_smallm_q4_em_r8_w) || defined(KERNEL_moe_gemv_smallm_q4_em_r16) || defined(KERNEL_moe_gemv_smallm_q4_em_r16_w) || defined(KERNEL_moe_gemv_smallm_q4_em_r8_n2) || defined(KERNEL_moe_gemv_smallm_q4_em_r16_n2)
+#define EXPERT_MAJOR
+#endif
+#ifdef MAXR
+#ifndef EXPERT_MAJOR
+shared uint tg_pairs[MOE_SMALLM_MAX_S];
+#endif
+void main() {
+    uint K = arg_u32(6), GS = arg_u32(7), N = arg_u32(8), S = arg_u32(9), TOPK = arg_u32(10), XPP = arg_u32(11);
+    uvec2 tg = threadgroup_position_in_grid.xy;
+    // xbase: a routed row's place in x, in the 16-byte loads the walk reads.
+    uint pair[MAXR];
+    uint xbase[MAXR];
+    [[unroll]] for (uint ri = 0; ri < MAXR; ++ri) {
+        pair[ri] = 0;
+        xbase[ri] = 0;
+    }
+#ifdef EXPERT_MAJOR
+    // MOE_GEMV_SMALLM_EM_PROLOGUE.
+    U32 umap = U32(arg(4));
+    uint u = tg.y;
+    if (u >= min(umap.v[0], S)) return;
+    uint e = umap.v[1 + u];
+    uint nr = min(umap.v[1 + MOE_SMALLM_MAX_S + u], uint(MAXR));
+    uint upairs = 1 + 2 * MOE_SMALLM_MAX_S + u * MOE_SMALLM_MAX_ROWS;
+    [[unroll]] for (uint ri = 0; ri < MAXR; ++ri) {
+        if (ri < nr) {
+            uint jj = umap.v[upairs + ri];
+            pair[ri] = jj;
+            xbase[ri] = ((XPP != 0) ? jj : jj / TOPK) * (K / 8);
+        }
+    }
+#else
+    U32 indices = U32(arg(4));
+    uint lane = thread_index_in_threadgroup;
+    for (uint jj = lane; jj < S; jj += 64) tg_pairs[jj] = indices.v[jj];
+    barrier();
+    uint j = tg.y;
+    uint e = tg_pairs[j];
+    for (uint jj = 0; jj < j; ++jj) {
+        if (tg_pairs[jj] == e) return;
+    }
+    uint nr = 0;
+    for (uint jj = j; jj < S; ++jj) {
+        if (tg_pairs[jj] != e || nr >= MAXR) continue;
+        uint xr = (XPP != 0) ? jj : jj / TOPK;
+        [[unroll]] for (uint ri = 0; ri < MAXR; ++ri) {
+            if (ri == nr) {
+                pair[ri] = jj;
+                xbase[ri] = xr * (K / 8);
+            }
+        }
+        ++nr;
+    }
+#endif
+
+    // MOE_GEMV_SMALLM_CORE.
+    // The subgroup's own position (Metal: the thread index over and modulo 32).
+    uint sg = simdgroup_index_in_threadgroup, sl = thread_index_in_simdgroup;
+    uint row0 = (tg.x * 2 + sg) * R4;
+    uint words = K / 8, blocks = K / 16, bpg = GS / 16, groups = K / GS;
+    U32x4 xw = U32x4(arg(3));
+    uint64_t y = arg(5);
+    // The expert's R4 rows from row0 are consecutive: row r4's block i is
+    // wrow.v[r4 * blocks + i], its group g scales.v[r4 * groups + g]. A row
+    // number fits 32 bits (the offsets it scales to do not).
+    uint grow = e * N + row0;
+    U32x2 wrow = U32x2(arg(0) + 4 * (uint64_t(grow) * words));
+    BF16 scales = BF16(arg(1) + 2 * (uint64_t(grow) * groups)), biases = BF16(arg(2) + 2 * (uint64_t(grow) * groups));
+    precise float acc[MAXR][R4];
+    [[unroll]] for (uint ri = 0; ri < MAXR; ++ri) {
+        [[unroll]] for (uint r4 = 0; r4 < R4; ++r4) acc[ri][r4] = 0.0;
+    }
+    for (uint i = sl; i < blocks; i += 32) {
+        uint g = i / bpg;
+        uvec2 w2[R4];
+        float s[R4], b[R4];
+        [[unroll]] for (uint r4 = 0; r4 < R4; ++r4) {
+            w2[r4] = wrow.v[r4 * blocks + i];
+            s[r4] = float(scales.v[r4 * groups + g]);
+            b[r4] = float(biases.v[r4 * groups + g]);
+        }
+        // Metal breaks at ri >= nr; guarding each row is the same and unrolls.
+        [[unroll]] for (uint ri = 0; ri < MAXR; ++ri) {
+            if (ri < nr) {
+                uvec4 xa = xw.v[xbase[ri] + 2 * i], xb = xw.v[xbase[ri] + 2 * i + 1];
+                vec4 x0 = bf16x8_lo(xa), x1 = bf16x8_hi(xa), x2 = bf16x8_lo(xb), x3 = bf16x8_hi(xb);
+                [[unroll]] for (uint r4 = 0; r4 < R4; ++r4) {
+                    precise vec2 d = qdot_word_masked(w2[r4].x, x0, x1);
+                    d += qdot_word_masked(w2[r4].y, x2, x3);
+                    acc[ri][r4] += s[r4] * d.x + b[r4] * d.y;
+                }
+            }
+        }
+    }
+    [[unroll]] for (uint ri = 0; ri < MAXR; ++ri) {
+        // nr is threadgroup-uniform, so reductions stay whole.
+        if (ri < nr) {
+            [[unroll]] for (uint r4 = 0; r4 < R4; ++r4) {
+                float r = subgroupAdd(acc[ri][r4]);
+                if (sl == 0) BF16(y + 2 * (uint64_t(pair[ri]) * N)).v[row0 + r4] = bfloat16_t(r);
+            }
+        }
+    }
+}
+#endif
+
+// Reference router top-k kernels: the repeated-argmax versions the register
+// selection replaced (one threadgroup of up to 256 threads, two barriers per
+// round). moe_router_topk_ref: F32 logits [E]; moe_router_topk_rows_ref:
+// BF16 logits [m, E], one threadgroup per row.
+#if defined(KERNEL_moe_router_topk_ref) || defined(KERNEL_moe_router_topk_rows_ref)
+shared float probs[MOE_MAX_E];
+shared float red[32];
+shared float sel_val[MOE_MAX_K];
+shared uint sel_idx[MOE_MAX_K];
+shared float win_val[32];
+shared uint win_idx[32];
+void main() {
+    uint E = arg_u32(3), K = arg_u32(4), renorm = arg_u32(5);
+    uint tid = thread_index_in_threadgroup, tg_size = threads_per_threadgroup.x;
+    uint sg = simdgroup_index_in_threadgroup, lane = thread_index_in_simdgroup;
+#ifdef KERNEL_moe_router_topk_rows_ref
+    uint64_t row = threadgroup_position_in_grid.x;
+    BF16 row_logits = BF16(arg(0) + 2 * row * E);
+    U32 indices = U32(arg(1) + 4 * row * K);
+    F32 scores = F32(arg(2) + 4 * row * K);
+#else
+    F32 row_logits = F32(arg(0));
+    U32 indices = U32(arg(1));
+    F32 scores = F32(arg(2));
+#endif
+
+    // Full softmax cancels when selected logits are renormalized.
+    if (renorm != 0) {
+        for (uint i = tid; i < E; i += tg_size) probs[i] = float(row_logits.v[i]);
+        barrier();
+    } else {
+        float local_max = MOE_NEG_INFINITY;
+        for (uint i = tid; i < E; i += tg_size) local_max = max(local_max, float(row_logits.v[i]));
+        local_max = subgroupMax(local_max);
+        if (lane == 0) red[sg] = local_max;
+        barrier();
+        if (tid == 0) {
+            float m = MOE_NEG_INFINITY;
+            for (uint i = 0; i < (tg_size + 31) / 32; ++i) m = max(m, red[i]);
+            red[0] = m;
+        }
+        barrier();
+        float gmax = red[0];
+
+        precise float local_sum = 0.0;
+        for (uint i = tid; i < E; i += tg_size) {
+            precise float e = exp(float(row_logits.v[i]) - gmax);
+            probs[i] = e;
+            local_sum += e;
+        }
+        local_sum = subgroupAdd(local_sum);
+        barrier();
+        if (lane == 0) red[sg] = local_sum;
+        barrier();
+        if (tid == 0) {
+            precise float s = 0.0;
+            for (uint i = 0; i < (tg_size + 31) / 32; ++i) s += red[i];
+            red[0] = s;
+        }
+        barrier();
+        precise float inv_sum = 1.0 / red[0];
+        for (uint i = tid; i < E; i += tg_size) {
+            precise float p = probs[i] * inv_sum;
+            probs[i] = p;
+        }
+        barrier();
+    }
+
+    // Repeated argmax masks each selected expert before the next round.
+    for (uint round = 0; round < K; ++round) {
+        float best = MOE_NEG_INFINITY;
+        uint best_i = 0xFFFFFFFFu;
+        for (uint i = tid; i < E; i += tg_size) {
+            float p = probs[i];
+            if (p > best || (p == best && i < best_i)) {
+                best = p;
+                best_i = i;
+            }
+        }
+        // Metal: simd_shuffle_down by 16, 8, .., of which lane 0 sees the
+        // tree this folds.
+        for (uint off = 16; off > 0; off >>= 1) {
+            float ov = subgroupShuffleXor(best, off);
+            uint oi = subgroupShuffleXor(best_i, off);
+            if (ov > best || (ov == best && oi < best_i)) {
+                best = ov;
+                best_i = oi;
+            }
+        }
+        if (lane == 0) {
+            win_val[sg] = best;
+            win_idx[sg] = best_i;
+        }
+        barrier();
+        if (tid == 0) {
+            float b = MOE_NEG_INFINITY;
+            uint bi = 0xFFFFFFFFu;
+            for (uint i = 0; i < (tg_size + 31) / 32; ++i) {
+                if (win_val[i] > b || (win_val[i] == b && win_idx[i] < bi)) {
+                    b = win_val[i];
+                    bi = win_idx[i];
+                }
+            }
+            sel_val[round] = b;
+            sel_idx[round] = bi;
+            // NaN cannot collide with a valid -inf logit on the raw path.
+            probs[bi] = MOE_NAN;
+        }
+        barrier();
+    }
+
+    if (tid == 0) {
+        if (renorm != 0) {
+            float mx = sel_val[0];
+            precise float denom = 0.0;
+            for (uint j = 0; j < K; ++j) denom += exp(sel_val[j] - mx);
+            for (uint j = 0; j < K; ++j) {
+                precise float score = exp(sel_val[j] - mx) / denom;
+                indices.v[j] = sel_idx[j];
+                scores.v[j] = score;
+            }
+        } else {
+            for (uint j = 0; j < K; ++j) {
+                indices.v[j] = sel_idx[j];
+                scores.v[j] = sel_val[j];
+            }
+        }
+    }
+}
+#endif
