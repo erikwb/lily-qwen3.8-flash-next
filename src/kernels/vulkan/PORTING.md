@@ -157,6 +157,46 @@ Things this driver and compiler do that a plain translation trips over:
 - **Reads past a buffer** fault the GPU job; Metal tensor slices clamp where
   a pointer walk does not.
 
+## What is fast on this compiler and GPU
+
+Measured while tuning the kernels (2026-11-10 and 11, M5 Max); the Mesa
+branch `ewb/lily-compiler` removes some of these costs, the daily Mesa has
+all of them.
+
+- **Loads are the unit of cost.** A load from cache costs about what five
+  or six adds do, and about thirteen when its address depends on the load
+  before it; from DRAM about 0.3 us. A thread waits for each. Prefer few,
+  wide, independent loads (16 bytes at a time), issued together, and avoid
+  chains where one load's result addresses the next.
+- **Registers written cost time**, and past about 123 live 32-bit values the
+  compiler spills to per-thread stack memory. Fewer live registers was
+  faster at every step of the MoE kernels' tuning. The highest register
+  number alone is free. An array of accumulators or matrices indexed by a
+  loop variable lives in stack memory: name them.
+- **Row addresses** are `base + uint64_t(row) * (element_size * stride)`
+  with both factors 32-bit: one multiply. A 64x64 product adds cross terms.
+  Index a loop-invariant 64-bit base with a 32-bit index: a load takes
+  `base64 + (index32 << shift)` natively.
+- **A 32-bit load ignores the low two bits of its address**, so the
+  alignment branches around them must stay. 16-bit vector loads of two to
+  four elements are exact at any 2-byte offset.
+- **Shuffles.** `subgroupShuffleXor` with a constant mask of 1 to 31 is one
+  instruction on the compiler branch; a non-constant mask or a general
+  shuffle costs about twenty adds. `subgroupAdd` is one instruction and adds
+  as a pairwise tree over adjacent lanes (tests pin it: kernels rely on it
+  for bit-identical sums).
+- **Loops** with constant trip counts unroll; an iteration left as a loop
+  costs about six adds of overhead. A division by a non-constant is about
+  twenty instructions: make the divisor a power of two and shift.
+- **Dispatches on one level do not overlap** on this driver: three cost the
+  sum of each alone, where Metal runs them side by side. Fuse independent
+  same-level work into one dispatch (`gemv_quant_sets`). A tiny level costs
+  2 to 4 us, a barrier about 0.35 us.
+- **The matrix lane layout** (`mat_a_col` and friends in matmul.glsl) is
+  shared with Mesa's lowering: a change must land in both.
+- **`fma()`** may be split by the compiler; a `precise dot()` is an in-order
+  chain of fused multiply-adds.
+
 Start with a direct, readable translation that passes the tests. Then, where
 the Rust side or `docs/performance.md` says a kernel is on the decode or
 prefill hot path, look at what the translation costs: the Metal kernels were
