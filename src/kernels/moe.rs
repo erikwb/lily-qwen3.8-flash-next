@@ -209,6 +209,19 @@ fn check_smallm(
     Ok((k_in, m, s))
 }
 
+/// The Vulkan small-m kernels of K > 512 place a row in a stacked expert
+/// weight by a 32-bit byte offset from its start (moe.comp).
+fn check_vulkan_smallm_offsets(w: &QuantWeights) -> Result<()> {
+    for (t, what) in [(&w.codes, "codes"), (&w.scales, "scales"), (&w.biases, "biases")] {
+        ensure!(
+            t.byte_len() <= u32::MAX as usize,
+            "small-m expert kernels index a stack's {what} in 32 bits ({} bytes)",
+            t.byte_len()
+        );
+    }
+    Ok(())
+}
+
 /// Fused small-batch gate + up + SwiGLU over the union of the routed experts:
 /// `y[pair, :] = silu(gate_e . x[row]) * (up_e . x[row])` for every routed
 /// `(row, k)` pair with `e = indices[row, k]`, `x` `[m, K]`, `y` BF16
@@ -245,9 +258,15 @@ pub fn moe_smallm_gate_up(
         (false, true) => ("moe_smallm_q4_gate_up_r8_w", 8),
     };
     // On Vulkan the K > 512 tiers are one kernel that walks two rows per
-    // threadgroup of one simdgroup (moe.comp says why).
-    let (r4, threads) =
-        if cfg!(target_os = "linux") && k_in > 512 { (1, 32) } else { (r4, 64) };
+    // threadgroup of one simdgroup, each pair's threadgroups its own expert
+    // (no union: moe.comp says why).
+    let (r4, threads) = if cfg!(target_os = "linux") && k_in > 512 {
+        check_vulkan_smallm_offsets(gate)?;
+        check_vulkan_smallm_offsets(up)?;
+        (1, 32)
+    } else {
+        (r4, 64)
+    };
     let (k_in, m, s) = check_smallm(gate, n_per_expert, indices, top_k, r4)?;
     ensure!(
         x.numel() == m * k_in && x.dtype() == DType::BF16,
@@ -324,6 +343,9 @@ pub fn moe_smallm_down_combine(
     } else {
         ("moe_smallm_q4_down_combine", 4)
     };
+    if vulkan_rows {
+        check_vulkan_smallm_offsets(w)?;
+    }
     let (k_in, m, s) =
         check_smallm(w, h, indices, top_k, if vulkan_rows { 1 } else { r4 })?;
     ensure!(

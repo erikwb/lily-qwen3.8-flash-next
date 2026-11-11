@@ -450,6 +450,32 @@ fn smallm_routing(
                 }
                 indices.extend(&pool[..top_k]);
             }
+            // What a verify pass routes (docs/performance.md: a draft row
+            // routes to 6 to 7 experts the rows before it did not): the
+            // first row as "random", a later row 3 or 4 experts of the
+            // earlier rows' and the rest new, in random slots.
+            "draft" => {
+                let seen: Vec<u32> = indices.clone();
+                let shared = if seen.is_empty() { 0 } else { 3 + indices.len() / top_k % 2 };
+                let mut row: Vec<u32> = Vec::with_capacity(top_k);
+                while row.len() < shared.min(top_k) {
+                    let pick = seen[rng.gen_range(0..seen.len())];
+                    if !row.contains(&pick) {
+                        row.push(pick);
+                    }
+                }
+                while row.len() < top_k {
+                    let pick = rng.gen_range(0..e as u32);
+                    if !row.contains(&pick) && !seen.contains(&pick) {
+                        row.push(pick);
+                    }
+                }
+                for k in 0..top_k {
+                    let pick = rng.gen_range(k..top_k);
+                    row.swap(k, pick);
+                }
+                indices.extend(&row);
+            }
             other => panic!("unknown routing mode {other}"),
         }
     }
@@ -1485,6 +1511,82 @@ fn smallm_moe_timing() {
                 pass.level_barrier(&[&out]).unwrap();
             });
         }
+    }
+}
+
+/// The fused small-m pair and its halves as the verify pass of speculative
+/// decode runs them (m = 3, and m = 1 for the one-row use), at the model's
+/// shape, with the routings of `smallm_moe_timing` ("random": every row its
+/// own experts, 30 streamed at m = 3) and of a verify pass ("draft": about 23
+/// streamed, 7 pairs walk an expert a second row). Prints us per layer, best
+/// of `LILY_SMALLM_PASSES` (5) passes of 256 layers over 64 routings. Run
+/// with `--ignored --nocapture`.
+#[test]
+#[ignore = "timing only"]
+fn smallm_verify_timing() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(93);
+    let (e, inter, k_in, h, gs, top_k) =
+        (512usize, 640usize, 2560usize, 2560usize, 64usize, 10usize);
+    let gate = random_q4_stack(&ctx, &mut rng, e * inter, k_in, gs);
+    let up = random_q4_stack(&ctx, &mut rng, e * inter, k_in, gs);
+    let down = random_q4_stack(&ctx, &mut rng, e * h, inter, gs);
+    let passes: usize = std::env::var("LILY_SMALLM_PASSES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
+    let routings = 64;
+    let iters = 256;
+    for (m, mode) in [(1usize, "random"), (3, "random"), (3, "draft")] {
+        let s = m * top_k;
+        let inputs: Vec<SmallmInputs> = (0..routings)
+            .map(|_| smallm_inputs(&ctx, &mut rng, e, k_in, h, m, top_k, mode))
+            .collect();
+        let ea = Tensor::zeros(&ctx, &[s, inter], DType::BF16).expect("ea");
+        let out = Tensor::zeros(&ctx, &[m, h], DType::BF16).expect("out");
+        let time = |f: &dyn Fn(&ComputePass<'_>, &SmallmInputs)| {
+            let mut best = f64::MAX;
+            for _ in 0..passes {
+                let pass = ctx.begin_concurrent().expect("pass");
+                for i in 0..iters {
+                    f(&pass, &inputs[i % routings]);
+                }
+                let start = std::time::Instant::now();
+                pass.commit_wait().expect("commit");
+                best = best.min(start.elapsed().as_secs_f64() * 1e6 / iters as f64);
+            }
+            best
+        };
+        let w3 = (&gate, &up, &down);
+        let pair = time(&|pass, inp| {
+            smallm_fused_chain(&ctx, pass, w3, inter, h, inp, &ea, &out, top_k).unwrap();
+        });
+        let gate_up = time(&|pass, inp| {
+            moe_smallm_gate_up(&ctx, pass, &gate, &up, inter, &inp.x, &inp.indices, &ea, top_k)
+                .unwrap();
+            pass.level_barrier(&[&ea]).unwrap();
+        });
+        let down_combine = time(&|pass, inp| {
+            moe_smallm_down_combine(
+                &ctx,
+                pass,
+                &down,
+                h,
+                &ea,
+                &inp.indices,
+                &inp.scores,
+                &inp.shared_out,
+                &inp.shared_gate,
+                &out,
+                top_k,
+            )
+            .unwrap();
+            pass.level_barrier(&[&out]).unwrap();
+        });
+        eprintln!(
+            "smallm m={m} {mode}: pair {pair:.1} gate_up {gate_up:.1} down_combine \
+             {down_combine:.1} us per layer (best of {passes})"
+        );
     }
 }
 
