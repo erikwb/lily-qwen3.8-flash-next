@@ -32,7 +32,10 @@
 //! - **GPU time** is the host's: a pass's span runs from its first
 //!   submission, or the end of the pass before it, to the completion the
 //!   watcher saw. The per-kernel profile submits and waits for each dispatch
-//!   alone, which adds a job's fixed cost to each.
+//!   alone, which adds a job's fixed cost (some 150 us, against kernels of
+//!   10 to 100) to each: a profiling context measures that cost on a trivial
+//!   dispatch when it is made and takes it off every sample
+//!   ([`MetalContext::calibrate_profile`]).
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -685,6 +688,10 @@ const GATE_SPIN: Duration = Duration::from_micros(200);
 /// context (`metal.rs`, `GATE_PATIENCE`).
 const GATE_PATIENCE: Duration = Duration::from_secs(30);
 
+/// What one dispatch submitted and waited for alone costs beside its
+/// kernel, in nanoseconds: taken off every profile sample.
+static PROFILE_FLOOR_NS: AtomicU64 = AtomicU64::new(0);
+
 struct Submitter {
     dev: Arc<Dev>,
     fault: Arc<Fault>,
@@ -713,9 +720,10 @@ impl Submitter {
                             self.fault.record(format!("{e:#}"));
                         } else if self.profile {
                             self.wait_completed(self.serial);
+                            let floor = PROFILE_FLOOR_NS.load(Ordering::Relaxed) as f64 * 1e-9;
                             kernels.push(profile::KernelSample {
                                 name,
-                                gpu_secs: host_secs() - at,
+                                gpu_secs: (host_secs() - at - floor).max(0.0),
                             });
                         }
                     }
@@ -913,7 +921,7 @@ impl MetalContext {
         ];
         let batch = env_usize("LILY_VK_BATCH")
             .map_or((SERIAL_BATCH, CONCURRENT_BATCH), |v| (v, v));
-        Ok(Self {
+        let ctx = Self {
             pool: Rc::new(Pool { dev: dev.clone(), free: RefCell::new(Vec::new()) }),
             dev,
             fence,
@@ -926,7 +934,49 @@ impl MetalContext {
             profile,
             batch,
             recorded: RefCell::new(None),
-        })
+        };
+        if profile {
+            ctx.calibrate_profile()?;
+        }
+        Ok(ctx)
+    }
+
+    /// Measures what the profile's one-dispatch command buffers cost beside
+    /// their kernel: the median of a word copy's dispatches, each submitted
+    /// and waited for alone as every profiled dispatch is. The copy itself
+    /// is a few microseconds, so a kernel's sample comes out that much low.
+    fn calibrate_profile(&self) -> Result<()> {
+        const SAMPLES: usize = 96;
+        PROFILE_FLOOR_NS.store(0, Ordering::Relaxed);
+        let kernel = self.pipeline("copy_u32", "", MslVersion::V3_1)?;
+        let (src, dst) = (self.dev.new_buffer(4, true)?, self.dev.new_buffer(4, true)?);
+        let before = profile::take();
+        let pass = self.begin()?;
+        for _ in 0..SAMPLES {
+            pass.dispatch_at(
+                &kernel,
+                &[(&src, 0), (&dst, 0)],
+                &[],
+                Grid::Threads { grid: (1, 1, 1), threadgroup: (1, 1, 1) },
+            )?;
+        }
+        pass.commit_wait()?;
+        let mut samples: Vec<f64> = profile::take()
+            .iter()
+            .flat_map(|pass| pass.kernels.iter().map(|k| k.gpu_secs))
+            .collect();
+        for pass in before {
+            profile::record(pass);
+        }
+        ensure!(samples.len() == SAMPLES, "profile calibration lost samples");
+        samples.sort_by(f64::total_cmp);
+        // The first dispatches include the pipeline's creation: the median.
+        let floor = samples[SAMPLES / 2];
+        PROFILE_FLOOR_NS.store((floor * 1e9) as u64, Ordering::Relaxed);
+        if std::env::var_os("LILY_VK_PROFILE_LOG").is_some() {
+            eprintln!("vulkan: the profile takes {:.1} us off every dispatch", floor * 1e6);
+        }
+        Ok(())
     }
 
     /// Whether the per-kernel profile mode is on; see [`profile`].
