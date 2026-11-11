@@ -4,7 +4,9 @@
 // is; this is the same arithmetic in the same order.
 #include "common.glsl"
 
-#ifdef KERNEL_moe_smallm_q4_down_combine
+// moe_smallm_q4_down_combine_l: the Metal moe_smallm_q4_down_combine, which
+// here takes only the K the kernel of that name below does not (K > 1024).
+#ifdef KERNEL_moe_smallm_q4_down_combine_l
 #define MOE_SMALLM_DOWN_R4 4
 #define MOE_SMALLM_DOWN_PSG 4
 #endif
@@ -27,18 +29,21 @@
 #define EPL 32
 #endif
 #ifdef EPL
+#if defined(KERNEL_moe_router_topk_rows_e8) || defined(KERNEL_moe_router_topk_rows_e16) || defined(KERNEL_moe_router_topk_rows_e32)
+#define ROUTER_ROWS
+#endif
 shared float probs[MOE_MAX_E];
 shared float red[32];
-shared float sel_val[MOE_ROUTER_MAX_K];
-shared uint sel_idx[MOE_ROUTER_MAX_K];
+shared float sel_exp[MOE_ROUTER_MAX_K];
 
 void main() {
     uint E = arg_u32(3), K = arg_u32(4), renorm = arg_u32(5);
     uint tid = thread_index_in_threadgroup, tg_size = threads_per_threadgroup.x;
     uint sg = simdgroup_index_in_threadgroup, lane = thread_index_in_simdgroup;
-#if defined(KERNEL_moe_router_topk_rows_e8) || defined(KERNEL_moe_router_topk_rows_e16) || defined(KERNEL_moe_router_topk_rows_e32)
+#ifdef ROUTER_ROWS
     uint64_t row = threadgroup_position_in_grid.x;
-    BF16 row_logits = BF16(arg(0) + 2 * row * E);
+    uint64_t logits_at = arg(0) + 2 * row * E;
+    BF16 row_logits = BF16(logits_at);
     U32 out_idx = U32(arg(1) + 4 * row * K);
     F32 out_scores = F32(arg(2) + 4 * row * K);
 #else
@@ -47,13 +52,37 @@ void main() {
     F32 out_scores = F32(arg(2));
 #endif
 
+    // Metal holds expert lane + 32 * j in v[j]; here a lane holds EPL
+    // consecutive experts, base + j, which it can read as whole 16-byte
+    // loads (2026-11-10: the selection, by value and then by expert id, is
+    // the same whichever lane holds an expert).
+    uint base = lane * EPL;
     float v[EPL];
     if (renorm != 0) {
         if (sg != 0) return;
-        [[unroll]] for (uint j = 0; j < EPL; ++j) {
-            uint i = lane + 32 * j;
-            v[j] = MOE_NAN;
-            if (i < E) v[j] = float(row_logits.v[i]);
+        if (E == 32 * EPL) {
+#ifdef ROUTER_ROWS
+            U32x4 wide = U32x4(logits_at);
+            [[unroll]] for (uint q = 0; q < EPL / 8; ++q) {
+                uvec4 w = wide.v[lane * (EPL / 8) + q];
+                vec4 lo = bf16x8_lo(w), hi = bf16x8_hi(w);
+                [[unroll]] for (uint c = 0; c < 4; ++c) {
+                    v[8 * q + c] = lo[c];
+                    v[8 * q + 4 + c] = hi[c];
+                }
+            }
+#else
+            F32x4 wide = F32x4(arg(0));
+            [[unroll]] for (uint q = 0; q < EPL / 4; ++q) {
+                vec4 f = wide.v[lane * (EPL / 4) + q];
+                [[unroll]] for (uint c = 0; c < 4; ++c) v[4 * q + c] = f[c];
+            }
+#endif
+        } else {
+            [[unroll]] for (uint j = 0; j < EPL; ++j) {
+                v[j] = MOE_NAN;
+                if (base + j < E) v[j] = float(row_logits.v[base + j]);
+            }
         }
     } else {
         float local_max = MOE_NEG_INFINITY;
@@ -93,51 +122,48 @@ void main() {
         barrier();
         if (sg != 0) return;
         [[unroll]] for (uint j = 0; j < EPL; ++j) {
-            uint i = lane + 32 * j;
             v[j] = MOE_NAN;
-            if (i < E) v[j] = probs[i];
+            if (base + j < E) v[j] = probs[base + j];
         }
     }
 
-    // moe_topk_select<EPL>.
+    // moe_topk_select<EPL>, with the winner of round r kept by lane r, which
+    // writes it. A round is the lanes' largest values, their maximum, the
+    // lowest expert id that holds it, and its entry masked: the same choice
+    // as Metal's (value, then id) comparison per entry in half the
+    // instructions; the K exponentials of the renormalised scores are one
+    // instruction stream over K lanes, summed in lane order as lane 0 sums
+    // them on Metal. 11.3 to 5.6 us per dispatch in router_topk_timing, of
+    // which 2.0 are the level (2026-11-10).
+    float win_val = 0.0;
+    uint win_idx = 0;
     for (uint round = 0; round < K; ++round) {
         float best = MOE_NEG_INFINITY;
-        uint best_i = 0xFFFFFFFFu;
-        [[unroll]] for (uint j = 0; j < EPL; ++j) {
-            uint i = lane + 32 * j;
-            float p = v[j];
-            if (p > best || (p == best && i < best_i)) {
-                best = p;
-                best_i = i;
-            }
-        }
+        [[unroll]] for (uint j = 0; j < EPL; ++j) best = v[j] > best ? v[j] : best;
         float bv = subgroupMax(best);
-        uint bi = subgroupMin(best == bv ? best_i : 0xFFFFFFFFu);
-        if (lane == 0) {
-            sel_val[round] = bv;
-            sel_idx[round] = bi;
-        }
-        [[unroll]] for (uint j = 0; j < EPL; ++j) {
-            if (lane + 32 * j == bi) v[j] = MOE_NAN;
-        }
+        uint slot = 0xFFFFFFFFu;
+        [[unroll]] for (uint j = EPL; j > 0; --j) slot = v[j - 1] == bv ? j - 1 : slot;
+        uint bi = subgroupMin(slot == 0xFFFFFFFFu ? slot : base + slot);
+        uint own = bi - base;
+        [[unroll]] for (uint j = 0; j < EPL; ++j) v[j] = own == j ? MOE_NAN : v[j];
+        win_val = lane == round ? bv : win_val;
+        win_idx = lane == round ? bi : win_idx;
     }
 
-    if (lane == 0) {
-        if (renorm != 0) {
-            float mx = sel_val[0];
-            precise float denom = 0.0;
-            for (uint j = 0; j < K; ++j) denom += exp(sel_val[j] - mx);
-            for (uint j = 0; j < K; ++j) {
-                precise float score = exp(sel_val[j] - mx) / denom;
-                out_idx.v[j] = sel_idx[j];
-                out_scores.v[j] = score;
-            }
-        } else {
-            for (uint j = 0; j < K; ++j) {
-                out_idx.v[j] = sel_idx[j];
-                out_scores.v[j] = sel_val[j];
-            }
+    if (renorm != 0) {
+        float mx = subgroupBroadcastFirst(win_val);
+        precise float e = exp(win_val - mx);
+        if (lane < K) sel_exp[lane] = e;
+        precise float denom = 0.0;
+        for (uint j = 0; j < K; ++j) denom += sel_exp[j];
+        precise float score = e / denom;
+        if (lane < K) {
+            out_idx.v[lane] = win_idx;
+            out_scores.v[lane] = score;
         }
+    } else if (lane < K) {
+        out_idx.v[lane] = win_idx;
+        out_scores.v[lane] = win_val;
     }
 }
 #endif
@@ -163,6 +189,12 @@ void main() {
         uint g = i / bpg;
         uvec4 gate_w4 = gate_wrow.v[i];
         uvec4 up_w4 = up_wrow.v[i];
+        // Metal reads the group's scales and biases where it uses them, after
+        // the block's products. Read here they are in flight with the
+        // weights, where read late a thread waits for memory a second time:
+        // 47.6 to 44.0 us per layer in moe_gather_chain_timing (2026-11-10).
+        float gate_scale = float(gate_scales.v[g]), gate_bias = float(gate_biases.v[g]);
+        float up_scale = float(up_scales.v[g]), up_bias = float(up_biases.v[g]);
         float gate_dot = 0.0;
         float up_dot = 0.0;
         float x_sum = 0.0;
@@ -176,8 +208,8 @@ void main() {
             up_dot += dot(q4_lo(uw), xlo) + dot(q4_hi(uw), xhi);
             x_sum += dot(xlo, vec4(1.0)) + dot(xhi, vec4(1.0));
         }
-        gate_sum += float(gate_scales.v[g]) * gate_dot + float(gate_biases.v[g]) * x_sum;
-        up_sum += float(up_scales.v[g]) * up_dot + float(up_biases.v[g]) * x_sum;
+        gate_sum += gate_scale * gate_dot + gate_bias * x_sum;
+        up_sum += up_scale * up_dot + up_bias * x_sum;
     }
     gate_sum = subgroupAdd(gate_sum);
     up_sum = subgroupAdd(up_sum);
@@ -192,10 +224,12 @@ void main() {
 // The routed experts' down projections gathered and combined with the scores
 // (and the gated shared expert): moe_down_combine_body<LANES, SG>, LANES
 // lanes per output row and SG subgroups per threadgroup taking alternate
-// routed slots for the same rows.
-#if defined(KERNEL_moe_gather_gemv_q4_down_combine) || defined(KERNEL_moe_gather_gemv_q4_down_combine_sg1)
+// routed slots for the same rows. _sg4 is Metal's
+// moe_gather_gemv_q4_down_combine, which here takes only the K the kernel of
+// that name below does not; _sg1 is the reference of the bit-identity test.
+#if defined(KERNEL_moe_gather_gemv_q4_down_combine_sg4) || defined(KERNEL_moe_gather_gemv_q4_down_combine_sg1)
 #define LANES 16
-#ifdef KERNEL_moe_gather_gemv_q4_down_combine
+#ifdef KERNEL_moe_gather_gemv_q4_down_combine_sg4
 #define SG 4
 #else
 #define SG 1
@@ -275,20 +309,95 @@ void main() {
 }
 #endif
 
+// moe_gather_gemv_q4_down_combine on this driver, for K <= 1024 (a row of at
+// most 32 blocks of 32 weights). Metal's sixteen lanes per row reload the
+// slot's activations for every row and block, and the second trip of their
+// walk runs with a quarter of the lanes: compiled here that is 230
+// instructions and seven loads per 32 weights, and no part of it stood out
+// when taken away (the weight loads 5 of 41 us, the products 10, every other
+// load and the bias sum 9). Here a subgroup takes one routed slot at a time,
+// holds the slot's activations in registers, a lane one block with its sum
+// for the bias term, and walks DOWN_ROWS output rows: a row is one 16-byte
+// weight load, two scale loads and about 150 instructions. Lane 2k holds
+// block h = bitrev4(k) and lane 2k + 1 block h + 16, so the subgroup sum,
+// which this GPU adds as a pairwise tree over adjacent lanes
+// (`subgroup_add_is_a_pairwise_tree`), adds a row's block terms in the order
+// of Metal's strided lanes and shuffle tree: bit-identical to _sg1
+// (`down_combine_variants_bit_identical`). 44.5 to 30 us per layer in
+// moe_gather_chain_timing (2026-11-10; Metal 22.3). What lost: a row per lane
+// (every load then touches 32 lines), 57 to 194 us; and, in the small-m form
+// of this kernel at m = 3, a lane of 64 weights with three rows a walk (87
+// against 72 us: its registers), the weight loads of two or more rows
+// requested together (80), and the sum stored by every lane without a
+// branch (83).
+#ifdef KERNEL_moe_gather_gemv_q4_down_combine
+#define DOWN_ROWS 16
+shared float xchg[MOE_MAX_K * DOWN_ROWS];
+void main() {
+    uint K = arg_u32(9), GS = arg_u32(10), H = arg_u32(11), S = arg_u32(12), has_shared = arg_u32(13);
+    uint64_t codes = arg(0), scales_at = arg(1), biases_at = arg(2);
+    U32x4 xv = U32x4(arg(3));
+    U32 indices = U32(arg(4));
+    F32 scores = F32(arg(5));
+    uint sg = simdgroup_index_in_threadgroup, lane = thread_index_in_simdgroup;
+    uint nsg = threads_per_threadgroup.x / 32;
+    uint row0 = threadgroup_position_in_grid.x * DOWN_ROWS;
+    // The last threadgroup may hold fewer rows.
+    uint nrows = min(uint(DOWN_ROWS), H - row0);
+    uint blocks = K / 32, groups = K / GS, bpg = GS / 32;
+    uint k = lane >> 1;
+    uint i = (((k & 1u) << 3) | ((k & 2u) << 1) | ((k & 4u) >> 1) | ((k & 8u) >> 3)) + 16 * (lane & 1u);
+    // A lane past the row's blocks reads block 0 and adds nothing.
+    bool on = i < blocks;
+    i = on ? i : 0;
+    uint g = i / bpg;
+    for (uint slot = sg; slot < S; slot += nsg) {
+        vec4 xlo[4], xhi[4];
+        precise float xs = 0.0;
+        [[unroll]] for (uint j = 0; j < 4; ++j) {
+            uvec4 x8 = xv.v[slot * (K / 8) + 4 * i + j];
+            xlo[j] = bf16x8_lo(x8);
+            xhi[j] = bf16x8_hi(x8);
+            xs += dot(xlo[j], vec4(1.0)) + dot(xhi[j], vec4(1.0));
+        }
+        // The expert's rows from row0 are consecutive. A row number fits 32
+        // bits (the offsets it scales to do not).
+        uint grow = indices.v[slot] * H + row0;
+        U32x4 wrow = U32x4(codes + 16 * (uint64_t(grow) * blocks));
+        BF16 scales = BF16(scales_at + 2 * (uint64_t(grow) * groups)), biases = BF16(biases_at + 2 * (uint64_t(grow) * groups));
+        for (uint r = 0; r < nrows; ++r) {
+            uvec4 w4 = wrow.v[r * blocks + i];
+            float scale = float(scales.v[r * groups + g]);
+            float bias = float(biases.v[r * groups + g]);
+            precise float qx = 0.0;
+            [[unroll]] for (uint j = 0; j < 4; ++j) qx += dot(q4_lo(w4[j]), xlo[j]) + dot(q4_hi(w4[j]), xhi[j]);
+            precise float term = scale * qx + bias * xs;
+            float sum = subgroupAdd(on ? term : 0.0);
+            if (lane == 0) xchg[slot * DOWN_ROWS + r] = float(bfloat16_t(sum));
+        }
+    }
+    // xchg[slot * DOWN_ROWS + r]: the slot's sum for the threadgroup's row r.
+    barrier();
+    if (sg == 0 && lane < nrows) {
+        uint row = row0 + lane;
+        precise float combined = 0.0;
+        for (uint slot = 0; slot < S; ++slot) combined += scores.v[slot] * xchg[slot * DOWN_ROWS + lane];
+        if (has_shared != 0) {
+            precise float gate = 1.0 / (1.0 + exp(-F32(arg(7)).v[0]));
+            combined += gate * float(BF16(arg(6)).v[row]);
+        }
+        BF16(arg(8)).v[row] = bfloat16_t(combined);
+    }
+}
+#endif
+
 // ---- Small-batch expert path (m <= MOE_SMALLM_MAX_M token rows) -------------
 // MOE_SMALLM_GATE_UP_KERNEL(NAME, MAXR, R4): one threadgroup per (R4-row pair
-// of 2 subgroups, union expert).
-#ifdef KERNEL_moe_smallm_q4_gate_up_r4
-#define MAXR 4
-#define R4 4
-#endif
+// of 2 subgroups, union expert). Of Metal's four instantiations the two wide
+// walks (K <= 512) are these; the other two are the kernel after them.
 #ifdef KERNEL_moe_smallm_q4_gate_up_r4_w
 #define MAXR 4
 #define R4 8
-#endif
-#ifdef KERNEL_moe_smallm_q4_gate_up_r8
-#define MAXR 8
-#define R4 2
 #endif
 #ifdef KERNEL_moe_smallm_q4_gate_up_r8_w
 #define MAXR 8
@@ -394,6 +503,173 @@ void main() {
                 }
             }
         }
+    }
+}
+#endif
+
+// moe_smallm_q4_gate_up_r4 and _r8 on this driver (K > 512): one threadgroup
+// of one subgroup per (two rows, union expert). Metal keeps a sum per routed
+// row and expert row in registers (32 in the r4 tier) and reads the weights
+// as 8-byte blocks, 26 loads a trip. Threads that hold fewer registers
+// measured faster at every step taken (2026-11-10, smallm_moe_timing, m = 3:
+// 129 us per layer as ported; 118 with sums for one routed row only; 108
+// with two rows a subgroup in place of eight; four rows a lane 131), so this
+// kernel walks an expert's two rows once per routed token row with four
+// sums: the second and later walks of an expert read its weights from
+// cache, and the tiers no longer differ (the kernel is built under both
+// names). Sixteen lanes take a row: lane g its blocks 2g and
+// 2g + 1 of every 32, one 16-byte load, with a sum for each. Their sum is
+// the first level of the pairwise tree the subgroup sum adds in
+// (`subgroup_add_is_a_pairwise_tree`) and a sum over one half of the
+// subgroup the rest, so a row's terms are added in the order of the
+// expert-major GEMV's 32 strided lanes: bit-identical to the reference chain
+// (`smallm_fused_kernels_match_reference_chain_bitwise`). The union comes
+// from one ballot of the pair list per 32 pairs in place of the staged list's
+// two loops (no time of its own: 131 against 129 alone). 129 to 107 us per
+// layer at m = 3, 57 to 44 at m = 1; with only the weight loads left the
+// ported kernel took 99 (535 GB/s).
+#if defined(KERNEL_moe_smallm_q4_gate_up_r4) || defined(KERNEL_moe_smallm_q4_gate_up_r8)
+void main() {
+    uint K = arg_u32(9), GS = arg_u32(10), N = arg_u32(11), S = arg_u32(12), TOPK = arg_u32(13);
+    U32 indices = U32(arg(7));
+    uvec2 tg = threadgroup_position_in_grid.xy;
+    uint lane = thread_index_in_simdgroup, hr = lane >> 4, g = lane & 15u;
+    uint j = tg.y;
+    uint e = indices.v[j];
+    uint row = tg.x * 2 + hr;
+    uint pairs = K / 32, groups = K / GS, ppg = GS / 32;
+    U32x4 xw = U32x4(arg(6));
+    uint64_t y = arg(8);
+    // A row number fits 32 bits (the offsets it scales to do not).
+    uint grow = e * N + row;
+    uint64_t wrow = 16 * (uint64_t(grow) * pairs), srow = 2 * (uint64_t(grow) * groups);
+    U32x4 g_wrow = U32x4(arg(0) + wrow), u_wrow = U32x4(arg(3) + wrow);
+    BF16 g_scales = BF16(arg(1) + srow), g_biases = BF16(arg(2) + srow);
+    BF16 u_scales = BF16(arg(4) + srow), u_biases = BF16(arg(5) + srow);
+    // MOE_SMALLM_UNION_PROLOGUE: the threadgroup exits when a pair before j
+    // routes to its expert, and walks the expert for pair j and every later
+    // pair that routes to it.
+    for (uint c = 0; c < S; c += 32) {
+        uint jj = c + lane;
+        uint m = subgroupBallot(jj < S && indices.v[min(jj, S - 1)] == e).x;
+        uint before = j > c ? (j - c >= 32 ? 0xFFFFFFFFu : (1u << (j - c)) - 1u) : 0u;
+        if ((m & before) != 0) return;
+        m &= ~before;
+        while (m != 0) {
+            uint p = c + findLSB(m);
+            m &= m - 1;
+            // The pair's token row in x, in the 16-byte loads the walk reads.
+            uint xrow = (p / TOPK) * (K / 8);
+            precise float ag0 = 0.0, ag1 = 0.0, au0 = 0.0, au1 = 0.0;
+            for (uint bp = g; bp < pairs; bp += 16) {
+                uint grp = bp / ppg;
+                uvec4 gw = g_wrow.v[bp], uw = u_wrow.v[bp];
+                float gs = float(g_scales.v[grp]), gb = float(g_biases.v[grp]);
+                float us = float(u_scales.v[grp]), ub = float(u_biases.v[grp]);
+                uint xat = xrow + 4 * bp;
+                uvec4 xa = xw.v[xat], xb = xw.v[xat + 1];
+                vec4 x0 = bf16x8_lo(xa), x1 = bf16x8_hi(xa), x2 = bf16x8_lo(xb), x3 = bf16x8_hi(xb);
+                precise vec2 dg = qdot_word_masked(gw.x, x0, x1);
+                dg += qdot_word_masked(gw.y, x2, x3);
+                ag0 += gs * dg.x + gb * dg.y;
+                precise vec2 du = qdot_word_masked(uw.x, x0, x1);
+                du += qdot_word_masked(uw.y, x2, x3);
+                au0 += us * du.x + ub * du.y;
+                uvec4 xc = xw.v[xat + 2], xd = xw.v[xat + 3];
+                vec4 x4 = bf16x8_lo(xc), x5 = bf16x8_hi(xc), x6 = bf16x8_lo(xd), x7 = bf16x8_hi(xd);
+                precise vec2 dh = qdot_word_masked(gw.z, x4, x5);
+                dh += qdot_word_masked(gw.w, x6, x7);
+                ag1 += gs * dh.x + gb * dh.y;
+                precise vec2 dv = qdot_word_masked(uw.z, x4, x5);
+                dv += qdot_word_masked(uw.w, x6, x7);
+                au1 += us * dv.x + ub * dv.y;
+            }
+            precise float pg = ag0 + ag1;
+            precise float pu = au0 + au1;
+            float g_lo = subgroupAdd(hr == 0 ? pg : 0.0), g_hi = subgroupAdd(hr == 0 ? 0.0 : pg);
+            float u_lo = subgroupAdd(hr == 0 ? pu : 0.0), u_hi = subgroupAdd(hr == 0 ? 0.0 : pu);
+            if (g == 0) {
+                float gv = float(bfloat16_t(hr == 0 ? g_lo : g_hi));
+                precise float sv = gv / (1.0 + exp(-gv));
+                precise float act = sv * float(bfloat16_t(hr == 0 ? u_lo : u_hi));
+                BF16(y + 2 * (uint64_t(p) * N)).v[row] = bfloat16_t(act);
+            }
+        }
+    }
+}
+#endif
+
+// moe_smallm_q4_down_combine on this driver, for 512 < K <= 1024: the shape
+// of moe_gather_gemv_q4_down_combine above with the small-m arithmetic. One
+// threadgroup per (SMALLM_DOWN_ROWS output columns, token row); a subgroup
+// takes one of the row's pairs at a time, holds the pair's activations in
+// registers (a lane the 32 of two adjacent blocks) and walks the columns'
+// expert rows, one 16-byte weight load and two scale loads each. Lanes 0 to
+// 15 hold blocks 0 to 31 and lanes 16 and up the blocks past them, whose
+// terms are the second terms of lanes 0 and up: a shuffle folds them in,
+// then a lane's two sums and the subgroup sum over the first sixteen lanes
+// add in the expert-major GEMV's order (the gate/up kernel above): bit-
+// identical to the reference chain. 81 to 73 us per layer at m = 3, 39 to 30
+// at m = 1 (2026-11-10, smallm_moe_timing).
+#ifdef KERNEL_moe_smallm_q4_down_combine
+#define SMALLM_DOWN_ROWS 8
+shared float part[MOE_MAX_K * SMALLM_DOWN_ROWS];
+void main() {
+    uint K = arg_u32(9), GS = arg_u32(10), N = arg_u32(11), TOPK = arg_u32(12);
+    uint64_t codes = arg(0), scales_at = arg(1), biases_at = arg(2);
+    U32x4 xv = U32x4(arg(3));
+    U32 indices = U32(arg(4));
+    F32 scores = F32(arg(5));
+    uint sg = simdgroup_index_in_threadgroup, lane = thread_index_in_simdgroup;
+    uint nsg = threads_per_threadgroup.x / 32;
+    uint row = threadgroup_position_in_grid.y;
+    uint row0 = threadgroup_position_in_grid.x * SMALLM_DOWN_ROWS;
+    // The last threadgroup may hold fewer columns.
+    uint nrows = min(uint(SMALLM_DOWN_ROWS), N - row0);
+    uint pairs = K / 32, groups = K / GS, ppg = GS / 32;
+    // A lane past the row's blocks reads the first and adds nothing.
+    bool on = lane < pairs;
+    uint bp = on ? lane : 0;
+    uint grp = bp / ppg;
+    for (uint k = sg; k < TOPK; k += nsg) {
+        uint pair = row * TOPK + k;
+        uint xat = pair * (K / 8) + 4 * bp;
+        uvec4 xa = xv.v[xat], xb = xv.v[xat + 1], xc = xv.v[xat + 2], xd = xv.v[xat + 3];
+        vec4 x0 = bf16x8_lo(xa), x1 = bf16x8_hi(xa), x2 = bf16x8_lo(xb), x3 = bf16x8_hi(xb);
+        vec4 x4 = bf16x8_lo(xc), x5 = bf16x8_hi(xc), x6 = bf16x8_lo(xd), x7 = bf16x8_hi(xd);
+        // The expert's rows from row0 are consecutive. A row number fits 32
+        // bits (the offsets it scales to do not).
+        uint grow = indices.v[pair] * N + row0;
+        U32x4 wrow = U32x4(codes + 16 * (uint64_t(grow) * pairs));
+        BF16 scales = BF16(scales_at + 2 * (uint64_t(grow) * groups)), biases = BF16(biases_at + 2 * (uint64_t(grow) * groups));
+        for (uint r = 0; r < nrows; ++r) {
+            uvec4 w = wrow.v[r * pairs + bp];
+            float s = float(scales.v[r * groups + grp]), b = float(biases.v[r * groups + grp]);
+            precise vec2 d0 = qdot_word_masked(w.x, x0, x1);
+            d0 += qdot_word_masked(w.y, x2, x3);
+            precise float t0 = s * d0.x + b * d0.y;
+            precise vec2 d1 = qdot_word_masked(w.z, x4, x5);
+            d1 += qdot_word_masked(w.w, x6, x7);
+            precise float t1 = s * d1.x + b * d1.y;
+            t0 = on ? t0 : 0.0;
+            t1 = on ? t1 : 0.0;
+            precise float a0 = t0 + subgroupShuffleXor(t0, 16), a1 = t1 + subgroupShuffleXor(t1, 16);
+            precise float p = a0 + a1;
+            float sum = subgroupAdd(lane < 16 ? p : 0.0);
+            if (lane == 0) part[k * SMALLM_DOWN_ROWS + r] = float(bfloat16_t(sum));
+        }
+    }
+    // part[k * SMALLM_DOWN_ROWS + r]: pair k's value for the threadgroup's
+    // column r.
+    barrier();
+    if (sg == 0 && lane < nrows) {
+        uint r = lane;
+        precise float combined = 0.0;
+        for (uint k = 0; k < TOPK; ++k) combined += scores.v[row * TOPK + k] * part[k * SMALLM_DOWN_ROWS + r];
+        precise float gsig = 1.0 / (1.0 + exp(-float(BF16(arg(7)).v[row])));
+        uint64_t at = 2 * (uint64_t(row) * N + row0 + r);
+        precise float v = float(bfloat16_t(combined)) + gsig * float(BF16(arg(6) + at).v[0]);
+        BF16(arg(8) + at).v[0] = bfloat16_t(v);
     }
 }
 #endif

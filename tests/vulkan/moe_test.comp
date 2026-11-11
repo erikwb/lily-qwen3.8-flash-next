@@ -328,3 +328,108 @@ void main() {
     }
 }
 #endif
+
+// subgroup_add_is_a_pairwise_tree: the hardware's subgroup sum of 32 floats,
+// one threadgroup per trial.
+#ifdef KERNEL_moe_subgroup_add_probe
+void main() {
+    uint trial = threadgroup_position_in_grid.x, lane = thread_index_in_simdgroup;
+    precise float s = subgroupAdd(F32(arg(0)).v[trial * 32 + lane]);
+    if (lane == 0) F32(arg(1)).v[trial] = s;
+}
+#endif
+
+// The Metal moe_gather_gemv_q4_gate_up as first ported: the shipped kernel
+// reads a group's scales and biases with its weights.
+#ifdef KERNEL_moe_gather_gemv_q4_gate_up_ref
+void main() {
+    uint K = arg_u32(9), GS = arg_u32(10), N = arg_u32(11);
+    uint row = threadgroup_position_in_grid.x, slot = threadgroup_position_in_grid.y;
+    uint lane = thread_index_in_simdgroup;
+    uint grow = U32(arg(7)).v[slot] * N + row;
+    uint words = K / 8, blocks = words / 4, bpg = GS / 32, groups = K / GS;
+    uint64_t wrow = 4 * (uint64_t(grow) * words), srow = 2 * (uint64_t(grow) * groups);
+    U32x4 gate_wrow = U32x4(arg(0) + wrow);
+    U32x4 up_wrow = U32x4(arg(3) + wrow);
+    BF16 gate_scales = BF16(arg(1) + srow), gate_biases = BF16(arg(2) + srow);
+    BF16 up_scales = BF16(arg(4) + srow), up_biases = BF16(arg(5) + srow);
+    U32x4 xv = U32x4(arg(6));
+    float gate_sum = 0.0;
+    float up_sum = 0.0;
+    for (uint i = lane; i < blocks; i += 32) {
+        uint g = i / bpg;
+        uvec4 gate_w4 = gate_wrow.v[i];
+        uvec4 up_w4 = up_wrow.v[i];
+        float gate_dot = 0.0;
+        float up_dot = 0.0;
+        float x_sum = 0.0;
+        [[unroll]] for (uint j = 0; j < 4; ++j) {
+            uvec4 x8 = xv.v[4 * i + j];
+            vec4 xlo = bf16x8_lo(x8);
+            vec4 xhi = bf16x8_hi(x8);
+            uint gw = gate_w4[j];
+            uint uw = up_w4[j];
+            gate_dot += dot(q4_lo(gw), xlo) + dot(q4_hi(gw), xhi);
+            up_dot += dot(q4_lo(uw), xlo) + dot(q4_hi(uw), xhi);
+            x_sum += dot(xlo, vec4(1.0)) + dot(xhi, vec4(1.0));
+        }
+        gate_sum += float(gate_scales.v[g]) * gate_dot + float(gate_biases.v[g]) * x_sum;
+        up_sum += float(up_scales.v[g]) * up_dot + float(up_biases.v[g]) * x_sum;
+    }
+    gate_sum = subgroupAdd(gate_sum);
+    up_sum = subgroupAdd(up_sum);
+    if (lane == 0) {
+        gate_sum = float(bfloat16_t(gate_sum));
+        up_sum = float(bfloat16_t(up_sum));
+        BF16(arg(8) + 2 * (uint64_t(slot) * N)).v[row] = bfloat16_t((gate_sum / (1.0 + exp(-gate_sum))) * up_sum);
+    }
+}
+#endif
+
+// grid_spawn_timing: a grid's threads load one param and leave.
+#ifdef KERNEL_moe_grid_probe
+void main() {
+    if (arg_u32(1) == 0x12345u) U32(arg(0)).v[0] = 1;
+}
+#endif
+
+// load_latency_probe: chains of loads per subgroup, in the patterns the test
+// names.
+#ifdef KERNEL_moe_load_probe
+void main() {
+    uint mode = arg_u32(2), iters = arg_u32(3), span = arg_u32(4);
+    U32x4 buf = U32x4(arg(0));
+    uint lane = thread_index_in_simdgroup;
+    uint tg = threadgroup_position_in_grid.x * (threads_per_threadgroup.x / 32) + simdgroup_index_in_threadgroup;
+    // Each subgroup walks its own region of `span` 16-byte elements.
+    uint at = tg * span;
+    uvec4 acc = uvec4(0);
+    for (uint it = 0; it < iters; ++it) {
+        uint i = at + ((it * 32) % (span - 256));
+        if (mode == 0) {
+            acc += buf.v[i + lane];
+        } else if (mode == 1) {
+            uvec4 a = buf.v[i + lane], b = buf.v[i + lane + 32], c = buf.v[i + lane + 64], d = buf.v[i + lane + 96];
+            acc += a + b + c + d;
+        } else if (mode == 2) {
+            uvec4 a = buf.v[i + lane];
+            uvec4 b = buf.v[i + lane + 32 + (a.x & 1u)];
+            uvec4 c = buf.v[i + lane + 64 + (b.x & 1u)];
+            uvec4 d = buf.v[i + lane + 96 + (c.x & 1u)];
+            acc += a + b + c + d;
+        } else if (mode == 3) {
+            acc += buf.v[at + (it & 3u)];
+        } else if (mode == 4) {
+            acc += buf.v[at + ((it + lane * 20) % (span - 256))];
+        } else if (mode == 5) {
+            acc += uvec4(i + lane, i ^ lane, i, lane);
+        } else if (mode == 6) {
+            uvec4 a = buf.v[at + (it & 3u)], b = buf.v[at + 4 + (it & 3u)], c = buf.v[at + 8 + (it & 3u)], d = buf.v[at + 12 + (it & 3u)];
+            acc += a + b + c + d;
+        } else {
+            [[unroll]] for (uint k = 0; k < 8; ++k) acc += buf.v[i + lane + 32 * k];
+        }
+    }
+    if (lane == 0) U32x4(arg(1)).v[tg] = acc;
+}
+#endif

@@ -244,6 +244,10 @@ pub fn moe_smallm_gate_up(
         (false, false) => ("moe_smallm_q4_gate_up_r8", 2),
         (false, true) => ("moe_smallm_q4_gate_up_r8_w", 8),
     };
+    // On Vulkan the K > 512 tiers are one kernel that walks two rows per
+    // threadgroup of one simdgroup (moe.comp says why).
+    let (r4, threads) =
+        if cfg!(target_os = "linux") && k_in > 512 { (1, 32) } else { (r4, 64) };
     let (k_in, m, s) = check_smallm(gate, n_per_expert, indices, top_k, r4)?;
     ensure!(
         x.numel() == m * k_in && x.dtype() == DType::BF16,
@@ -276,10 +280,14 @@ pub fn moe_smallm_gate_up(
         ],
         Grid::Threadgroups {
             groups: (n_per_expert / (2 * r4), s, 1),
-            threadgroup: (64, 1, 1),
+            threadgroup: (threads, 1, 1),
         },
     )
 }
+
+/// Output columns a threadgroup of the Vulkan small-m down kernel walks
+/// (`SMALLM_DOWN_ROWS` in moe.comp).
+const VULKAN_SMALLM_DOWN_ROWS: usize = 8;
 
 /// Fused small-batch down + combine + shared-expert add:
 /// `out[row, :] = bf16(sum_k scores[row, k] * bf16(down_e . x[row, k])) +
@@ -303,12 +311,21 @@ pub fn moe_smallm_down_combine(
     out: &Tensor,
     top_k: usize,
 ) -> Result<()> {
+    // On Vulkan the kernel of Metal's name takes 512 < K <= 1024 on a grid
+    // of its own: `VULKAN_SMALLM_DOWN_ROWS` columns per threadgroup, one
+    // simdgroup per pair of the row. Metal's kernel is `_l` there, for the K
+    // past it.
+    let vulkan_rows =
+        cfg!(target_os = "linux") && (513..=1024).contains(&w.in_features());
     let (name, r4) = if w.in_features() <= 512 {
         ("moe_smallm_q4_down_combine_w", 8)
+    } else if cfg!(target_os = "linux") && !vulkan_rows {
+        ("moe_smallm_q4_down_combine_l", 4)
     } else {
         ("moe_smallm_q4_down_combine", 4)
     };
-    let (k_in, m, s) = check_smallm(w, h, indices, top_k, r4)?;
+    let (k_in, m, s) =
+        check_smallm(w, h, indices, top_k, if vulkan_rows { 1 } else { r4 })?;
     ensure!(
         x.numel() == s * k_in && x.dtype() == DType::BF16,
         "x must be BF16 [{s}, {k_in}]"
@@ -342,9 +359,16 @@ pub fn moe_smallm_down_combine(
             out.binding(),
         ],
         &[&u32_bytes(k_in), &u32_bytes(w.group_size), &u32_bytes(h), &u32_bytes(top_k)],
-        Grid::Threadgroups {
-            groups: (h / (2 * r4), m, 1),
-            threadgroup: (64 * MOE_SMALLM_DOWN_PSG, 1, 1),
+        if vulkan_rows {
+            Grid::Threadgroups {
+                groups: (h.div_ceil(VULKAN_SMALLM_DOWN_ROWS), m, 1),
+                threadgroup: (32 * top_k, 1, 1),
+            }
+        } else {
+            Grid::Threadgroups {
+                groups: (h / (2 * r4), m, 1),
+                threadgroup: (64 * MOE_SMALLM_DOWN_PSG, 1, 1),
+            }
         },
     )
 }
@@ -361,17 +385,15 @@ pub fn moe_gather_gemv_down_combine(
     shared: Option<(&Tensor, &Tensor)>,
     out: &Tensor,
 ) -> Result<()> {
+    // On Vulkan the kernel of Metal's name takes K <= 1024 (moe.comp says
+    // why); Metal's kernel is `_sg4` there, for the K past it.
+    let name = if cfg!(target_os = "linux") && w.in_features() > 1024 {
+        "moe_gather_gemv_q4_down_combine_sg4"
+    } else {
+        "moe_gather_gemv_q4_down_combine"
+    };
     moe_gather_gemv_down_combine_named(
-        ctx,
-        pass,
-        "moe_gather_gemv_q4_down_combine",
-        w,
-        h,
-        x,
-        indices,
-        scores,
-        shared,
-        out,
+        ctx, pass, name, w, h, x, indices, scores, shared, out,
     )
 }
 
@@ -409,6 +431,15 @@ pub fn moe_gather_gemv_down_combine_named(
         "in {k_in} / group size {} not block-packable",
         w.group_size
     );
+    let vulkan_rows =
+        cfg!(target_os = "linux") && name == "moe_gather_gemv_q4_down_combine";
+    if vulkan_rows {
+        ensure!(
+            k_in <= 1024 && slots <= MAX_K,
+            "the Vulkan down gather takes K <= 1024 and at most {MAX_K} slots \
+             (got K={k_in}, {slots} slots)"
+        );
+    }
     if let Some((shared_out, gate)) = shared {
         ensure!(
             shared_out.numel() == h && shared_out.dtype() == DType::BF16,
@@ -444,13 +475,24 @@ pub fn moe_gather_gemv_down_combine_named(
             &u32_bytes(slots),
             &u32_bytes(shared.is_some() as usize),
         ],
-        down_combine_grid(name, h),
+        if vulkan_rows {
+            Grid::Threadgroups {
+                groups: (h.div_ceil(VULKAN_DOWN_ROWS), 1, 1),
+                threadgroup: (32 * slots.max(1), 1, 1),
+            }
+        } else {
+            down_combine_grid(name, h)
+        },
     )
 }
 
+/// Output rows a threadgroup of the Vulkan down gather walks (`DOWN_ROWS` in
+/// moe.comp), one simdgroup per routed slot.
+const VULKAN_DOWN_ROWS: usize = 16;
+
 /// The down gather's dispatch shape by kernel name: two rows per
-/// threadgroup, four simdgroups on them for the shipped kernel and one for
-/// the `_sg1` reference form.
+/// threadgroup, four simdgroups on them for the shipped kernel (`_sg4` on
+/// Vulkan) and one for the `_sg1` reference form.
 fn down_combine_grid(name: &str, h: usize) -> Grid {
     let sgs = if name.ends_with("_sg1") { 1 } else { 4 };
     Grid::Threadgroups { groups: (h / 2, 1, 1), threadgroup: (32 * sgs, 1, 1) }
