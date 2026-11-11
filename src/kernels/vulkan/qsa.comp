@@ -171,10 +171,10 @@ void main() {
 // --- Block scoring and selection --------------------------------------------------
 
 #ifdef KERNEL_qsa_scores_f32
-// The query's heads staged by float4 (Metal: by float; NH * D <= 512), so a
-// block's eight dims of a head are two loads, and a block's key row
-// requested QSA_SCORE_KB loads (32 dims) ahead of its dots, which wait on
-// every load they follow.
+// The query's heads are staged by float4 (Metal: by float; NH * D <= 512),
+// so a block's eight dims of a head are two loads, and a block's key row is
+// requested QSA_SCORE_KB loads (32 dims) at a time ahead of their dots
+// (Metal: a load, then its dots): a dot waits for the load before it.
 #define QSA_SCORE_KB 4
 shared vec4 qs[4 * 128 / 4];
 void main() {
@@ -293,8 +293,8 @@ uint qsa_scan(uint value, out uint total) {
 #undef QSA_SELECT_BODY
 // The largest register cache, which also takes the rows of more than one
 // chunk (past 32K tokens at ratio 4). The Metal kernel has an instance of
-// 32 blocks per thread above it; here that many live registers are more
-// than some instructions' operands can name, and the pipeline is refused.
+// 32 blocks per thread above it; here one measured slower than two chunks
+// of this one (25 against 18 us at 64K tokens).
 #define QSA_CACHE 16
 #define QSA_SELECT_CHUNKS
 #define QSA_EACH_KEY(M) QSA_KEYS_16(M, 0)
@@ -602,13 +602,36 @@ void main() {
 //
 // A subgroup's sixteen rows (four queries' four heads) against the
 // threadgroup's QSA_SCORE_BN blocks in eight 16-block products (Metal: four
-// of 32 blocks), walking K as gemm.comp does. A score row (query, head)
-// sits in the lanes whose bit 1 is the head's bit 1 and in the element half
-// (e >> 2) that is its bit 0, so the head sum is one in-lane add and one
-// shuffle (Metal: two shuffles), in the same order.
+// of 32 blocks). The rows' eight K chunks are loaded once and held; each
+// 16-block group then walks K into one accumulator. A score row (query,
+// head) sits in the lanes whose bit 1 is the head's bit 1 and in the
+// element half (e >> 2) that is its bit 0, so the head sum is one in-lane
+// add and one shuffle (Metal: two shuffles), in the same order.
 #ifdef KERNEL_qsa_scores_nax
 #define QSA_SCORE_BN 128
 shared bfloat16_t mat_stage[MAT_STAGE_ELEMENTS(4)];
+// The rows' K chunk k (a ragged last group of queries is staged).
+#define QSA_SCORE_ROWS(k, a)                                                                 \
+    MatA a;                                                                                  \
+    if (rows < 16) {                                                                         \
+        MAT_STAGE(a_rows + 2 * 16 * (k), D, rows, 16u)                                       \
+        MAT_LOAD_STAGED_A(a);                                                                \
+    } else {                                                                                 \
+        MAT_LOAD_A(a, BF16(a_rows).v, 16 * (k), D);                                          \
+    }
+// The blocks' K chunk k (a ragged last group of blocks is staged) and its
+// product.
+#define QSA_SCORE_K(k, a)                                                                    \
+    {                                                                                        \
+        MatB mb;                                                                             \
+        if (cols < 16) {                                                                     \
+            MAT_STAGE(b_rows + 2 * 16 * (k), D, cols, 16u)                                   \
+            MAT_LOAD_STAGED_B(mb);                                                           \
+        } else {                                                                             \
+            MAT_LOAD_B(mb, BF16(b_rows).v, 16 * (k), D);                                     \
+        }                                                                                    \
+        acc = coopMatMulAdd(a, mb, acc);                                                     \
+    }
 void main() {
     const uint D = 128;
     uint64_t q = arg(0), blk = arg(1), scores = arg(2);
@@ -621,32 +644,8 @@ void main() {
     uint rows = min(16u, (QB - q0) * 4);
     uint64_t a_rows = q + 2 * uint64_t(q0) * 4 * D;
     uint cb0 = threadgroup_position_in_grid.x * QSA_SCORE_BN;
-
-    MatC acc[QSA_SCORE_BN / 16];
-    for (uint n = 0; n < QSA_SCORE_BN / 16; ++n) acc[n] = MatC(0.0);
-    for (uint k0 = 0; k0 < D; k0 += 16) {
-        MatA ma;
-        if (rows < 16) {
-            MAT_STAGE(a_rows + 2 * k0, D, rows, 16u)
-            MAT_LOAD_STAGED_A(ma);
-        } else {
-            MAT_LOAD_A(ma, BF16(a_rows).v, k0, D);
-        }
-        for (uint n = 0; n < QSA_SCORE_BN / 16; ++n) {
-            uint cb = cb0 + 16 * n;
-            if (cb >= nb_max) break;
-            uint cols = min(16u, nb_max - cb);
-            uint64_t b_rows = blk + 2 * uint64_t(cb) * D;
-            MatB mb;
-            if (cols < 16) {
-                MAT_STAGE(b_rows + 2 * k0, D, cols, 16u)
-                MAT_LOAD_STAGED_B(mb);
-            } else {
-                MAT_LOAD_B(mb, BF16(b_rows).v, k0, D);
-            }
-            acc[n] = coopMatMulAdd(ma, mb, acc[n]);
-        }
-    }
+    QSA_SCORE_ROWS(0, a0) QSA_SCORE_ROWS(1, a1) QSA_SCORE_ROWS(2, a2) QSA_SCORE_ROWS(3, a3)
+    QSA_SCORE_ROWS(4, a4) QSA_SCORE_ROWS(5, a5) QSA_SCORE_ROWS(6, a6) QSA_SCORE_ROWS(7, a7)
 
     uint qi = q0 + ((lane >> 2) & 1) + ((lane >> 3) & 2);
     bool writer = (lane & 2) == 0 && qi < QB;
@@ -655,8 +654,13 @@ void main() {
     for (uint n = 0; n < QSA_SCORE_BN / 16; ++n) {
         uint cb = cb0 + 16 * n;
         if (cb >= nb_max) break;
-        vec4 v = max(vec4(acc[n][0], acc[n][1], acc[n][2], acc[n][3]), 0.0) +
-                 max(vec4(acc[n][4], acc[n][5], acc[n][6], acc[n][7]), 0.0);
+        uint cols = min(16u, nb_max - cb);
+        uint64_t b_rows = blk + 2 * uint64_t(cb) * D;
+        MatC acc = MatC(0.0);
+        QSA_SCORE_K(0, a0) QSA_SCORE_K(1, a1) QSA_SCORE_K(2, a2) QSA_SCORE_K(3, a3)
+        QSA_SCORE_K(4, a4) QSA_SCORE_K(5, a5) QSA_SCORE_K(6, a6) QSA_SCORE_K(7, a7)
+        vec4 v = max(vec4(acc[0], acc[1], acc[2], acc[3]), 0.0) +
+                 max(vec4(acc[4], acc[5], acc[6], acc[7]), 0.0);
         v += subgroupShuffleXor(v, 2);
         if (writer) {
             for (uint e = 0; e < 4; ++e) {
@@ -735,6 +739,41 @@ bf16vec4 qsa_k4(uvec4 halves, uint odd) {
 }
 #endif
 
+// The V rows of output chunk c (the lane's two keys of each block, four
+// dims each) and their two products into the chunk's accumulator; a q8
+// group's two chunks share their rows' scales.
+#ifdef KERNEL_qsa_attn_gqa_nax_q8
+#define QSA_PV_SCALES(c2)                                                                    \
+    uvec4 sc_at = tok * (QSA_TILE_D / 32) + sg * 4 + (c2);                                   \
+    vec4 sc = vec4(vs_head.v[sc_at.x], vs_head.v[sc_at.y], vs_head.v[sc_at.z], vs_head.v[sc_at.w]);
+#define QSA_V4(i, comp) qsa_v4(v_head.v[i], sc.comp)
+#else
+#define QSA_PV_SCALES(c2)
+#define QSA_V4(i, comp) qsa_bf16_of_words(v_head.v[i])
+#endif
+#define QSA_PV(c, m)                                                                         \
+    {                                                                                        \
+        uvec4 at = tok * 64 + v_at + 4 * (c);                                                \
+        MatB v0m, v1m;                                                                       \
+        QSA_MAT_FILL(v0m, QSA_V4(at.x, x), QSA_V4(at.y, y))                                  \
+        QSA_MAT_FILL(v1m, QSA_V4(at.z, z), QSA_V4(at.w, w))                                  \
+        m = coopMatMulAdd(p0m, v0m, m);                                                      \
+        m = coopMatMulAdd(p1m, v1m, m);                                                      \
+    }
+#define QSA_PV2(c2, ma, mb)                                                                  \
+    {                                                                                        \
+        QSA_PV_SCALES(c2)                                                                    \
+        QSA_PV(2 * (c2), ma)                                                                 \
+        QSA_PV(2 * (c2) + 1, mb)                                                             \
+    }
+// An accumulator's two heads rescaled by their alphas, and stored.
+#define QSA_RESCALE(m)                                                                       \
+    m[0] *= alpha.x; m[1] *= alpha.x; m[2] *= alpha.x; m[3] *= alpha.x;                      \
+    m[4] *= alpha.y; m[5] *= alpha.y; m[6] *= alpha.y; m[7] *= alpha.y;
+#define QSA_STORE(c, m)                                                                      \
+    if (row < group) out4.v[row * 64 + v_at + 4 * (c)] = qsa_bf16_words(vec4(m[0], m[1], m[2], m[3]) * inv.x); \
+    if (row + 1 < group) out4.v[(row + 1) * 64 + v_at + 4 * (c)] = qsa_bf16_words(vec4(m[4], m[5], m[6], m[7]) * inv.y);
+
 void main() {
     uint64_t q = arg(0);
     QSA_K_ROWS k_head;
@@ -797,32 +836,28 @@ void main() {
     }
     barrier();
 
-    MatC o[8];
-    for (uint c = 0; c < 8; ++c) o[c] = MatC(0.0);
+    // The eight output chunks' accumulators, named: an array of them
+    // indexed by a loop's chunk lives in the lane's stack memory.
+    MatC o0 = MatC(0.0), o1 = MatC(0.0), o2 = MatC(0.0), o3 = MatC(0.0);
+    MatC o4 = MatC(0.0), o5 = MatC(0.0), o6 = MatC(0.0), o7 = MatC(0.0);
     vec2 m_run = vec2(-INFINITY);
     precise vec2 l_run = vec2(0.0);
 
     // The cache rows of this lane's keys: keys row and row + 1 of the
     // step's two blocks; keys past the list read the query's own row, which
-    // is finite.
+    // is finite. (Metal computes them a step ahead; here the four more
+    // registers that takes cost more than the wait they save.)
     uvec4 key_at = uvec4(row, row + 1, 16 + row, 17 + row);
-#define QSA_TOKENS(tk, k0)                                                                   \
-    {                                                                                        \
-        uvec4 j = (k0) + key_at;                                                             \
-        uvec4 block = j / ratio;                                                             \
-        bvec4 listed = lessThan(j, uvec4(in_blocks));                                        \
-        uvec4 at = mix(uvec4(0), block, listed);                                             \
-        uvec4 id = uvec4(sel_row.v[at.x], sel_row.v[at.y], sel_row.v[at.z], sel_row.v[at.w]); \
-        uvec4 tail = mix(uvec4(pos), tail_start + (j - in_blocks), lessThan(j, uvec4(total))); \
-        tk = mix(tail, id * ratio + (j - block * ratio), listed);                            \
-    }
 
     uint parity = 0;
-    uvec4 tok, next;
-    QSA_TOKENS(next, 0)
     for (uint k0 = 0; k0 < total; k0 += QSA_GQA_BK) {
-        tok = next;
-        QSA_TOKENS(next, k0 + QSA_GQA_BK)
+        uvec4 key = k0 + key_at;
+        uvec4 key_block = key / ratio;
+        bvec4 listed = lessThan(key, uvec4(in_blocks));
+        uvec4 id_at = mix(uvec4(0), key_block, listed);
+        uvec4 id = uvec4(sel_row.v[id_at.x], sel_row.v[id_at.y], sel_row.v[id_at.z], sel_row.v[id_at.w]);
+        uvec4 tail = mix(uvec4(pos), tail_start + (key - in_blocks), lessThan(key, uvec4(total)));
+        uvec4 tok = mix(tail, id * ratio + (key - key_block * ratio), listed);
         MatC s0 = MatC(0.0), s1 = MatC(0.0);
         // Scores over the head-dim chunks, two per 32-dim q8 group.
         for (uint c2 = 0; c2 < 4; ++c2) {
@@ -865,10 +900,10 @@ void main() {
         vec2 mx = m_run;
         uint theirs = parity * 2 * (QSA_GQA_BK * 8) + left_col * 8 + (row >> 1);
         for (uint i = 0; i < 8; ++i) {
-            uint key = 16 * (i >> 2) + left_col + 2 * (i & 3);
+            uint col = 16 * (i >> 2) + left_col + 2 * (i & 3);
             uint at = theirs + (16 * (i >> 2) + 2 * (i & 3)) * 8;
             precise vec2 v = (xs[at] + xs[at + QSA_GQA_BK * 8]) * scale;
-            s[i] = k0 + key < total ? v : vec2(-INFINITY);
+            s[i] = k0 + col < total ? v : vec2(-INFINITY);
             mx = max(mx, s[i]);
         }
         mx = max(mx, subgroupShuffleXor(mx, 1));
@@ -888,37 +923,18 @@ void main() {
         QSA_MAT_FILL(p0m, qsa_bf16(vec4(p[0].x, p[1].x, p[2].x, p[3].x)), qsa_bf16(vec4(p[0].y, p[1].y, p[2].y, p[3].y)))
         QSA_MAT_FILL(p1m, qsa_bf16(vec4(p[4].x, p[5].x, p[6].x, p[7].x)), qsa_bf16(vec4(p[4].y, p[5].y, p[6].y, p[7].y)))
         if (alpha.x != 1.0 || alpha.y != 1.0) {
-            for (uint c = 0; c < 8; ++c) {
-                o[c][0] *= alpha.x; o[c][1] *= alpha.x; o[c][2] *= alpha.x; o[c][3] *= alpha.x;
-                o[c][4] *= alpha.y; o[c][5] *= alpha.y; o[c][6] *= alpha.y; o[c][7] *= alpha.y;
-            }
+            QSA_RESCALE(o0) QSA_RESCALE(o1) QSA_RESCALE(o2) QSA_RESCALE(o3)
+            QSA_RESCALE(o4) QSA_RESCALE(o5) QSA_RESCALE(o6) QSA_RESCALE(o7)
         }
         // Each V chunk is loaded right before its products.
-        for (uint c2 = 0; c2 < 4; ++c2) {
-#ifdef KERNEL_qsa_attn_gqa_nax_q8
-            uvec4 sc_at = tok * (QSA_TILE_D / 32) + sg * 4 + c2;
-            vec4 sc = vec4(vs_head.v[sc_at.x], vs_head.v[sc_at.y], vs_head.v[sc_at.z], vs_head.v[sc_at.w]);
-#endif
-            for (uint c = 2 * c2; c < 2 * c2 + 2; ++c) {
-                uvec4 at = tok * 64 + v_at + 4 * c;
-                MatB v0m, v1m;
-#ifdef KERNEL_qsa_attn_gqa_nax_q8
-                QSA_MAT_FILL(v0m, qsa_v4(v_head.v[at.x], sc.x), qsa_v4(v_head.v[at.y], sc.y))
-                QSA_MAT_FILL(v1m, qsa_v4(v_head.v[at.z], sc.z), qsa_v4(v_head.v[at.w], sc.w))
-#else
-                QSA_MAT_FILL(v0m, qsa_bf16_of_words(v_head.v[at.x]), qsa_bf16_of_words(v_head.v[at.y]))
-                QSA_MAT_FILL(v1m, qsa_bf16_of_words(v_head.v[at.z]), qsa_bf16_of_words(v_head.v[at.w]))
-#endif
-                o[c] = coopMatMulAdd(p0m, v0m, o[c]);
-                o[c] = coopMatMulAdd(p1m, v1m, o[c]);
-            }
-        }
+        QSA_PV2(0, o0, o1)
+        QSA_PV2(1, o2, o3)
+        QSA_PV2(2, o4, o5)
+        QSA_PV2(3, o6, o7)
         parity ^= 1u;
     }
     vec2 inv = 1.0 / l_run;
-    for (uint c = 0; c < 8; ++c) {
-        if (row < group) out4.v[row * 64 + v_at + 4 * c] = qsa_bf16_words(vec4(o[c][0], o[c][1], o[c][2], o[c][3]) * inv.x);
-        if (row + 1 < group) out4.v[(row + 1) * 64 + v_at + 4 * c] = qsa_bf16_words(vec4(o[c][4], o[c][5], o[c][6], o[c][7]) * inv.y);
-    }
+    QSA_STORE(0, o0) QSA_STORE(1, o1) QSA_STORE(2, o2) QSA_STORE(3, o3)
+    QSA_STORE(4, o4) QSA_STORE(5, o5) QSA_STORE(6, o6) QSA_STORE(7, o7)
 }
 #endif

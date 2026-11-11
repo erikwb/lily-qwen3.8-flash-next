@@ -9,7 +9,10 @@
 // A thread's keys are a register array and every walk over them is written
 // out per key: an index that is not a constant would turn the array into a
 // branch per element. A key past the row's end is QSA_NO_KEY, which no walk
-// counts or takes, so the walks do not test the block index.
+// counts or takes, so the walks do not test the block index. A row of more
+// than one chunk is walked chunk by chunk with the keys re-read into the
+// same registers (Metal: the first chunk's stay, the later ones are read
+// where they are used), so a walk is the same code for every chunk.
 #ifndef QSA_LOAD_QUAD
 // Four keys by one load where the row holds all four.
 #define QSA_LOAD_QUAD(q)                                                                     \
