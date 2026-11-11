@@ -159,9 +159,8 @@ Things this driver and compiler do that a plain translation trips over:
 
 ## What is fast on this compiler and GPU
 
-Measured while tuning the kernels (2026-11-10 and 11, M5 Max); the Mesa
-branch `ewb/lily-mesa` removes some of these costs, the daily Mesa has
-all of them.
+Measured while tuning the kernels (2026-11-10 and 11, M5 Max); some of
+these costs are the driver's and go away as it improves.
 
 - **Loads are the unit of cost.** A load from cache costs about what five
   or six adds do, and about thirteen when its address depends on the load
@@ -196,8 +195,9 @@ all of them.
 - **A load waits for every line its lanes touch**: do not point idle lanes
   at other lines to read ahead. Work that follows a streaming pass from
   cache is not hidden under it either.
-- **Dispatches with no barrier between them run side by side** on the
-  combined Mesa (`ewb/lily-mesa`; one after another on the daily Mesa).
+- **Dispatches with no barrier between them run side by side** on a
+  Honeykrisp that leaves out the ordering barrier between application
+  dispatches (one after another before that).
   Independent same-level work is cheapest as separate dispatches when the
   weights are small (the router level: 13.4 us as three against 14.6
   fused) and fused when they are large (the attention level: 71.7 fused
@@ -220,31 +220,41 @@ itself stays in the `.metal` file, which the `.comp` header names.
 
 ## Build and test
 
-The tree is on the build host; it builds and runs on the Mac.
+On a Linux machine with a Vulkan 1.3 driver that has `VK_KHR_cooperative_matrix`
+and `VK_KHR_shader_bfloat16` (Honeykrisp on an M5), with `glslc` on the path
+(`build.rs` compiles every kernel of `src/kernels/vulkan/*.comp` and
+`tests/vulkan/*.comp` to SPIR-V):
 
-    ~/aurora-m5/lily-check.sh <file>.comp          # compile every kernel of a file here (glslc), fast
-    ~/aurora-m5/lily-test.sh kernels::<module>     # the module's unit tests on the Mac's GPU
+    cargo build --release
+    cargo test --release --lib kernels::<module> -- --test-threads=1
 
-Both take `LILY_OVERLAY=<dir>` and `LILY_NAME=<name>`: a directory whose
-`src/kernels/vulkan/` and `tests/vulkan/` files are laid over the main tree
-(`~/aurora-m5/lily`), for work on a kernel file apart from the tree.
+Run one GPU user at a time: timings are worthless otherwise, and two model
+loads at once exhaust memory. A kernel's unit tests are
+`tests/unit/kernels/<module>.rs`, each against the f32 CPU reference in
+`tests/support/cpu_ref.rs`; tests marked
+`#[ignore = "requires LILY_MODEL_DIR_FLASH"]` need a checkpoint, and the
+ignored `*_timing` and `*_probe` tests print timings (`--ignored
+--nocapture`). A kernel without a shader fails with "has no Vulkan shader".
 
-`lily-test.sh` copies the tree (and the overlay) to the Mac's
-`~/ai/lily-<name>`, builds, and
-runs `cargo test --release --lib <filter> -- --test-threads=1` under the GPU
-lock (one GPU user at a time, across everyone), printing the failures and the
-summary; the whole output stays in the Mac's `/tmp/lily-test-<name>.log`
-(read it with `ssh -i ~/.ssh/id_agent ewb@192.168.1.110 'tail -100 /tmp/lily-test-<name>.log'`).
-A kernel's unit tests are `tests/unit/kernels/<module>.rs`, each against the
-f32 CPU reference in `tests/support/cpu_ref.rs`; tests marked
-`#[ignore = "requires LILY_MODEL_DIR_FLASH"]` need a checkpoint and are not
-run. A kernel without a shader fails with "has no Vulkan shader".
+To compile the kernels of one file without the crate, run `glslc` once per
+`KERNEL_<name>` the file defines, as `build.rs` does.
 
-`LILY_VK_SHADER_DIR=<dir>` makes the backend load `<dir>/<kernel>.spv` in
-place of the built-in shader, for trying a variant without a rebuild.
+Environment:
+
+- `LILY_VK_SHADER_DIR=<dir>` makes the backend load `<dir>/<kernel>.spv` in
+  place of the built-in shader, for trying a variant without a rebuild.
+- `MESA_SHADER_CACHE_DIR=<fresh dir>` (or `MESA_SHADER_CACHE_DISABLE=true`)
+  when the driver or a shader changed: the driver's disk cache has served
+  stale shaders.
+- `LILY_PROFILE=1` prints each pass's GPU time; `lily-bench
+  --kernel-profile` the per-kernel table (each dispatch alone, so it
+  overstates small dispatches that normally overlap).
+- `LILY_VK_TRACE=<file>` writes a timeline of passes.
+- `LILY_VK_BATCH`, `LILY_VK_WINDOW`: dispatches per command buffer and
+  command buffers in flight. `LILY_VK_CLOCK=0` turns the CPU clock hold off.
+- `LILY_FUSE_LEVELS=1` sends shared-input projections fused, for a driver
+  whose dispatches do not overlap.
 
 A GPU fault or a job over its time shows as "Vulkan command buffer failed"
-(or the test hangs until its timeout): do not loop on it. Never reboot the
-Mac, never kill processes there that are not yours, and never use
-`pkill -f`/`pgrep -f` over ssh with a pattern that matches your own command
-line.
+(or the test hangs until its timeout): do not loop on it; the kernel log
+says what happened.
