@@ -557,7 +557,7 @@ pub fn sdpa_prefill<'t>(
     sdpa_prefill_with(
         ctx,
         pass,
-        SDPA_PREFILL_KERNEL,
+        sdpa_prefill_kernel(ctx),
         q,
         k_cache,
         v_cache,
@@ -625,6 +625,36 @@ pub(crate) fn sdpa_prefill_with(
 }
 
 const SDPA_PREFILL_KERNEL: &str = "sdpa_prefill_nax_qdev128";
+/// The same tile with the scores in registers (attention_cm2.comp), on
+/// VK_NV_cooperative_matrix2's conversions, reductions and per-element
+/// operations; same arguments and geometry.
+#[cfg(target_os = "linux")]
+const SDPA_PREFILL_CM2_KERNEL: &str = "sdpa_prefill_cm2";
+
+/// The kernel [`sdpa_prefill`] dispatches: the hand-built
+/// [`SDPA_PREFILL_KERNEL`], or with `LILY_VK_PREFILL_CM2=1`
+/// [`SDPA_PREFILL_CM2_KERNEL`] where the device has the operations it needs
+/// (and the build compiled it). The latter is 1 to 4% faster per dispatch
+/// but no faster end to end (lily-bench, 4096-token prompt: 1993 tok/s
+/// either way, 2026-11-11), and its rounding changes the output, so it is
+/// off by default.
+pub(crate) fn sdpa_prefill_kernel(ctx: &MetalContext) -> &'static str {
+    #[cfg(target_os = "linux")]
+    {
+        static ALLOWED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let allowed = *ALLOWED
+            .get_or_init(|| std::env::var("LILY_VK_PREFILL_CM2").is_ok_and(|v| v == "1"));
+        if allowed
+            && ctx.cooperative_matrix_register_ops()
+            && ctx.has_kernel(SDPA_PREFILL_CM2_KERNEL)
+        {
+            return SDPA_PREFILL_CM2_KERNEL;
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = ctx;
+    SDPA_PREFILL_KERNEL
+}
 const SDPA_PREFILL_BQ: usize = 16;
 const SDPA_PREFILL_THREADS: usize = 128;
 

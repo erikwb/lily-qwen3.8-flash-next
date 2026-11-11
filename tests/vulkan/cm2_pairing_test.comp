@@ -1,0 +1,29 @@
+#version 460
+// A product of matrices of flexible dimensions whose K is 64, with the A
+// operand converted from an accumulator and the B operand read by a tensor
+// load: the driver may pair K 64 deep in the tensor load only when the
+// converted operand holds K the same way, so the result must be the
+// product's, exactly (small integers).
+#include "common.glsl"
+#include "matmul.glsl"
+#extension GL_NV_cooperative_matrix2 : require
+
+#ifdef KERNEL_cm2_convert_pairing_test
+#define MatC16x64 coopmat<float, gl_ScopeSubgroup, 16, 64, gl_MatrixUseAccumulator>
+#define MatA16x64 coopmat<bfloat16_t, gl_ScopeSubgroup, 16, 64, gl_MatrixUseA>
+#define MatB64x16 coopmat<bfloat16_t, gl_ScopeSubgroup, 64, 16, gl_MatrixUseB>
+#define CLAMP_ZERO gl_CooperativeMatrixClampModeConstantNV
+void main() {
+    tensorLayoutNV<2, CLAMP_ZERO> tx = createTensorLayoutNV(2, CLAMP_ZERO);
+    tx = setTensorLayoutDimensionNV(tx, 16, 64);
+    tensorLayoutNV<2, CLAMP_ZERO> ty = createTensorLayoutNV(2, CLAMP_ZERO);
+    ty = setTensorLayoutDimensionNV(ty, 64, 16);
+    MatC16x64 x;
+    coopMatLoadTensorNV(x, F32(arg(0)).v, 0, tx);
+    MatA16x64 a = MatA16x64(x);
+    MatB64x16 y;
+    coopMatLoadTensorNV(y, BF16(arg(1)).v, 0, ty);
+    MatC c = coopMatMulAdd(a, y, MatC(0.0));
+    coopMatStore(c, F32(arg(2)).v, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+}
+#endif

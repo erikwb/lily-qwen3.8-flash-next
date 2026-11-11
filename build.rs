@@ -135,6 +135,11 @@ fn vulkan_kernels(root: &Path, out: &Path) {
     let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
     let next = std::sync::atomic::AtomicUsize::new(0);
     let failures = std::sync::Mutex::new(Vec::new());
+    // Kernels of a file that requires an extension lily can run without
+    // (OPTIONAL_EXTENSIONS) are left out when glslc cannot compile them;
+    // their callers dispatch them only where the device has the extension
+    // and the kernel was built.
+    let skipped = std::sync::Mutex::new(Vec::new());
     std::thread::scope(|scope| {
         for _ in 0..workers {
             scope.spawn(|| {
@@ -155,6 +160,10 @@ fn vulkan_kernels(root: &Path, out: &Path) {
                         Ok(output) => String::from_utf8_lossy(&output.stderr).into_owned(),
                         Err(e) => format!("running {glslc}: {e}"),
                     };
+                    if requires_optional_extension(path) {
+                        skipped.lock().expect("skipped").push((name.clone(), failure));
+                        continue;
+                    }
                     failures
                         .lock()
                         .expect("failures")
@@ -167,6 +176,12 @@ fn vulkan_kernels(root: &Path, out: &Path) {
     if !failures.is_empty() {
         panic!("{} Vulkan kernels failed to compile:\n{}", failures.len(), failures.join("\n"));
     }
+    let skipped = skipped.into_inner().expect("skipped");
+    for (name, failure) in &skipped {
+        let first = failure.lines().next().unwrap_or("");
+        println!("cargo:warning=Vulkan kernel {name} left out (needs an extension glslc lacks): {first}");
+    }
+    kernels.retain(|(name, _)| !skipped.iter().any(|(s, _)| s == name));
     let mut table = String::from(
         "/// Every Vulkan kernel: its name (the Metal kernel function's) and SPIR-V.\n\
          static KERNELS: &[(&str, &[u8])] = &[\n",
@@ -182,6 +197,21 @@ fn vulkan_kernels(root: &Path, out: &Path) {
     table.push_str("];\n");
     std::fs::write(out.join("vulkan_kernels.rs"), table)
         .expect("writing vulkan_kernels.rs");
+}
+
+/// Shader extensions lily runs without: a kernel file that requires one is
+/// built only where glslc has it.
+const OPTIONAL_EXTENSIONS: &[&str] = &["GL_NV_cooperative_matrix2"];
+
+/// Whether the kernel file `path` requires one of [`OPTIONAL_EXTENSIONS`].
+fn requires_optional_extension(path: &Path) -> bool {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    text.lines().any(|line| {
+        let line = line.trim_start();
+        line.starts_with("#extension")
+            && line.contains(": require")
+            && OPTIONAL_EXTENSIONS.iter().any(|ext| line.contains(ext))
+    })
 }
 
 /// Every regular file below `dir`, directories descended into (rerun on each,

@@ -1,0 +1,73 @@
+#version 460
+// The cooperative-matrix operations of GL_NV_cooperative_matrix2 that work on
+// a matrix in registers (reductions, per-element functions, conversions of
+// an accumulator into an operand), each checked exactly on one 16x16 block.
+#include "common.glsl"
+#include "matmul.glsl"
+#extension GL_NV_cooperative_matrix2 : require
+
+#ifdef KERNEL_cm2_ops_test
+#define Mat8 coopmat<float, gl_ScopeSubgroup, 8, 8, gl_MatrixUseAccumulator>
+#define MatAh coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+#define MatBh coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
+
+float add(const in float a, const in float b) { return a + b; }
+float maxf(const in float a, const in float b) { return max(a, b); }
+float tag(const in uint row, const in uint col, const in float x) {
+    return x + float(row * 100u + col);
+}
+float scaled(const in uint row, const in uint col, const in float x, const in float y,
+             const in float s) {
+    return x * s + y;
+}
+bfloat16_t identity_bf(const in uint row, const in uint col, const in bfloat16_t x) {
+    return bfloat16_t(row == col ? 1.0 : 0.0);
+}
+float16_t identity_h(const in uint row, const in uint col, const in float16_t x) {
+    return float16_t(row == col ? 1.0 : 0.0);
+}
+
+// Block i of the output is at 256 * i; a 16x16 result is row-major.
+void put(MatC m, uint i) {
+    coopMatStore(m, F32(arg(1)).v, 256 * i, 16, gl_CooperativeMatrixLayoutRowMajor);
+}
+
+void main() {
+    MatC m;
+    coopMatLoad(m, F32(arg(0)).v, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+    MatC r;
+    coopMatReduceNV(r, m, gl_CooperativeMatrixReduceRowNV, add);
+    put(r, 0);
+    coopMatReduceNV(r, m, gl_CooperativeMatrixReduceRowNV, maxf);
+    put(r, 1);
+    coopMatReduceNV(r, m, gl_CooperativeMatrixReduceColumnNV, add);
+    put(r, 2);
+    coopMatReduceNV(r, m, gl_CooperativeMatrixReduceRowAndColumnNV, maxf);
+    put(r, 3);
+    Mat8 q;
+    coopMatReduceNV(q, m, gl_CooperativeMatrixReduce2x2NV, add);
+    coopMatStore(q, F32(arg(1)).v, 256 * 4, 8, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatPerElementNV(r, m, tag);
+    put(r, 5);
+    MatC t = r;
+    coopMatPerElementNV(r, m, scaled, t, 3.0);
+    put(r, 6);
+
+    // Accumulator to operands, through the matrix unit.
+    MatA one_a;
+    MatB one_b;
+    coopMatPerElementNV(one_a, MatA(0.0), identity_bf);
+    coopMatPerElementNV(one_b, MatB(0.0), identity_bf);
+    MatA a = MatA(m);
+    put(coopMatMulAdd(a, one_b, MatC(0.0)), 7);
+    MatB b = MatB(m);
+    put(coopMatMulAdd(one_a, b, MatC(0.0)), 8);
+    MatB bt;
+    coopMatTransposeNV(bt, m);
+    put(coopMatMulAdd(one_a, bt, MatC(0.0)), 9);
+    MatBh one_bh;
+    coopMatPerElementNV(one_bh, MatBh(0.0), identity_h);
+    MatAh ah = MatAh(m);
+    put(coopMatMulAdd(ah, one_bh, MatC(0.0)), 10);
+}
+#endif

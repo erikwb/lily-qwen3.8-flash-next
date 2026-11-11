@@ -148,6 +148,24 @@ const BFLOAT16_FEATURES: vk::StructureType = vk::StructureType::from_raw(1000141
 const BFLOAT16_EXTENSION: &CStr = c"VK_KHR_shader_bfloat16";
 const COOPERATIVE_MATRIX_EXTENSION: &CStr = c"VK_KHR_cooperative_matrix";
 
+/// `VkPhysicalDeviceCooperativeMatrix2FeaturesNV`, which the `ash` release
+/// in use predates.
+#[repr(C)]
+struct CooperativeMatrix2Features {
+    s_type: vk::StructureType,
+    p_next: *mut c_void,
+    workgroup_scope: vk::Bool32,
+    flexible_dimensions: vk::Bool32,
+    reductions: vk::Bool32,
+    conversions: vk::Bool32,
+    per_element_operations: vk::Bool32,
+    tensor_addressing: vk::Bool32,
+    block_loads: vk::Bool32,
+}
+const COOPERATIVE_MATRIX2_FEATURES: vk::StructureType =
+    vk::StructureType::from_raw(1000593000);
+const COOPERATIVE_MATRIX2_EXTENSION: &CStr = c"VK_NV_cooperative_matrix2";
+
 /// The device and what lives as long as it: shared by the context, its
 /// buffers and its two threads, destroyed with the last of them.
 struct Dev {
@@ -172,6 +190,10 @@ struct Dev {
     /// VK_EXT_pageable_device_local_memory, when the device has it: memory
     /// priority 1.0 keeps a buffer's memory resident.
     priority: Option<ash::ext::pageable_device_local_memory::Device>,
+    /// Whether VK_NV_cooperative_matrix2's conversions, reductions and
+    /// per-element operations are enabled (the operations on a matrix in
+    /// registers that the `_cm2` kernels use).
+    cooperative_matrix_register_ops: bool,
 }
 
 /// How the device imports host memory.
@@ -266,6 +288,24 @@ impl Dev {
                 priority.p_next = (&raw mut pageable).cast();
                 bfloat.p_next = (&raw mut priority).cast();
             }
+            // VK_NV_cooperative_matrix2, when the device has it: chained
+            // between bfloat and the memory priorities while queried, and
+            // kept there (enabled as queried) when it offers any feature.
+            let has_cooperative2 = has(COOPERATIVE_MATRIX2_EXTENSION);
+            let mut cooperative2 = CooperativeMatrix2Features {
+                s_type: COOPERATIVE_MATRIX2_FEATURES,
+                p_next: bfloat.p_next,
+                workgroup_scope: 0,
+                flexible_dimensions: 0,
+                reductions: 0,
+                conversions: 0,
+                per_element_operations: 0,
+                tensor_addressing: 0,
+                block_loads: 0,
+            };
+            if has_cooperative2 {
+                bfloat.p_next = (&raw mut cooperative2).cast();
+            }
             let mut cooperative = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default();
             cooperative.p_next = (&raw mut bfloat).cast();
             let mut v13 = vk::PhysicalDeviceVulkan13Features::default();
@@ -293,9 +333,31 @@ impl Dev {
             let prioritize = can_prioritize
                 && priority.memory_priority == vk::TRUE
                 && pageable.pageable_device_local_memory == vk::TRUE;
-            if !prioritize {
-                bfloat.p_next = std::ptr::null_mut();
+            let enable_cooperative2 = has_cooperative2
+                && [
+                    cooperative2.workgroup_scope,
+                    cooperative2.flexible_dimensions,
+                    cooperative2.reductions,
+                    cooperative2.conversions,
+                    cooperative2.per_element_operations,
+                    cooperative2.tensor_addressing,
+                    cooperative2.block_loads,
+                ]
+                .contains(&vk::TRUE);
+            if has_cooperative2 && !enable_cooperative2 {
+                bfloat.p_next = cooperative2.p_next;
             }
+            if !prioritize {
+                if enable_cooperative2 {
+                    cooperative2.p_next = std::ptr::null_mut();
+                } else {
+                    bfloat.p_next = std::ptr::null_mut();
+                }
+            }
+            let cooperative_matrix_register_ops = enable_cooperative2
+                && cooperative2.conversions == vk::TRUE
+                && cooperative2.reductions == vk::TRUE
+                && cooperative2.per_element_operations == vk::TRUE;
             let import = has(ash::ext::external_memory_host::NAME);
 
             let queues = [vk::DeviceQueueCreateInfo::default()
@@ -308,6 +370,9 @@ impl Dev {
             }
             if import {
                 names.push(ash::ext::external_memory_host::NAME.as_ptr());
+            }
+            if enable_cooperative2 {
+                names.push(COOPERATIVE_MATRIX2_EXTENSION.as_ptr());
             }
             let mut info = vk::DeviceCreateInfo::default()
                 .queue_create_infos(&queues)
@@ -375,6 +440,7 @@ impl Dev {
                 allocations: AtomicUsize::new(0),
                 host_import,
                 priority,
+                cooperative_matrix_register_ops,
             }))
         }
     }
@@ -1440,6 +1506,20 @@ impl MetalContext {
     /// Whether buffers can be kept resident ([`GpuBuffer::residency`]).
     pub fn can_keep_resident(&self) -> bool {
         self.dev.priority.is_some()
+    }
+
+    /// Whether the device offers, and the context enabled, the cooperative
+    /// matrix operations on a matrix in registers of VK_NV_cooperative_matrix2
+    /// (conversions between uses, reductions, per-element operations): the
+    /// `_cm2` kernels need all three.
+    pub fn cooperative_matrix_register_ops(&self) -> bool {
+        self.dev.cooperative_matrix_register_ops
+    }
+
+    /// Whether kernel `name` was built into the crate (one that needs a
+    /// shader extension the build's glslc lacks is left out).
+    pub fn has_kernel(&self, name: &str) -> bool {
+        KERNELS.iter().any(|(kernel, _)| *kernel == name)
     }
 
     pub fn new_buffer_with_bytes(&self, bytes: &[u8]) -> Result<Buffer> {
