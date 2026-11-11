@@ -4,7 +4,8 @@
 // arithmetic in the same order. The comments there say why each is as it is.
 #include "common.glsl"
 #include "attention_common.glsl"
-#ifdef KERNEL_sdpa_prefill_nax_qdev128
+#if defined(KERNEL_sdpa_prefill_nax_qdev128) || defined(KERNEL_sdpa_rows_split_nax) || \
+    defined(KERNEL_sdpa_rows_split_combine)
 #include "matmul.glsl"
 #endif
 
@@ -296,6 +297,29 @@ void main() {
 #define FA_SG 4
 #endif
 
+// sdpa_rows_split_nax: the same tile for a chunk of at most FA_BQ rows (the
+// verify pass of speculative decode), its keys split across threadgroups,
+// one key tile each, as the split decode kernels do (no Metal counterpart:
+// Metal runs sdpa_prefill_nax_qdev128 for these rows). One threadgroup per
+// head walks a chain of key tiles, and with a few rows that chain is the
+// kernel's time. Threadgroup (s, key head, t) takes key tile s for tile t of
+// the rows of the key head's query heads (three rows of twelve heads: three
+// tiles), keeps their softmax statistics and unnormalized P V in scratch,
+// and sdpa_rows_split_combine adds the key tiles up. `sdpa_small_m_timing`,
+// three rows, twelve layers, 2026-11-11: 1.64 ms with the prefill kernel at
+// 1 100 keys (2.66 at 2 048), 0.61 split per head, 0.50 (0.55) with the
+// heads folded into the tiles; the combine is 0.05 of it, a tile's Q K^T
+// and P V about a third each. A tile's P is rounded to bf16 against its own
+// row maxima rather than the running ones and the key tiles are summed in
+// the combine rather than through the accumulator, so the result is the
+// prefill kernel's to rounding, not bit for bit.
+#ifdef KERNEL_sdpa_rows_split_nax
+#define FA_BQ 16
+#define FA_BK 128
+#define FA_SG 4
+#define FA_SPLIT
+#endif
+
 #ifdef FA_BQ
 const uint FA_D = 256; // head dim (the model's, fixed)
 const uint FA_LANES = 32 * FA_SG / FA_BQ;
@@ -375,7 +399,20 @@ void main() {
     uvec2 tg = threadgroup_position_in_grid.xy;
     uint tid = thread_index_in_threadgroup, sg = simdgroup_index_in_threadgroup;
 
+#ifdef FA_SPLIT
+    // Arguments 10 and 11 are the scratch's split count and nothing. The
+    // tile's rows are the chunk's rows of the key head's `group` query
+    // heads: row p is chunk row p % M of head p / M of the group, so the
+    // group's heads share one read of the keys.
+    uint splits = parallel_softmax, split = tg.x;
+    uint qb = threadgroup_position_in_grid.z;
+    uint kv = tg.y, n_rows = M * group;
+#define FA_ROW_T(p) ((p) % M)
+#define FA_ROW_HEAD(p) (kv * group + (p) / M)
+#else
     uint qb = descending_blocks != 0u ? ((M + FA_BQ - 1) / FA_BQ) - 1u - tg.x : tg.x;
+    uint kv = tg.y / group, n_rows = M;
+#endif
     int q0 = int(qb) * FA_BQ;
     uint hq = tg.y;
     int len_total = int(base_len) + int(M);
@@ -387,12 +424,18 @@ void main() {
         row_sum[tid] = 0.0;
     }
 
-    uint64_t k_head = arg(1) + 2 * (uint64_t(hq / group) * max_seq * FA_D);
-    uint64_t v_head = arg(2) + 2 * (uint64_t(hq / group) * max_seq * FA_D);
+    uint64_t k_head = arg(1) + 2 * (uint64_t(kv) * max_seq * FA_D);
+    uint64_t v_head = arg(2) + 2 * (uint64_t(kv) * max_seq * FA_D);
+    uint q_valid = min(uint(FA_BQ), n_rows - uint(q0));
+#ifdef FA_SPLIT
+    uint64_t q_rows = arg(0);
+#define FA_Q_ROW(r) ((FA_ROW_T(uint(q0) + (r)) * nq + FA_ROW_HEAD(uint(q0) + (r))) * FA_D)
+#else
     // The tile's query rows: row r of it is q_stride elements after row r - 1.
     uint64_t q_rows = arg(0) + 2 * (uint64_t(uint(q0) * nq + hq) * FA_D);
     uint q_stride = nq * FA_D;
-    uint q_valid = min(uint(FA_BQ), M - uint(q0));
+#define FA_Q_ROW(r) ((r) * q_stride)
+#endif
     bool wide = ((arg(0) | arg(1) | arg(2)) & 3) == 0, wide_out = (arg(3) & 3) == 0;
 
     // The query tile, once: a thread assembles four lanes' operands of one
@@ -404,7 +447,7 @@ void main() {
             uint lane = 4 * (tid % 8) + j;
             uint row = (lane & 6) | ((lane >> 1) & 8);
             uint d = 16 * t + 8 * (lane & 1), odd16 = 16 * ((lane >> 3) & 1);
-            uint at0 = min(row, q_valid - 1) * q_stride + d, at1 = min(row + 1, q_valid - 1) * q_stride + d;
+            uint at0 = FA_Q_ROW(min(row, q_valid - 1)) + d, at1 = FA_Q_ROW(min(row + 1, q_valid - 1)) + d;
             uvec4 w0, w1;
             if (wide) {
                 w0 = MAT_VECTOR(q_rows, at0);
@@ -426,8 +469,16 @@ void main() {
 
     MatC acc0 = MatC(0.0), acc1 = MatC(0.0), acc2 = MatC(0.0), acc3 = MatC(0.0);
 
+#ifdef FA_SPLIT
+    int k_end = len_total;
+    // The grid is sized for the largest length the host allows.
+    if (int(split) * int(FA_BK) >= k_end) return;
+    {
+        int k0 = int(split) * int(FA_BK);
+#else
     int k_end = min(len_total, int(base_len) + q0 + FA_BQ);
     for (int k0 = 0; k0 < k_end; k0 += FA_BK) {
+#endif
         // S = Q K^T.
         int key_s = k0 + 32 * int(sg);
         if (key_s < k_end) {
@@ -449,12 +500,20 @@ void main() {
         barrier();
 
         // The parallel reduction is not bit-identical to the serial path.
+#ifdef FA_SPLIT
+        if (true) {
+#else
         if (parallel_softmax != 0u) {
+#endif
             uint row = tid / FA_LANES;
             uint lane8 = tid % FA_LANES;
             const uint cols = FA_BK / FA_LANES;
             uint j0 = lane8 * cols;
+#ifdef FA_SPLIT
+            int grow = int(FA_ROW_T(min(uint(q0) + row, n_rows - 1)));
+#else
             int grow = q0 + int(row);
+#endif
             int limit = min(min(int(base_len) + grow + 1, len_total) - k0, FA_BK);
             float prev_max = row_max[row];
             float local = prev_max;
@@ -480,6 +539,11 @@ void main() {
             }
             for (uint off = 1u; off < FA_LANES; off <<= 1) psum += subgroupShuffleXor(psum, off);
             if (lane8 == 0u) {
+#ifdef FA_SPLIT
+                // One tile: nothing to rescale (and a row with no key here
+                // has mx and prev_max both -inf, alpha NaN).
+                alpha = 0.0;
+#endif
                 row_sum[row] = row_sum[row] * alpha + psum;
                 row_max[row] = mx;
                 row_alpha[row] = alpha;
@@ -510,10 +574,12 @@ void main() {
 
         // acc = acc * alpha[row] + P V. A lane's elements of a block are in
         // two rows, four each.
+#ifndef FA_SPLIT
         {
             float alpha0 = row_alpha[lane_row], alpha1 = row_alpha[lane_row + 1];
             FA_SCALE(0) FA_SCALE(1) FA_SCALE(2) FA_SCALE(3)
         }
+#endif
         if (wide) {
             FA_VALUES(MAT_HALF)
         } else {
@@ -523,10 +589,65 @@ void main() {
         barrier();
     }
 
+#ifdef FA_SPLIT
+    // Row r's P V and statistics of tile `split`: entry (r * nq + hq) *
+    // splits + split of the scratch (argument 3: P V, f32 [M * nq * splits,
+    // D], then the row maximum of the scaled scores and the sum of P, f32
+    // [M * nq * splits, 2]).
+    {
+        uint64_t part = arg(3), stats = arg(3) + 4 * (uint64_t(M * nq * splits) * FA_D);
+        [[unroll]] for (uint h = 0; h < 2; ++h) {
+            uint p = uint(q0) + lane_row + h;
+            if (p < n_rows) {
+                uint at = ((FA_ROW_T(p) * nq + FA_ROW_HEAD(p)) * splits + split) * FA_D + 64 * sg + lane_col;
+                F32x4 o = F32x4(part);
+                o.v[at / 4] = vec4(acc0[4 * h], acc0[4 * h + 1], acc0[4 * h + 2], acc0[4 * h + 3]);
+                o.v[at / 4 + 4] = vec4(acc1[4 * h], acc1[4 * h + 1], acc1[4 * h + 2], acc1[4 * h + 3]);
+                o.v[at / 4 + 8] = vec4(acc2[4 * h], acc2[4 * h + 1], acc2[4 * h + 2], acc2[4 * h + 3]);
+                o.v[at / 4 + 12] = vec4(acc3[4 * h], acc3[4 * h + 1], acc3[4 * h + 2], acc3[4 * h + 3]);
+            }
+        }
+        if (uint(q0) + tid < n_rows && tid < FA_BQ) {
+            uint p = uint(q0) + tid;
+            uint at = (FA_ROW_T(p) * nq + FA_ROW_HEAD(p)) * splits + split;
+            F32(stats).v[2 * at] = row_max[tid];
+            F32(stats).v[2 * at + 1] = row_sum[tid];
+        }
+    }
+#else
     {
         float sum0 = row_sum[lane_row], sum1 = row_sum[lane_row + 1];
         FA_STORE(0) FA_STORE(1) FA_STORE(2) FA_STORE(3)
     }
+#endif
+}
+#endif
+
+// The rows' outputs from sdpa_rows_split_nax's tiles: threadgroup (head,
+// row), a thread per four head dims. The tiles of a row past its keys hold
+// a maximum of -inf and add nothing; tiles past the length were not run.
+#ifdef KERNEL_sdpa_rows_split_combine
+void main() {
+    // Arguments: the split kernel's scratch, the output [M, nq, 256].
+    uint base_len = arg_u32(2), M = arg_u32(3), nq = arg_u32(4), splits = arg_u32(5);
+    uint hq = threadgroup_position_in_grid.x, row = threadgroup_position_in_grid.y;
+    uint d4 = thread_index_in_threadgroup;
+    uint n = min(splits, (base_len + M + 127u) / 128u);
+    uint first = (row * nq + hq) * splits;
+    F32 stats = F32(arg(0) + 4 * (uint64_t(M * nq * splits) * 256));
+    float m = NEG_INFINITY;
+    for (uint s = 0; s < n; ++s) m = max(m, stats.v[2 * (first + s)]);
+    float l = 0.0;
+    vec4 acc = vec4(0.0);
+    F32x4 part = F32x4(arg(0));
+    for (uint s = 0; s < n; ++s) {
+        vec2 st = vec2(stats.v[2 * (first + s)], stats.v[2 * (first + s) + 1]);
+        float w = exp(st.x - m);
+        l += w * st.y;
+        acc += w * part.v[(first + s) * 64 + d4];
+    }
+    uint64_t o_row = arg(1) + 2 * (uint64_t(row * nq + hq) * 256);
+    U32x2(o_row).v[d4] = mat_bf16_words(acc / l);
 }
 #endif
 

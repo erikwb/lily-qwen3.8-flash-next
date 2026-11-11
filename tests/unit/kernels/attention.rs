@@ -372,6 +372,21 @@ fn check_sdpa_prefill_with(
     let out = Tensor::zeros(&ctx, &[m, nq, d], DType::BF16).expect("out");
 
     let pass = ctx.begin().expect("pass");
+    #[cfg(target_os = "linux")]
+    if kernel == SDPA_ROWS_SPLIT {
+        let scratch = Tensor::zeros(
+            &ctx,
+            &[sdpa_rows_split_scratch_numel(m, nq, d, base_len + m)],
+            DType::F32,
+        )
+        .expect("scratch");
+        sdpa_rows_split(&ctx, &pass, &tq, &tk, &tv, &out, base_len, scale, &scratch)
+            .expect("sdpa");
+    } else {
+        sdpa_prefill_with(&ctx, &pass, kernel, &tq, &tk, &tv, &out, base_len.into(), scale)
+            .expect("sdpa");
+    }
+    #[cfg(not(target_os = "linux"))]
     sdpa_prefill_with(&ctx, &pass, kernel, &tq, &tk, &tv, &out, base_len.into(), scale)
         .expect("sdpa");
     pass.commit_wait().expect("commit");
@@ -421,6 +436,25 @@ fn sdpa_prefill_matches_cpu_causal() {
     check_sdpa_prefill(16, 8, 2, 256, 64, 0, 23);
     check_sdpa_prefill(40, 4, 2, 256, 128, 9, 24);
     check_sdpa_prefill(33, 8, 2, 256, 96, 47, 25);
+}
+
+/// The name [`check_sdpa_prefill_with`] takes for [`sdpa_rows_split`].
+#[cfg(target_os = "linux")]
+const SDPA_ROWS_SPLIT: &str = "sdpa_rows_split";
+
+/// The split few-row route against the CPU: one row and a full tile, a
+/// length inside the first key tile, lengths on and off the 128-key splits
+/// (the last split holding only the chunk's last keys, so the earlier rows
+/// see none of it), one and several heads per key head.
+#[cfg(target_os = "linux")]
+#[test]
+fn sdpa_rows_split_matches_cpu_causal() {
+    check_sdpa_prefill_with(SDPA_ROWS_SPLIT, 3, 4, 2, FA_D, 64, 9, 41);
+    check_sdpa_prefill_with(SDPA_ROWS_SPLIT, 1, 8, 2, FA_D, 512, 300, 42);
+    check_sdpa_prefill_with(SDPA_ROWS_SPLIT, 3, 24, 2, FA_D, 1280, 1097, 43);
+    check_sdpa_prefill_with(SDPA_ROWS_SPLIT, 3, 4, 1, FA_D, 512, 254, 44);
+    check_sdpa_prefill_with(SDPA_ROWS_SPLIT, 4, 4, 2, FA_D, 512, 128, 45);
+    check_sdpa_prefill_with(SDPA_ROWS_SPLIT, 16, 8, 2, FA_D, 512, 200, 46);
 }
 
 /// The first port of the dense prefill kernel (`tests/vulkan/attention_test.comp`).
@@ -689,14 +723,23 @@ fn sdpa_small_m_timing() {
             .expect("q");
             let out = Tensor::zeros(&ctx, &[m, nq, d], DType::BF16).expect("out");
             #[cfg(target_os = "linux")]
-            let variants = ["prefill", "first-port", "decode-per-row"];
+            let variants = ["prefill", "split", "first-port", "decode-per-row"];
             #[cfg(not(target_os = "linux"))]
             let variants = ["prefill", "decode-per-row"];
             for variant in variants {
                 // A dispatch pair per row and layer is not a route for a chunk.
-                if variant == "decode-per-row" && m > 4 {
+                if (variant == "decode-per-row" && m > 4)
+                    || (variant == "split" && m > SDPA_ROWS_SPLIT_MAX_ROWS)
+                {
                     continue;
                 }
+                #[cfg(target_os = "linux")]
+                let rows_scratch = Tensor::zeros(
+                    &ctx,
+                    &[sdpa_rows_split_scratch_numel(m.min(16), nq, d, len)],
+                    DType::F32,
+                )
+                .expect("scratch");
                 let mut best = f64::MAX;
                 for _ in 0..5 {
                     let pass = ctx.begin_concurrent().expect("pass");
@@ -713,6 +756,20 @@ fn sdpa_small_m_timing() {
                                 0.0625,
                             )
                             .expect("prefill");
+                        } else if variant == "split" {
+                            #[cfg(target_os = "linux")]
+                            sdpa_rows_split(
+                                &ctx,
+                                &pass,
+                                &q,
+                                &k,
+                                &v,
+                                &out,
+                                len - m,
+                                0.0625,
+                                &rows_scratch,
+                            )
+                            .expect("split");
                         } else if variant == "first-port" {
                             #[cfg(target_os = "linux")]
                             sdpa_prefill_with(
