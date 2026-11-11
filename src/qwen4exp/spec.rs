@@ -47,6 +47,8 @@ use crate::kernels::spec::{
     spec_accept,
 };
 use crate::kernels::{Arg, Pos, Rope};
+#[cfg(target_os = "linux")]
+use crate::metal::DetachedPass;
 use crate::metal::{EncodedPass, MetalContext, PendingPass};
 use crate::moe_ffn::{prefix_rows, project_mat};
 use crate::tensor::Tensor;
@@ -59,6 +61,45 @@ use super::ngram::NgramHasher;
 
 fn profiling() -> bool {
     std::env::var_os("LILY_PROFILE").is_some()
+}
+
+/// A point of the step's host work in the backend's trace (`LILY_VK_TRACE`).
+#[cfg(target_os = "linux")]
+fn mark(name: &'static str) {
+    crate::metal::trace::mark(name);
+}
+
+#[cfg(not(target_os = "linux"))]
+fn mark(_name: &'static str) {}
+
+/// The next verify pass, encoded while the draft pass runs (Linux): a
+/// verify pass's encoding is 0.7 ms of host time at the top clock, and
+/// encoded after the proposals are read it is time the GPU idles. Nothing
+/// of the pass depends on the proposals themselves: it reads them, and the
+/// n-gram rows staged from them, from buffers written before it is
+/// committed. What it does depend on is here, and [`Qwen4ExpModel::verify`]
+/// uses the pass only when all of it still holds.
+#[cfg(target_os = "linux")]
+pub(super) struct VerifyAhead {
+    pass: DetachedPass,
+    pos: usize,
+    conv_slot: usize,
+    m: usize,
+    params: SamplingParams,
+    step0: usize,
+    /// [`MetalContext::passes_begun`] after the encoding: unchanged, no
+    /// other pass was encoded since (none that could have regrown the state
+    /// or the scratch the pass addresses).
+    begun: u64,
+}
+
+/// What the Linux speculative loop keeps in the state between its calls.
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+pub(super) struct SpecAhead {
+    /// The sampling and the draw index of the verify pass in flight.
+    drawn: Option<(SamplingParams, usize)>,
+    verify: Option<VerifyAhead>,
 }
 
 impl Qwen4ExpModel {
@@ -102,6 +143,7 @@ impl Qwen4ExpModel {
             s.spec.is_some() && self.weights.mtp.is_some(),
             "verify without a draft head"
         );
+        mark("verify");
         let mut tokens = Vec::with_capacity(drafts.len() + 1);
         tokens.push(pending);
         tokens.extend_from_slice(drafts);
@@ -116,14 +158,24 @@ impl Qwen4ExpModel {
         // the pass is encoded and committed whole.
         let ps = capacity.chunk(&tokens)?;
         let ple_w = self.weights.layers.iter().find_map(|l| l.ple.as_deref());
+        mark("stage");
         if let (Some(w), Some(p), Some(pst)) = (ple_w, &ps.ple, &state.ple) {
             self.stage_ngram(w, p, &tokens, pst.hist)?;
         }
+        mark("staged");
         let pos_before = state.pos;
         let hist_before = state.ple.as_ref().map(|p| p.hist);
-        let committed = self
-            .encode_batch(ctx, state, s, &ps, BatchMode::Verify { params, step0 })?
-            .commit()?;
+        #[cfg(target_os = "linux")]
+        let ahead = Self::take_verify_ahead(ctx, state, m, params, step0)?;
+        #[cfg(not(target_os = "linux"))]
+        let ahead: Option<EncodedPass<'a>> = None;
+        let encoded = match ahead {
+            Some(encoded) => encoded,
+            None => {
+                self.encode_batch(ctx, state, s, &ps, BatchMode::Verify { params, step0 })?
+            }
+        };
+        let committed = encoded.commit()?;
         // Same bookkeeping as a prefill chunk; the draft pass rolls it back.
         // Done before the draft pass is encoded: it sees the state as the
         // verify pass leaves it.
@@ -146,6 +198,7 @@ impl Qwen4ExpModel {
                 step0 + m,
             )?
             .commit()?;
+        mark("committed");
         let done = committed.wait_retain_polled()?;
         let verify_gpu_end = if profiling() {
             let t = done.timing()?;
@@ -160,6 +213,7 @@ impl Qwen4ExpModel {
         let sampled = s.spec.as_ref().expect("spec scratch").verify_tokens.to_u32()?
             [..m]
             .to_vec();
+        mark("verified");
         state.spec = Some(SpecPending {
             pos_before,
             hist_before,
@@ -183,6 +237,7 @@ impl Qwen4ExpModel {
         draft: PendingPass<'_>,
     ) -> Result<Vec<u32>> {
         let entered = Instant::now();
+        mark("finish");
         let pending = state.spec.take().ok_or_else(|| {
             anyhow::anyhow!("finish_speculation without a verify pass")
         })?;
@@ -256,8 +311,11 @@ impl Qwen4ExpModel {
                 "the step continues past a row the GPU did not confirm"
             );
             ensure!(chain > 0, "the draft pass proposed nothing to verify next");
+            #[cfg(target_os = "linux")]
+            self.encode_verify_ahead(ctx, state, s, 1 + chain, accepted + 1)?;
             self.collect_drafts(s, draft, chain, &pending)?
         };
+        mark("finished");
         if profiling() {
             eprintln!(
                 "profile host finish: done {:.2} ms after entry",
@@ -265,6 +323,73 @@ impl Qwen4ExpModel {
             );
         }
         Ok(proposals)
+    }
+
+    /// The verify pass [`Self::encode_verify_ahead`] left in the state, if
+    /// it is the pass [`Self::verify`] is about to encode: same position,
+    /// rows, sampling and draw index, and no pass encoded since. Notes the
+    /// sampling and the draw index for the step's own encoding ahead.
+    #[cfg(target_os = "linux")]
+    fn take_verify_ahead<'a>(
+        ctx: &'a MetalContext,
+        state: &mut DecodeState,
+        m: usize,
+        params: &SamplingParams,
+        step0: usize,
+    ) -> Result<Option<EncodedPass<'a>>> {
+        state.ahead.drawn = Some((*params, step0));
+        let Some(ahead) = state.ahead.verify.take() else { return Ok(None) };
+        let same = ahead.pos == state.pos
+            && ahead.conv_slot == state.conv_slot
+            && ahead.m == m
+            && ahead.params == *params
+            && ahead.step0 == step0
+            && ahead.begun == ctx.passes_begun();
+        if same { ahead.pass.attach(ctx).map(Some) } else { Ok(None) }
+    }
+
+    /// Encodes the verify pass of the next step, `m` rows at the state's
+    /// position (already rolled back to the accepted prefix), `fed` draws
+    /// after the last one's first, and keeps it in the state for
+    /// [`Self::verify`]. The draft pass may be running: nothing here writes
+    /// a buffer, and the state and the scratch must already have room, or
+    /// nothing is encoded. Neither under the expert cache, where encoding a
+    /// pass asks for its experts, nor in the per-kernel profile.
+    #[cfg(target_os = "linux")]
+    fn encode_verify_ahead(
+        &self,
+        ctx: &MetalContext,
+        state: &mut DecodeState,
+        s: &Scratch,
+        m: usize,
+        fed: usize,
+    ) -> Result<()> {
+        mark("ahead");
+        state.ahead.verify = None;
+        let Some((params, step0)) = state.ahead.drawn.take() else { return Ok(()) };
+        if self.weights.expert_cache.is_some() || ctx.profiling() {
+            return Ok(());
+        }
+        let Some(capacity) = s.prefill.as_ref() else { return Ok(()) };
+        if capacity.m < m || state.pos + m + MAX_DRAFTS > state.capacity() {
+            return Ok(());
+        }
+        let step0 = step0 + fed;
+        let ps = capacity.rows(m)?;
+        let pass = self
+            .encode_batch(ctx, state, s, &ps, BatchMode::Verify { params: &params, step0 })?
+            .detach();
+        state.ahead.verify = Some(VerifyAhead {
+            pass,
+            pos: state.pos,
+            conv_slot: state.conv_slot,
+            m,
+            params,
+            step0,
+            begun: ctx.passes_begun(),
+        });
+        mark("aheaded");
+        Ok(())
     }
 
     /// See [`crate::engine::LanguageModel::draft_initial`].
@@ -410,6 +535,8 @@ impl Qwen4ExpModel {
 
         let pass = ctx.begin_concurrent()?;
         pass.set_label("draft");
+        #[cfg(target_os = "linux")]
+        pass.set_short();
         let draws = sp.verify_tokens.view(0, &[m])?;
         spec_accept(
             ctx,
@@ -601,6 +728,8 @@ impl Qwen4ExpModel {
 
         let pass = ctx.begin_concurrent()?;
         pass.set_label("draft");
+        #[cfg(target_os = "linux")]
+        pass.set_short();
         if let Some((accepted, m)) = rollback {
             let heads = cfg.linear_num_value_heads;
             let per_state = heads * GDN_HEAD_DIM * GDN_HEAD_DIM;

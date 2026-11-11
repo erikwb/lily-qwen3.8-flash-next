@@ -428,6 +428,9 @@ pub struct DecodeState {
     pub(super) ple: Option<PleState>,
     pub(super) mtp: Option<MtpState>,
     pub(super) spec: Option<SpecPending>,
+    /// The next verify pass encoded ahead and what it needs (`spec.rs`).
+    #[cfg(target_os = "linux")]
+    pub(super) ahead: super::spec::SpecAhead,
     kv_format: KvFormat,
     kv_heads: usize,
     head_dim: usize,
@@ -1873,6 +1876,8 @@ impl Qwen4ExpModel {
             ple,
             mtp,
             spec: None,
+            #[cfg(target_os = "linux")]
+            ahead: Default::default(),
             kv_format: self.kv_format,
             kv_heads: cfg.num_key_value_heads,
             head_dim: cfg.head_dim,
@@ -2856,6 +2861,8 @@ impl Qwen4ExpModel {
                 "verify batch of {m} rows exceeds {}",
                 MAX_DRAFTS + 1
             );
+            #[cfg(target_os = "linux")]
+            pass.set_short();
         }
         let spec = if verify { s.spec.as_ref() } else { None };
         let vision = match mode {

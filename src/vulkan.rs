@@ -28,7 +28,8 @@
 //!   events a program signals, the fence among them.
 //! - **Jobs.** The kernel driver gives a GPU job about two seconds from its
 //!   submission, so a pass is submitted as command buffers of a bounded
-//!   number of dispatches, a few in flight at a time.
+//!   number of dispatches, a few in flight at a time; a pass that says it
+//!   is short ([`ComputePass::set_short`]) goes as one.
 //! - **GPU time** is the host's: a pass's span runs from its first
 //!   submission, or the end of the pass before it, to the completion the
 //!   watcher saw. The per-kernel profile submits and waits for each dispatch
@@ -126,6 +127,64 @@ const SERIAL_BATCH: usize = 32;
 const CONCURRENT_BATCH: usize = 128;
 const WINDOW: u64 = 3;
 
+/// Asks the scheduler to clock the calling thread's CPU as for a busy one
+/// whenever the thread runs (a utilization clamp: `sched_setattr` with
+/// `SCHED_FLAG_UTIL_CLAMP_MIN`; needs no privilege, and a kernel without
+/// utilization clamps refuses it, which is ignored). What macOS does for a
+/// user-interactive thread. The threads of a decode step run in bursts
+/// between sleeps (the engine thread encodes a pass for under a millisecond
+/// and then waits for tens; the submitter and the watcher wake for
+/// microseconds), so the frequency governor sees little load and clocks
+/// their CPUs low: on the M5 Max under `schedutil`, which changes a
+/// cluster's frequency at most every 6 ms, a verify pass's encoding took
+/// 6.4 ms where it takes 0.65 at the top clock, its n-gram staging 1.4 ms
+/// where it takes 0.19, and a decode step's 0.5 where it takes 0.08, all
+/// with the GPU idle (2026-11-11: speculative decode 31.4 to 27.6 ms per
+/// step, plain 15.3 to 15.0). A thread that wakes after such a change is
+/// still clocked low until the next one is allowed, which is what is left
+/// of it (about one wait in ten). `LILY_VK_CLOCK=0` leaves the threads
+/// alone.
+fn clock_thread_high() {
+    #[repr(C)]
+    struct SchedAttr {
+        size: u32,
+        sched_policy: u32,
+        sched_flags: u64,
+        sched_nice: i32,
+        sched_priority: u32,
+        sched_runtime: u64,
+        sched_deadline: u64,
+        sched_period: u64,
+        sched_util_min: u32,
+        sched_util_max: u32,
+    }
+    const SCHED_FLAG_KEEP_POLICY: u64 = 0x08;
+    const SCHED_FLAG_KEEP_PARAMS: u64 = 0x10;
+    const SCHED_FLAG_UTIL_CLAMP_MIN: u64 = 0x20;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("LILY_VK_CLOCK").is_none_or(|v| v != "0")) {
+        return;
+    }
+    let attr = SchedAttr {
+        size: size_of::<SchedAttr>() as u32,
+        sched_policy: 0,
+        sched_flags: SCHED_FLAG_KEEP_POLICY | SCHED_FLAG_KEEP_PARAMS | SCHED_FLAG_UTIL_CLAMP_MIN,
+        sched_nice: 0,
+        sched_priority: 0,
+        sched_runtime: 0,
+        sched_deadline: 0,
+        sched_period: 0,
+        sched_util_min: 1024,
+        sched_util_max: 0,
+    };
+    // SAFETY: a valid attribute block of the size it states, for the calling
+    // thread (0).
+    let set = unsafe { libc::syscall(libc::SYS_sched_setattr, 0, &raw const attr, 0) };
+    if set != 0 && std::env::var_os("LILY_VK_TRACE").is_some() {
+        eprintln!("vulkan: no utilization clamp: {}", std::io::Error::last_os_error());
+    }
+}
+
 fn env_usize(name: &str) -> Option<usize> {
     std::env::var(name).ok()?.parse().ok().filter(|&v| v > 0)
 }
@@ -133,6 +192,153 @@ fn env_usize(name: &str) -> Option<usize> {
 // The per-kernel profile (`profile`) and the busy time (`busy`), shared with
 // the Metal backend.
 include!("gpu_stats.rs");
+
+/// A timeline of the passes and their command buffers
+/// (`LILY_VK_TRACE=<file>`), for finding where a decode step's wall time goes
+/// beside its kernels: every event is one line of the file, written when the
+/// context is dropped, with its time on the host clock ([`host_secs`]). The
+/// GPU's start and end of a pass are timestamps it writes itself, moved to
+/// the host clock with VK_KHR_calibrated_timestamps. Under the trace the
+/// watcher waits for every command buffer, and a stamp at the boundary of
+/// two command buffers holds the second back about 0.2 ms (which is why
+/// only a pass's ends are stamped unless asked): wall times under it are
+/// close to, not exactly, production's. The kernel driver's own trace
+/// events (`asahi_g17_complete`) carry every job's start and end without
+/// that cost, and its `seq` is the queue serial here.
+///
+/// Events, as `secs kind label pass a b`:
+///
+/// - `open`/`close`: a command buffer's recording began and ended (`a` its
+///   slot, `b` its dispatches); `end` the pass's encoding ended (`a` the
+///   nanoseconds of it spent in the driver's recording calls, `b` those in
+///   [`ComputePass::dispatch_with`] as a whole); `commit` it went to the
+///   submitter; `taken` the submitter reached it.
+/// - `window`/`submit`/`submitted`: the submitter began waiting for room in
+///   the window, entered `vkQueueSubmit` and returned from it (`a` the slot,
+///   `b` the queue serial); `gate`/`gated` it began and ended a host wait.
+/// - `gpu_start`/`gpu_end`: the GPU's own stamps of slot `a` (a pass's
+///   first start and last end, or every command buffer's: [`stamp_all`]);
+///   `seen`: the watcher saw serial `b` (slot `a`) complete.
+/// - `signal`/`fence`: the watcher raised an event of the pass, and its
+///   fence; `woke`: the thread waiting for the pass ran again.
+/// - `mark`: a point of the host's own work ([`mark`]).
+pub mod trace {
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, OnceLock};
+
+    struct Event {
+        secs: f64,
+        kind: &'static str,
+        label: &'static str,
+        pass: u64,
+        a: u64,
+        b: u64,
+    }
+
+    struct Trace {
+        path: PathBuf,
+        events: Mutex<Vec<Event>>,
+    }
+
+    static TRACE: OnceLock<Option<Trace>> = OnceLock::new();
+    static PASSES: AtomicU64 = AtomicU64::new(0);
+
+    fn get() -> Option<&'static Trace> {
+        TRACE
+            .get_or_init(|| {
+                std::env::var_os("LILY_VK_TRACE").filter(|v| !v.is_empty()).map(|path| Trace {
+                    path: path.into(),
+                    events: Mutex::new(Vec::with_capacity(1 << 16)),
+                })
+            })
+            .as_ref()
+    }
+
+    /// Whether the trace is on.
+    pub fn on() -> bool {
+        get().is_some()
+    }
+
+    pub(super) fn next_pass() -> u64 {
+        PASSES.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    pub(super) fn event_at(
+        secs: f64,
+        kind: &'static str,
+        label: &'static str,
+        pass: u64,
+        a: u64,
+        b: u64,
+    ) {
+        if let Some(trace) = get()
+            && let Ok(mut events) = trace.events.lock()
+        {
+            events.push(Event { secs, kind, label, pass, a, b });
+        }
+    }
+
+    pub(super) fn event(kind: &'static str, label: &'static str, pass: u64, a: u64, b: u64) {
+        if on() {
+            event_at(super::host_secs(), kind, label, pass, a, b);
+        }
+    }
+
+    /// Records a point of the host's own work, by name, with the CPU the
+    /// calling thread is on.
+    pub fn mark(label: &'static str) {
+        if on() {
+            // SAFETY: no preconditions.
+            let cpu = unsafe { libc::sched_getcpu() };
+            event("mark", label, 0, cpu.max(0) as u64, 0);
+        }
+    }
+
+    /// Whether every command buffer is stamped by the GPU
+    /// (`LILY_VK_TRACE_STAMPS=all`), not only a pass's first and last. A
+    /// stamped boundary between two command buffers costs about 0.2 ms the
+    /// unstamped one does not (2026-11-11), so the default leaves the inner
+    /// ones alone.
+    pub(super) fn stamp_all() -> bool {
+        static ALL: OnceLock<bool> = OnceLock::new();
+        *ALL.get_or_init(|| std::env::var_os("LILY_VK_TRACE_STAMPS").is_some_and(|v| v == "all"))
+    }
+
+    /// Whether no command buffer is stamped (`LILY_VK_TRACE_STAMPS=none`):
+    /// the host's events alone, for a run timed from outside (the kernel
+    /// driver's own trace events carry the GPU's start and end of every job).
+    pub(super) fn stamp_none() -> bool {
+        std::env::var_os("LILY_VK_TRACE_STAMPS").is_some_and(|v| v == "none")
+    }
+
+    /// Writes the events recorded so far to the trace file and forgets them.
+    pub fn dump() {
+        use std::io::Write;
+        let Some(trace) = get() else { return };
+        let Ok(mut events) = trace.events.lock() else { return };
+        let written = std::fs::File::create(&trace.path).and_then(|file| {
+            let mut out = std::io::BufWriter::new(file);
+            for e in events.iter() {
+                writeln!(
+                    out,
+                    "{:.7}\t{}\t{}\t{}\t{}\t{}",
+                    e.secs,
+                    e.kind,
+                    if e.label.is_empty() { "-" } else { e.label },
+                    e.pass,
+                    e.a,
+                    e.b
+                )?;
+            }
+            out.flush()
+        });
+        if let Err(e) = written {
+            eprintln!("vulkan: writing the trace {}: {e}", trace.path.display());
+        }
+        events.clear();
+    }
+}
 
 /// `VkPhysicalDeviceShaderBfloat16FeaturesKHR`, which the `ash` release in
 /// use predates.
@@ -194,6 +400,8 @@ struct Dev {
     /// per-element operations are enabled (the operations on a matrix in
     /// registers that the `_cm2` kernels use).
     cooperative_matrix_register_ops: bool,
+    /// VK_KHR_calibrated_timestamps, enabled for the trace ([`trace`]).
+    calibrated: Option<ash::khr::calibrated_timestamps::Device>,
 }
 
 /// How the device imports host memory.
@@ -374,6 +582,10 @@ impl Dev {
             if enable_cooperative2 {
                 names.push(COOPERATIVE_MATRIX2_EXTENSION.as_ptr());
             }
+            let calibrate = trace::on() && has(ash::khr::calibrated_timestamps::NAME);
+            if calibrate {
+                names.push(ash::khr::calibrated_timestamps::NAME.as_ptr());
+            }
             let mut info = vk::DeviceCreateInfo::default()
                 .queue_create_infos(&queues)
                 .enabled_extension_names(&names);
@@ -422,6 +634,8 @@ impl Dev {
             };
             let priority = prioritize
                 .then(|| ash::ext::pageable_device_local_memory::Device::new(&instance, &device));
+            let calibrated = calibrate
+                .then(|| ash::khr::calibrated_timestamps::Device::new(&instance, &device));
 
             Ok(Arc::new(Self {
                 _entry: entry,
@@ -441,6 +655,7 @@ impl Dev {
                 host_import,
                 priority,
                 cooperative_matrix_register_ops,
+                calibrated,
             }))
         }
     }
@@ -937,8 +1152,9 @@ impl Fault {
 
 /// One step of a pass's program.
 enum Item {
-    /// A command buffer, and in profile mode the kernel it holds.
-    Cmd(vk::CommandBuffer, &'static str),
+    /// A command buffer, in profile mode the kernel it holds, and under the
+    /// trace its slot ([`NO_SLOT`] without).
+    Cmd(vk::CommandBuffer, &'static str, u32),
     Wait(SharedEvent, u64),
     Signal(SharedEvent, u64),
 }
@@ -981,9 +1197,14 @@ impl Feedback {
     }
 }
 
+/// The slot of a command buffer outside the trace.
+const NO_SLOT: u32 = u32::MAX;
+
 /// A committed pass on its way to the submitter thread.
 struct Submission {
     items: Vec<Item>,
+    /// The pass's number in the trace.
+    pass: u64,
     fence_value: u64,
     feedback: Arc<Feedback>,
     /// Profile mode: the pass's label.
@@ -1002,6 +1223,8 @@ enum Then {
     /// A pass's end: its feedback, the host time of its first submission
     /// (none for a pass without command buffers) and its fence value.
     Fence(Arc<Feedback>, Option<f64>, u64),
+    /// The trace: the command buffer of this slot completed.
+    Seen(u32),
 }
 
 /// How long the submitter polls a host event before it blocks on it, as a
@@ -1080,6 +1303,88 @@ impl ProfileStamps {
     }
 }
 
+/// Command buffers the trace keeps stamps for at a time: far more than are
+/// ever between their recording and the watcher's reading.
+const TRACE_SLOTS: u32 = 4096;
+
+/// The trace's timestamps: a command buffer of slot `s` writes query
+/// `2 s mod 2 TRACE_SLOTS` when it starts and the next one when it ends, and
+/// the watcher reads and resets both once it completed.
+#[derive(Clone, Copy)]
+struct TraceStamps {
+    pool: vk::QueryPool,
+    period_ns: f64,
+}
+
+impl TraceStamps {
+    fn new(dev: &Dev) -> Result<Option<Self>> {
+        // SAFETY: valid handles.
+        let (period_ns, bits) = unsafe {
+            let properties = dev.instance.get_physical_device_properties(dev.physical);
+            let families =
+                dev.instance.get_physical_device_queue_family_properties(dev.physical);
+            (
+                f64::from(properties.limits.timestamp_period),
+                families[dev.queue_family as usize].timestamp_valid_bits,
+            )
+        };
+        if bits < 64 || period_ns <= 0.0 || dev.calibrated.is_none() {
+            eprintln!("vulkan: the trace has no GPU timestamps on this device");
+            return Ok(None);
+        }
+        // SAFETY: a valid device; host query reset is core in Vulkan 1.2.
+        let pool = unsafe {
+            let pool = dev.device.create_query_pool(
+                &vk::QueryPoolCreateInfo::default()
+                    .query_type(vk::QueryType::TIMESTAMP)
+                    .query_count(2 * TRACE_SLOTS),
+                None,
+            )?;
+            dev.device.reset_query_pool(pool, 0, 2 * TRACE_SLOTS);
+            pool
+        };
+        Ok(Some(Self { pool, period_ns }))
+    }
+
+    fn query(slot: u32) -> u32 {
+        2 * (slot % TRACE_SLOTS)
+    }
+
+    /// Host time minus GPU time, in seconds, now.
+    fn offset(&self, dev: &Dev) -> Option<f64> {
+        let fns = dev.calibrated.as_ref()?;
+        let domains = [
+            vk::CalibratedTimestampInfoKHR::default().time_domain(vk::TimeDomainKHR::DEVICE),
+            vk::CalibratedTimestampInfoKHR::default()
+                .time_domain(vk::TimeDomainKHR::CLOCK_MONOTONIC),
+        ];
+        // SAFETY: a valid device with the extension enabled.
+        let (stamps, _) = unsafe { fns.get_calibrated_timestamps(&domains) }.ok()?;
+        Some(stamps[1] as f64 * 1e-9 - stamps[0] as f64 * self.period_ns * 1e-9)
+    }
+
+    /// The GPU's start and end of the completed command buffer of `slot`, in
+    /// GPU seconds, each if it was stamped; resets its stamps.
+    fn take(&self, dev: &Dev, slot: u32) -> (Option<f64>, Option<f64>) {
+        let mut stamps = [[0u64; 2]; 2];
+        // SAFETY: the command buffer that wrote them has completed; nothing
+        // else uses these two queries until they are reset here.
+        unsafe {
+            // VK_NOT_READY (a stamp missing) still fills the available ones.
+            let _ = dev.device.get_query_pool_results(
+                self.pool,
+                Self::query(slot),
+                &mut stamps,
+                vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WITH_AVAILABILITY,
+            );
+            dev.device.reset_query_pool(self.pool, Self::query(slot), 2);
+        }
+        let secs =
+            |stamp: [u64; 2]| (stamp[1] != 0).then(|| stamp[0] as f64 * self.period_ns * 1e-9);
+        (secs(stamps[0]), secs(stamps[1]))
+    }
+}
+
 struct Submitter {
     dev: Arc<Dev>,
     fault: Arc<Fault>,
@@ -1094,19 +1399,29 @@ struct Submitter {
 
 impl Submitter {
     fn run(mut self) {
+        clock_thread_high();
         while let Ok(submission) = self.work.recv() {
             let mut first = None;
             let mut kernels = Vec::new();
             let began = host_secs();
+            let pass = submission.pass;
+            trace::event("taken", "", pass, 0, 0);
             for item in &submission.items {
                 if self.fault.is_set() {
                     break;
                 }
                 match item {
-                    Item::Cmd(cmd, name) => {
+                    Item::Cmd(cmd, name, slot) => {
                         let at = host_secs();
                         first.get_or_insert(at);
-                        if let Err(e) = self.submit(*cmd) {
+                        let submitted = self.submit(*cmd, pass, *slot);
+                        if *slot != NO_SLOT {
+                            let _ = self.completions.send(Completion {
+                                serial: self.serial,
+                                then: Then::Seen(*slot),
+                            });
+                        }
+                        if let Err(e) = submitted {
                             self.fault.record(format!("{e:#}"));
                         } else if self.profile {
                             self.wait_completed(self.serial);
@@ -1127,7 +1442,11 @@ impl Submitter {
                             kernels.push(profile::KernelSample { name, gpu_secs });
                         }
                     }
-                    Item::Wait(event, value) => self.gate(event, *value),
+                    Item::Wait(event, value) => {
+                        trace::event("gate", "", pass, 0, 0);
+                        self.gate(event, *value);
+                        trace::event("gated", "", pass, 0, 0);
+                    }
                     Item::Signal(event, value) => {
                         let _ = self.completions.send(Completion {
                             serial: self.serial,
@@ -1152,12 +1471,15 @@ impl Submitter {
 
     /// Submits one command buffer, which signals the completion counter,
     /// once fewer than the window are in flight.
-    fn submit(&mut self, cmd: vk::CommandBuffer) -> Result<()> {
+    fn submit(&mut self, cmd: vk::CommandBuffer, pass: u64, slot: u32) -> Result<()> {
+        let slot = u64::from(slot);
         if self.serial >= self.window {
+            trace::event("window", "", pass, slot, self.serial + 1);
             self.wait_completed(self.serial + 1 - self.window);
         }
         self.fault.check()?;
         self.serial += 1;
+        trace::event("submit", "", pass, slot, self.serial);
         let values = [self.serial];
         let mut timeline =
             vk::TimelineSemaphoreSubmitInfo::default().signal_semaphore_values(&values);
@@ -1169,8 +1491,11 @@ impl Submitter {
             .push_next(&mut timeline)];
         // SAFETY: this thread alone uses the queue; the command buffer is
         // complete and stays alive until its pass was waited for.
-        unsafe { self.dev.device.queue_submit(self.dev.queue, &info, vk::Fence::null()) }
-            .map_err(|e| anyhow!("queue submission failed: {e}"))
+        let submitted =
+            unsafe { self.dev.device.queue_submit(self.dev.queue, &info, vk::Fence::null()) }
+                .map_err(|e| anyhow!("queue submission failed: {e}"));
+        trace::event("submitted", "", pass, slot, self.serial);
+        submitted
     }
 
     /// Blocks until the queue has completed `serial` command buffers, or a
@@ -1230,16 +1555,42 @@ fn watch(
     fault: Arc<Fault>,
     completions: Receiver<Completion>,
     fence: SharedEvent,
+    stamps: Option<TraceStamps>,
 ) {
+    clock_thread_high();
     let mut last_end = 0.0f64;
+    // The trace: host time minus GPU time, and when it was last measured.
+    let mut calibration = (0.0f64, f64::NEG_INFINITY);
     while let Ok(Completion { serial, then }) = completions.recv() {
         if serial > 0 {
             wait_completed(&dev, &fault, serial);
         }
         let now = host_secs();
         match then {
-            Then::Signal(event, value) => event.signal(value),
+            Then::Signal(event, value) => {
+                event.signal(value);
+                trace::event_at(now, "signal", "", 0, value, serial);
+            }
+            Then::Seen(slot) => {
+                trace::event_at(now, "seen", "", 0, u64::from(slot), serial);
+                if let Some(stamps) = &stamps {
+                    if now - calibration.1 > 0.05
+                        && let Some(offset) = stamps.offset(&dev)
+                    {
+                        calibration = (offset, now);
+                    }
+                    let (start, end) = stamps.take(&dev, slot);
+                    let slot = u64::from(slot);
+                    if let Some(start) = start {
+                        trace::event_at(start + calibration.0, "gpu_start", "", 0, slot, serial);
+                    }
+                    if let Some(end) = end {
+                        trace::event_at(end + calibration.0, "gpu_end", "", 0, slot, serial);
+                    }
+                }
+            }
             Then::Fence(feedback, first, value) => {
+                trace::event_at(now, "fence", "", 0, value, serial);
                 let (start, end) = match first {
                     Some(first) => (first.max(last_end), now),
                     None => (now, now),
@@ -1270,6 +1621,11 @@ pub struct MetalContext {
     profile: bool,
     /// Profile mode: the timestamps around each dispatch ([`ProfileStamps`]).
     stamps: Option<ProfileStamps>,
+    /// The trace's timestamps, and the slot of the next command buffer.
+    trace_stamps: Option<TraceStamps>,
+    trace_slot: Cell<u32>,
+    /// Passes begun so far ([`Self::passes_begun`]).
+    begun: Cell<u64>,
     batch: (usize, usize),
     recorded: RefCell<Option<Vec<Weak<GpuBuffer>>>>,
 }
@@ -1286,6 +1642,11 @@ impl Drop for MetalContext {
             // SAFETY: the submitter, its last user, has ended.
             unsafe { self.dev.device.destroy_query_pool(stamps.pool, None) };
         }
+        if let Some(stamps) = self.trace_stamps.take() {
+            // SAFETY: the watcher, its last user, has ended.
+            unsafe { self.dev.device.destroy_query_pool(stamps.pool, None) };
+        }
+        trace::dump();
     }
 }
 
@@ -1300,8 +1661,15 @@ impl MetalContext {
 
     /// Like [`Self::new`], with the per-kernel profile mode chosen explicitly.
     pub fn new_with_profile(profile: bool) -> Result<Self> {
+        // The thread that makes the context encodes its passes.
+        clock_thread_high();
         let dev = Dev::new()?;
         let stamps = if profile { ProfileStamps::new(&dev)? } else { None };
+        let trace_stamps = if trace::on() && !profile && !trace::stamp_none() {
+            TraceStamps::new(&dev)?
+        } else {
+            None
+        };
         let fault = Arc::new(Fault::default());
         let fence = SharedEvent::new();
         let (work, submissions) = channel();
@@ -1324,13 +1692,17 @@ impl MetalContext {
                 let (dev, fault, fence) = (dev.clone(), fault.clone(), fence.clone());
                 std::thread::Builder::new()
                     .name("lily-vk-watch".into())
-                    .spawn(move || watch(dev, fault, completed, fence))?
+                    .spawn(move || watch(dev, fault, completed, fence, trace_stamps))?
             },
         ];
         let batch = env_usize("LILY_VK_BATCH")
             .map_or((SERIAL_BATCH, CONCURRENT_BATCH), |v| (v, v));
         let ctx = Self {
-            pool: Rc::new(Pool { dev: dev.clone(), free: RefCell::new(Vec::new()) }),
+            pool: Rc::new(Pool {
+                dev: dev.clone(),
+                free: RefCell::new(Vec::new()),
+                used: RefCell::new(Vec::new()),
+            }),
             dev,
             fence,
             fence_value: AtomicU64::new(0),
@@ -1341,6 +1713,9 @@ impl MetalContext {
             build_nanos: AtomicU64::new(0),
             profile,
             stamps,
+            trace_stamps,
+            trace_slot: Cell::new(0),
+            begun: Cell::new(0),
             batch,
             recorded: RefCell::new(None),
         };
@@ -1552,8 +1927,18 @@ impl MetalContext {
         self.begin_pass(true)
     }
 
+    /// How many passes this context has begun encoding: equal before and
+    /// after means nothing was encoded in between, which is what keeps a
+    /// pass encoded ahead ([`EncodedPass::detach`]) valid.
+    pub fn passes_begun(&self) -> u64 {
+        self.begun.get()
+    }
+
     fn begin_pass(&self, concurrent: bool) -> Result<ComputePass<'_>> {
+        self.begun.set(self.begun.get() + 1);
         let slot = self.pool.take()?;
+        let trace = if trace::on() { trace::next_pass() } else { 0 };
+        trace::event("begin", "", trace, 0, 0);
         Ok(ComputePass {
             ctx: self,
             program: RefCell::new(Vec::new()),
@@ -1562,7 +1947,10 @@ impl MetalContext {
             done: RefCell::new(None),
             milestone: RefCell::new(None),
             label: Cell::new(profile::UNLABELED),
+            short: Cell::new(false),
             slot: RefCell::new(slot),
+            trace,
+            trace_ns: Cell::new((0, 0)),
         })
     }
 
@@ -1645,19 +2033,23 @@ impl MetalContext {
         items: Vec<Item>,
         feedback: &Arc<Feedback>,
         label: &'static str,
+        pass: u64,
     ) -> Result<u64> {
         self.fault.check()?;
         let fence_value = self.fence_value.fetch_add(1, Ordering::AcqRel) + 1;
+        trace::event("commit", label, pass, fence_value, 0);
         self.work
             .as_ref()
             .ok_or_else(|| anyhow!("the context is shutting down"))?
             .send(Submission {
                 items,
+                pass,
                 fence_value,
                 feedback: feedback.clone(),
                 profile: self.profile.then_some(label),
             })
             .map_err(|_| anyhow!("the submitter thread is gone"))?;
+        self.pool.clean();
         Ok(fence_value)
     }
 
@@ -1666,6 +2058,7 @@ impl MetalContext {
         while !self.fence.wait_until(value, 1000) {
             self.fault.check()?;
         }
+        trace::event("woke", "", 0, value, 0);
         self.fault.check()
     }
 }
@@ -1690,14 +2083,23 @@ impl Drop for BufferRecording<'_> {
     }
 }
 
-/// Command pools with their arenas, recycled across passes.
+/// Command pools with their arenas, recycled across passes. A pool given
+/// back is reset before its next use, and where possible while the GPU has
+/// work ([`Self::clean`]): resetting the pool of a pass takes the driver
+/// 0.1 to 0.3 ms, which right after a pass's wait is time the GPU idles
+/// when the host's next commit is what it waits for (2026-11-11).
 struct Pool {
     dev: Arc<Dev>,
     free: RefCell<Vec<SlotInner>>,
+    /// Given back, not yet reset.
+    used: RefCell<Vec<SlotInner>>,
 }
 
 impl Pool {
     fn take(self: &Rc<Self>) -> Result<Slot> {
+        if self.free.borrow().is_empty() {
+            self.clean();
+        }
         let recycled = self.free.borrow_mut().pop();
         let inner = match recycled {
             Some(inner) => inner,
@@ -1722,20 +2124,29 @@ impl Pool {
         Ok(Slot { inner: Some(inner), pool: self.clone() })
     }
 
-    fn recycle(&self, mut inner: SlotInner) {
-        // SAFETY: the pass that used the pool's command buffers completed
-        // (or never submitted them).
-        if unsafe {
-            inner
-                .dev
-                .device
-                .reset_command_pool(inner.pool, vk::CommandPoolResetFlags::empty())
-        }
-        .is_ok()
-        {
-            inner.used = 0;
-            inner.arena.reset();
-            self.free.borrow_mut().push(inner);
+    fn recycle(&self, inner: SlotInner) {
+        self.used.borrow_mut().push(inner);
+    }
+
+    /// Resets the pools given back since the last call. Called after a
+    /// commit, when the GPU has that pass to run.
+    fn clean(&self) {
+        let used = std::mem::take(&mut *self.used.borrow_mut());
+        for mut inner in used {
+            // SAFETY: the pass that used the pool's command buffers completed
+            // (or never submitted them).
+            if unsafe {
+                inner
+                    .dev
+                    .device
+                    .reset_command_pool(inner.pool, vk::CommandPoolResetFlags::empty())
+            }
+            .is_ok()
+            {
+                inner.used = 0;
+                inner.arena.reset();
+                self.free.borrow_mut().push(inner);
+            }
         }
     }
 }
@@ -1862,6 +2273,8 @@ struct OpenSegment {
     dispatches: usize,
     bound: vk::Pipeline,
     kernel: &'static str,
+    /// Its slot in the trace ([`NO_SLOT`] without).
+    slot: u32,
 }
 
 /// A batch of GPU work.
@@ -1876,7 +2289,14 @@ pub struct ComputePass<'a> {
     /// The last host-signalled wait of the pass ([`Self::set_milestone`]).
     milestone: RefCell<Option<(SharedEvent, u64)>>,
     label: Cell<&'static str>,
+    /// Whether the pass goes to the queue as one command buffer per part
+    /// ([`Self::set_short`]).
+    short: Cell<bool>,
     slot: RefCell<Slot>,
+    /// The pass's number in the trace, and the nanoseconds its encoding
+    /// spent in the driver's recording calls and in `dispatch_with`.
+    trace: u64,
+    trace_ns: Cell<(u64, u64)>,
 }
 
 impl Drop for ComputePass<'_> {
@@ -1961,18 +2381,42 @@ impl<'a> ComputePass<'a> {
                     )
                 };
             }
+            let mut slot = NO_SLOT;
+            if trace::on() && !self.ctx.profile {
+                slot = self.ctx.trace_slot.get();
+                self.ctx.trace_slot.set(slot.wrapping_add(1) % (NO_SLOT - 1));
+                trace::event("open", "", self.trace, u64::from(slot), 0);
+            }
+            if let Some(stamps) = &self.ctx.trace_stamps {
+                // The first of the pass, or of its part behind a wait or a
+                // signal.
+                let first = !matches!(self.program.borrow().last(), Some(Item::Cmd(..)));
+                if trace::stamp_all() || first {
+                    // SAFETY: the command buffer is recording.
+                    unsafe {
+                        self.ctx.dev.device.cmd_write_timestamp(
+                            cmd,
+                            vk::PipelineStageFlags::TOP_OF_PIPE,
+                            stamps.pool,
+                            TraceStamps::query(slot),
+                        )
+                    };
+                }
+            }
             *open = Some(OpenSegment {
                 cmd,
                 dispatches: 0,
                 bound: vk::Pipeline::null(),
                 kernel: "(no dispatch)",
+                slot,
             });
         }
         f(&self.ctx.dev.device, open.as_mut().expect("segment open"), inner)
     }
 
-    /// Closes the open command buffer (if any) into the program.
-    fn close_segment(&self) -> Result<()> {
+    /// Closes the open command buffer (if any) into the program; `last`
+    /// when the pass, or its part before a wait or a signal, ends with it.
+    fn close_segment(&self, last: bool) -> Result<()> {
         if let Some(seg) = self.open.borrow_mut().take() {
             // SAFETY: the command buffer is recording.
             unsafe {
@@ -1984,9 +2428,28 @@ impl<'a> ComputePass<'a> {
                         1,
                     );
                 }
+                if let Some(stamps) = &self.ctx.trace_stamps
+                    && (last || trace::stamp_all())
+                {
+                    self.ctx.dev.device.cmd_write_timestamp(
+                        seg.cmd,
+                        vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                        stamps.pool,
+                        TraceStamps::query(seg.slot) + 1,
+                    );
+                }
                 self.ctx.dev.device.end_command_buffer(seg.cmd)
             }?;
-            self.program.borrow_mut().push(Item::Cmd(seg.cmd, seg.kernel));
+            if seg.slot != NO_SLOT {
+                trace::event(
+                    "close",
+                    "",
+                    self.trace,
+                    u64::from(seg.slot),
+                    seg.dispatches as u64,
+                );
+            }
+            self.program.borrow_mut().push(Item::Cmd(seg.cmd, seg.kernel, seg.slot));
         }
         Ok(())
     }
@@ -1996,13 +2459,28 @@ impl<'a> ComputePass<'a> {
     fn close_full_segment(&self) -> Result<()> {
         let limit = if self.ctx.profile {
             1
+        } else if self.short.get() {
+            usize::MAX
         } else if self.concurrent {
             self.ctx.batch.1
         } else {
             self.ctx.batch.0
         };
         let full = self.open.borrow().as_ref().is_some_and(|seg| seg.dispatches >= limit);
-        if full { self.close_segment() } else { Ok(()) }
+        if full { self.close_segment(false) } else { Ok(()) }
+    }
+
+    /// Says that the pass as a whole runs for milliseconds, far inside the
+    /// time the kernel driver gives a job: it then goes to the queue as one
+    /// command buffer (one per part between its waits and signals), not in
+    /// batches. Between two command buffers of a pass the GPU pauses for 0.8
+    /// to 2 ms about once in ten passes, with both already queued, and every
+    /// one costs a submission and a completion; as one job each, the verify
+    /// and the draft pass of a speculative step together run 0.87 ms
+    /// shorter (24.1 against 25.0 ms per step, three runs each, 2026-11-11).
+    /// Not for a pass whose dispatches can take milliseconds each (prefill).
+    pub fn set_short(&self) {
+        self.short.set(true);
     }
 
     /// Names the pass in the per-kernel profile ([`profile`]).
@@ -2072,6 +2550,7 @@ impl<'a> ComputePass<'a> {
             ),
         };
         let local = [local.0 as u32, local.1 as u32, local.2 as u32];
+        let tracing = trace::on();
         let started = Instant::now();
         let known = self.ctx.dev.pipelines.lock().is_ok_and(|p| p.contains_key(&(kernel.name, local)));
         let pipeline = self.ctx.dev.pipeline(kernel.name, local)?;
@@ -2128,6 +2607,7 @@ impl<'a> ComputePass<'a> {
             push[PUSH_HEADER..PUSH_HEADER + 8 * bound]
                 .copy_from_slice(bytemuck::cast_slice(&table[..bound]));
             let push = &push[..PUSH_HEADER + 8 * bound];
+            let recording = tracing.then(Instant::now);
             // SAFETY: the command buffer is recording; the pipeline and its
             // layout are the device's.
             unsafe {
@@ -2156,10 +2636,18 @@ impl<'a> ComputePass<'a> {
             if serial {
                 barrier(device, seg.cmd);
             }
+            if let Some(recording) = recording {
+                let (driver, whole) = self.trace_ns.get();
+                self.trace_ns.set((driver + recording.elapsed().as_nanos() as u64, whole));
+            }
             seg.dispatches += 1;
             seg.kernel = kernel.name;
             Ok(())
         })?;
+        if tracing {
+            let (driver, whole) = self.trace_ns.get();
+            self.trace_ns.set((driver, whole + started.elapsed().as_nanos() as u64));
+        }
         self.close_full_segment()
     }
 
@@ -2203,7 +2691,7 @@ impl<'a> ComputePass<'a> {
     /// read after this point exist. The event must be signalled by another
     /// thread, or after the commit.
     pub fn wait_event(&self, event: &SharedEvent, value: u64) -> Result<()> {
-        self.close_segment()?;
+        self.close_segment(true)?;
         self.program.borrow_mut().push(Item::Wait(event.clone(), value));
         Ok(())
     }
@@ -2211,7 +2699,7 @@ impl<'a> ComputePass<'a> {
     /// Raises `event` to `value` once everything encoded before this point
     /// has completed.
     pub fn signal_event(&self, event: &SharedEvent, value: u64) -> Result<()> {
-        self.close_segment()?;
+        self.close_segment(true)?;
         self.program.borrow_mut().push(Item::Signal(event.clone(), value));
         Ok(())
     }
@@ -2223,7 +2711,12 @@ impl<'a> ComputePass<'a> {
         if self.concurrent && !self.ctx.profile {
             let open = self.open.borrow();
             if let Some(seg) = open.as_ref() {
+                let recording = trace::on().then(Instant::now);
                 barrier(&self.ctx.dev.device, seg.cmd);
+                if let Some(recording) = recording {
+                    let (driver, whole) = self.trace_ns.get();
+                    self.trace_ns.set((driver + recording.elapsed().as_nanos() as u64, whole));
+                }
             }
         }
         Ok(())
@@ -2238,11 +2731,13 @@ impl<'a> ComputePass<'a> {
     /// Ends encoding without submitting. The host may still write shared
     /// buffers the encoded kernels read before [`EncodedPass::commit`].
     pub fn end(self) -> Result<EncodedPass<'a>> {
-        self.close_segment()?;
+        self.close_segment(true)?;
         let program = std::mem::take(&mut *self.program.borrow_mut());
         let done = self.done.borrow().clone();
         let milestone = self.milestone.borrow_mut().take();
         let slot = self.slot.replace(Slot { inner: None, pool: self.ctx.pool.clone() });
+        let (driver_ns, dispatch_ns) = self.trace_ns.get();
+        trace::event("end", self.label.get(), self.trace, driver_ns, dispatch_ns);
         Ok(EncodedPass {
             ctx: self.ctx,
             program,
@@ -2250,6 +2745,7 @@ impl<'a> ComputePass<'a> {
             milestone,
             slot,
             label: self.label.get(),
+            trace: self.trace,
         })
     }
 
@@ -2286,15 +2782,46 @@ pub struct EncodedPass<'a> {
     milestone: Option<(SharedEvent, u64)>,
     slot: Slot,
     label: &'static str,
+    trace: u64,
+}
+
+/// An encoded pass put aside without its borrow of the context
+/// ([`EncodedPass::detach`]), to be committed by a later call that holds the
+/// context again. Dropped uncommitted, nothing of it ever runs.
+pub struct DetachedPass {
+    dev: Arc<Dev>,
+    program: Vec<Item>,
+    done: Option<(SharedEvent, u64)>,
+    milestone: Option<(SharedEvent, u64)>,
+    slot: Slot,
+    label: &'static str,
+    trace: u64,
+}
+
+impl DetachedPass {
+    /// The pass again, on the context it was encoded on.
+    pub fn attach(self, ctx: &MetalContext) -> Result<EncodedPass<'_>> {
+        ensure!(Arc::ptr_eq(&self.dev, &ctx.dev), "a pass of another context");
+        let DetachedPass { dev: _, program, done, milestone, slot, label, trace } = self;
+        Ok(EncodedPass { ctx, program, done, milestone, slot, label, trace })
+    }
 }
 
 impl<'a> EncodedPass<'a> {
+    /// Puts the pass aside; see [`DetachedPass`]. The buffers it reads and
+    /// writes must be the same ones, alive, when it is committed: the caller
+    /// keeps what tells it so ([`MetalContext::passes_begun`]).
+    pub fn detach(self) -> DetachedPass {
+        let EncodedPass { ctx, program, done, milestone, slot, label, trace } = self;
+        DetachedPass { dev: ctx.dev.clone(), program, done, milestone, slot, label, trace }
+    }
+
     /// Submits without blocking.
     pub fn commit(self) -> Result<PendingPass<'a>> {
-        let EncodedPass { ctx, program, done, milestone, slot, label } = self;
+        let EncodedPass { ctx, program, done, milestone, slot, label, trace } = self;
         let feedback = Arc::new(Feedback::default());
-        let fence_value = ctx.submit(program, &feedback, label)?;
-        Ok(PendingPass { ctx, fence_value, done, milestone, feedback, slot: Some(slot) })
+        let fence_value = ctx.submit(program, &feedback, label, trace)?;
+        Ok(PendingPass { ctx, fence_value, done, milestone, feedback, slot: Some(slot), trace })
     }
 }
 
@@ -2318,6 +2845,7 @@ pub struct PendingPass<'a> {
     milestone: Option<(SharedEvent, u64)>,
     feedback: Arc<Feedback>,
     slot: Option<Slot>,
+    trace: u64,
 }
 
 impl PendingPass<'_> {
@@ -2387,9 +2915,10 @@ impl PendingPass<'_> {
         self.finished()
     }
 
-    /// Like [`Self::wait`], polled: checks the pass's done signal (see
-    /// [`ComputePass::signal_done`], falling back to the fence) every
-    /// [`POLL_INTERVAL`].
+    /// Like [`Self::wait`], on the pass's done signal (see
+    /// [`ComputePass::signal_done`], falling back to the fence), which may
+    /// lead the fence. Metal polls it every [`POLL_INTERVAL`]; here the
+    /// watcher's signal wakes the waiting thread.
     pub fn wait_polled(self) -> Result<()> {
         self.wait_retain_polled().map(|_| ())
     }
@@ -2410,10 +2939,15 @@ impl PendingPass<'_> {
                     self.ctx.fault.check()?;
                 }
             }
-            while event.signaled_value() < value {
+            // Blocked on the event, not polled as on Metal. The watcher's
+            // signal has this thread running again in about 10 us, where a
+            // 20 us sleep lasts 70 here (the default timer slack) and a
+            // thread that wakes that often for nothing keeps its CPU's
+            // clock low: see `clock_thread_high` (2026-11-11).
+            while !event.wait_until(value, FAULT_POLL_MS) {
                 self.ctx.fault.check()?;
-                std::thread::sleep(POLL_INTERVAL);
             }
+            trace::event("polled", "", self.trace, self.fence_value, 0);
             // The done event may lead the fence; the command memory is only
             // safe to reuse after the fence.
             self.ctx.wait_fence(self.fence_value)
@@ -2436,6 +2970,13 @@ impl PendingPass<'_> {
 /// ended without it.
 const MILESTONE_POLL_MS: u64 = 50;
 
+/// How often a wait blocked on a pass's done signal checks for a fault.
+const FAULT_POLL_MS: u64 = 50;
+
 /// How long a polled wait ([`PendingPass::wait_polled`]) sleeps between
 /// checks of the pass's done signal.
 pub const POLL_INTERVAL: Duration = Duration::from_micros(20);
+
+#[cfg(test)]
+#[path = "../tests/unit/vulkan.rs"]
+mod tests;
