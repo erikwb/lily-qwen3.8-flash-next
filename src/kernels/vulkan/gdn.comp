@@ -308,6 +308,23 @@ void main() {
 // each product. As the Metal kernels, these take whole chunks: M is a
 // multiple of GDN_CHUNK (the dispatch hands a ragged tail to the
 // token-serial scan), so no product has an edge to stage.
+//
+// The WY pass loads its operands with matmul.glsl's loaders, not coopMatLoad
+// (2026-11-10, `gdn_prefill_scan_timing`: gdn_chunk_wy3 2.0 to 1.55 ms a
+// dispatch; Metal 0.86; its solve, untouched, is about 1.1 of that): 4-, 8-
+// and 16-byte loads at 32-bit indices from device memory, and T, the one
+// left operand in threadgroup memory, stored with each row's columns where a
+// lane's four are neighbours (MAT_LOAD_A_PLACED). The arithmetic and its
+// order are unchanged. A product is written once for tensors at addresses
+// the wide loads can take and once for any other (`wide`).
+//
+// gdn_chunk_scan keeps coopMatLoad. Its time is the chain of its chunks'
+// steps, each step one wait for eight 2-byte loads issued in a row with
+// nothing between them and the multiply; two 16-byte loads need the lane's
+// even or odd bfloats shifted out, the compiler puts that shift between the
+// loads of the step, and each use of a loaded value is a wait: 1.64 ms a
+// dispatch with coopMatLoad, 2.1 to 2.3 with the wide loads however they
+// were ordered in the source.
 #if defined(KERNEL_gdn_chunk_wy) || defined(KERNEL_gdn_chunk_wy3) || defined(KERNEL_gdn_chunk_scan)
 #include "matmul.glsl"
 
@@ -316,9 +333,6 @@ void main() {
 
 // A destination tile as bf16, on its way to memory.
 #define MatCb coopmat<bfloat16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
-// matmul.glsl's loads are of a product with the right operand transposed.
-// The right operand as stored, 16 rows of a [K, N] tensor:
-#define MAT_LOAD_B_ROWS(b, rows, at, stride) coopMatLoad(b, rows, at, stride, gl_CooperativeMatrixLayoutRowMajor)
 // The left operand transposed, 16 rows of a [K, M] tensor:
 #define MAT_LOAD_A_COLS(a, rows, at, stride) coopMatLoad(a, rows, at, stride, gl_CooperativeMatrixLayoutColumnMajor)
 #define MAT_STORE_ROWS(c, rows, at, stride) coopMatStore(c, rows, at, stride, gl_CooperativeMatrixLayoutRowMajor)
@@ -329,6 +343,19 @@ void main() {
         MatCb mat_rounded;                                                                        \
         for (uint mat_e = 0; mat_e < 8; ++mat_e) mat_rounded[mat_e] = bfloat16_t(c[mat_e]);          \
         MAT_STORE_ROWS(mat_rounded, rows, at, stride);                                            \
+    }
+// The same into device memory, the lane's four columns of its two rows a
+// store each: `at` the element of the tile's first, `stride` the elements
+// between rows (a multiple of 4, as `at` is).
+#define GDN_STORE_BF16(c, address, at, stride)                                                    \
+    for (uint gdn_h = 0; gdn_h < 2; ++gdn_h) {                                                    \
+        uint gdn_at = (at) + (mat_lane_row() + gdn_h) * (stride) + mat_lane_col();                \
+        vec4 gdn_v = vec4(c[4 * gdn_h], c[4 * gdn_h + 1], c[4 * gdn_h + 2], c[4 * gdn_h + 3]);    \
+        if (wide_out) {                                                                           \
+            MAT_STORE_HALF(address, gdn_at, gdn_v);                                               \
+        } else {                                                                                  \
+            MAT_STORE_HALF_UNALIGNED(address, gdn_at, gdn_v);                                     \
+        }                                                                                         \
     }
 #endif
 
@@ -350,17 +377,27 @@ float gdn_log_decay(float a, float a_log, float dt_bias) {
 #define WY_RB (16 / WY_SG)
 
 // acc = left . K^T: [C x DIM] . [C x DIM]^T of the chunk's rows, `left` the
-// address of its q or k rows.
-#define WY_ROWS_PRODUCT(acc, left)                                                                \
-    for (uint i = 0; i < WY_RB; ++i) acc[i] = MatC(0.0);                                          \
+// address of its q or k rows. The lane's four columns are rows of k, a pair
+// of each per K step; its rows of `left` a vector each.
+#define WY_ROWS_PRODUCT_WITH(acc, left, pair, vector)                                             \
     for (uint k0 = 0; k0 < DIM; k0 += 16) {                                                       \
         MatB mb;                                                                                  \
-        MAT_LOAD_B(mb, BF16(k_rows + 2 * (uint64_t(16 * wy_cb) * qk_stride)).v, k0, qk_stride);   \
+        uint b_at = (16 * wy_cb + mat_lane_col()) * qk_stride + k0 + mat_lane_row();              \
+        MAT_B_OF_PAIRS(mb, pair(k_rows, b_at), pair(k_rows, b_at + qk_stride),                    \
+                       pair(k_rows, b_at + 2 * qk_stride), pair(k_rows, b_at + 3 * qk_stride))    \
         for (uint i = 0; i < WY_RB; ++i) {                                                        \
             MatA ma;                                                                              \
-            MAT_LOAD_A(ma, BF16((left) + 2 * (uint64_t(16 * (wy_rb0 + i)) * qk_stride)).v, k0, qk_stride); \
+            uint a_at = (16 * (wy_rb0 + i) + mat_lane_row()) * qk_stride + k0 + 8 * mat_a_half(); \
+            MAT_A_OF_ROWS(ma, vector(left, a_at), vector(left, a_at + qk_stride), 16 * mat_a_odd()) \
             acc[i] = coopMatMulAdd(ma, mb, acc[i]);                                               \
         }                                                                                         \
+    }
+#define WY_ROWS_PRODUCT(acc, left)                                                                \
+    for (uint i = 0; i < WY_RB; ++i) acc[i] = MatC(0.0);                                          \
+    if (wide) {                                                                                   \
+        WY_ROWS_PRODUCT_WITH(acc, left, MAT_PAIR, MAT_VECTOR)                                     \
+    } else {                                                                                      \
+        WY_ROWS_PRODUCT_WITH(acc, left, MAT_PAIR_UNALIGNED, MAT_VECTOR_UNALIGNED)                 \
     }
 
 // P = causal Q K^T with the decay between the two tokens, for value head `h`
@@ -381,26 +418,32 @@ float gdn_log_decay(float a, float a_log, float dt_bias) {
         }                                                                                         \
     }
 
-// dest = T . right: [C x C] . [C x DIM], T at wy_T[t_at..], `right` the
-// chunk's k or v rows, the tile rounded once to bf16 into the chunk's rows of
-// w_out or u_out (`dest` their address for this head). A subgroup owns a
-// block of columns at a time and its four blocks of rows.
+// dest = T . right: [C x C] . [C x DIM], T at wy_T[t_at..] (its columns at
+// their places, WY_STORE_T), `right` the chunk's k or v rows, the tile
+// rounded once to bf16 into the chunk's rows of w_out or u_out (`dest` their
+// address for this head). A subgroup owns a block of columns at a time and
+// its four blocks of rows.
+#define WY_T_PRODUCT_WITH(t_at, right, right_stride, half)                                        \
+    for (uint k0 = 0; k0 < C; k0 += 16) {                                                         \
+        MatB mb;                                                                                  \
+        uint b_at = (k0 + mat_lane_row()) * (right_stride) + 16 * cb + mat_lane_col();            \
+        MAT_B_OF_ROWS(mb, half(right, b_at), half(right, b_at + (right_stride)))                  \
+        for (uint i = 0; i < 4; ++i) {                                                            \
+            MatA ma;                                                                              \
+            MAT_LOAD_A_PLACED(ma, wy_T, (t_at) + 16 * i * C + k0, C)                              \
+            acc[i] = coopMatMulAdd(ma, mb, acc[i]);                                               \
+        }                                                                                         \
+    }
 #define WY_T_PRODUCT(t_at, right, right_stride, dest)                                             \
     for (uint cb = sg; cb < DIM / 16; cb += WY_SG) {                                              \
         MatC acc[4];                                                                              \
         for (uint i = 0; i < 4; ++i) acc[i] = MatC(0.0);                                          \
-        for (uint k0 = 0; k0 < C; k0 += 16) {                                                     \
-            MatB mb;                                                                              \
-            MAT_LOAD_B_ROWS(mb, BF16((right) + 2 * (uint64_t(k0) * (right_stride))).v, 16 * cb, right_stride); \
-            for (uint i = 0; i < 4; ++i) {                                                        \
-                MatA ma;                                                                          \
-                MAT_LOAD_A(ma, wy_T, (t_at) + 16 * i * C + k0, C);                                \
-                acc[i] = coopMatMulAdd(ma, mb, acc[i]);                                           \
-            }                                                                                     \
+        if (wide) {                                                                               \
+            WY_T_PRODUCT_WITH(t_at, right, right_stride, MAT_HALF)                                \
+        } else {                                                                                  \
+            WY_T_PRODUCT_WITH(t_at, right, right_stride, MAT_HALF_UNALIGNED)                      \
         }                                                                                         \
-        for (uint i = 0; i < 4; ++i) {                                                            \
-            MAT_STORE_BF16(acc[i], BF16((dest) + 2 * (uint64_t(16 * i) * wu_stride)).v, 16 * cb, wu_stride) \
-        }                                                                                         \
+        for (uint i = 0; i < 4; ++i) GDN_STORE_BF16(acc[i], dest, 16 * i * wu_stride + 16 * cb, wu_stride) \
     }
 #endif
 
@@ -465,14 +508,17 @@ float gdn_log_decay(float a, float a_log, float dt_bias) {
 #define WY_SOLVE() WY_SOLVE_ROWS16(0) WY_SOLVE_ROWS16(16) WY_SOLVE_ROWS16(32) WY_SOLVE_ROWS16(48)
 
 // The lane's column of T_w and of T_u into their tiles, wy_T[0..] and
-// wy_T[C * C..]; its gates are at wy_Bt and wy_G[g_at + c].
+// wy_T[C * C..]; its gates are at wy_Bt and wy_G[g_at + c]. T is the left
+// operand of its products: a column goes to its place in each row
+// (matmul.glsl, MAT_LOAD_A_PLACED).
 #define WY_STORE_T(g_at)                                                                          \
     {                                                                                             \
         float bw = wy_Bt[(g_at) + c] * exp(wy_G[(g_at) + c]);                                     \
         float bu = wy_Bt[(g_at) + c];                                                             \
+        uint place = mat_a_place(c);                                                              \
         [[unroll]] for (int i = 0; i < int(C); ++i) {                                             \
-            wy_T[i * C + c] = bfloat16_t(t[i] * bw);                                                 \
-            wy_T[C * C + i * C + c] = bfloat16_t(t[i] * bu);                                         \
+            wy_T[i * C + place] = bfloat16_t(t[i] * bw);                                             \
+            wy_T[C * C + i * C + place] = bfloat16_t(t[i] * bu);                                     \
         }                                                                                         \
     }
 
@@ -498,6 +544,7 @@ void main() {
     uint qk_stride = 2 * HK * DIM, wu_stride = H * DIM;
     uint64_t q_rows = arg(1) + 2 * (uint64_t(t0) * qk_stride + hk * DIM);
     uint64_t k_rows = q_rows + 2 * (HK * DIM);
+    bool wide = ((arg(0) | arg(1)) & 3) == 0, wide_out = ((arg(6) | arg(7)) & 3) == 0;
     uint wy_cb = sg, wy_rb0 = 0;
     uint c = tid;
     const uint a_at = 0;
@@ -580,6 +627,7 @@ void main() {
     uint qk_stride = 2 * HK * DIM, wu_stride = H * DIM;
     uint64_t q_rows = arg(1) + 2 * (uint64_t(t0) * qk_stride + hk * DIM);
     uint64_t k_rows = q_rows + 2 * (HK * DIM);
+    bool wide = ((arg(0) | arg(1)) & 3) == 0, wide_out = ((arg(6) | arg(7)) & 3) == 0;
     uint wy_cb = sg & 3, wy_rb0 = (sg >> 2) * WY_RB;
     uint v = tid / C;  // value head of this thread (3 = idle)
     uint c = tid % C;

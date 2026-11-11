@@ -2,8 +2,9 @@
 // The kernels of tests/metal/quant_test.metal: the grouped Q4 expert GEMM as
 // it shipped before 2026-10-01 (64-deep K steps, one 4-byte code word per
 // thread and step, an unpadded B tile), the reference the shipped kernel is
-// asserted bit-identical against. The product over the tile is the shipped
-// kernel's (quant_grouped.glsl).
+// asserted bit-identical against. The product over the tile is the first
+// port's (quant_grouped_first.glsl), not the shipped kernel's: the two share
+// no code past the dequantization's arithmetic (quant_common.glsl).
 #include "common.glsl"
 #include "quant_common.glsl"
 
@@ -15,7 +16,7 @@
 #endif
 #define QG_BK 64
 #define QG_LD QG_BK
-#include "quant_grouped.glsl"
+#include "quant_grouped_first.glsl"
 
 // Dequantizes one 64x64 B tile across the threadgroup's 128 threads.
 void qg_fill(uint64_t codes, BF16 scales, BF16 biases, uint words, uint groups, uint GS,

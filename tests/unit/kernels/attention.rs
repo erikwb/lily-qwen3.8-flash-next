@@ -401,6 +401,80 @@ fn sdpa_prefill_matches_cpu_causal() {
     check_sdpa_prefill(33, 8, 2, 256, 96, 47, 25);
 }
 
+/// The first port of the dense prefill kernel (`tests/vulkan/attention_test.comp`).
+#[cfg(target_os = "linux")]
+const SDPA_PREFILL_FIRST_PORT: &str = "sdpa_prefill_nax_qdev128_ref";
+
+/// The shipped prefill kernel against its first port: the same arithmetic in
+/// the same order, however the operands are loaded, so every output matches
+/// bit for bit. Few rows (the verify pass of speculative decode), query
+/// tiles on both sides of an edge, key tiles across the causal diagonal and
+/// the cache's last row, one and several heads per key head.
+#[cfg(target_os = "linux")]
+#[test]
+fn sdpa_prefill_bit_identical_to_first_port() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(31);
+    let d = FA_D;
+    for (m, nq, kvh, max_seq, base_len) in [
+        (1usize, 2usize, 2usize, 64usize, 0usize),
+        (3, 4, 2, 1200, 1100),
+        (6, 4, 2, 64, 9),
+        (16, 8, 2, 64, 0),
+        (17, 4, 1, 300, 250),
+        (40, 4, 2, 128, 9),
+        (33, 8, 2, 96, 47),
+        (130, 2, 1, 400, 270),
+    ] {
+        let rows = |rng: &mut StdRng, n: usize| -> Vec<f32> {
+            (0..n).map(|_| rng.gen_range(-1.0f32..1.0)).collect()
+        };
+        let filled = base_len + m;
+        let mut k = vec![0.0f32; kvh * max_seq * d];
+        let mut v = vec![0.0f32; kvh * max_seq * d];
+        for h in 0..kvh {
+            let at = h * max_seq * d;
+            k[at..at + filled * d].copy_from_slice(&rows(&mut rng, filled * d));
+            v[at..at + filled * d].copy_from_slice(&rows(&mut rng, filled * d));
+        }
+        let tq =
+            Tensor::from_f32_as_bf16(&ctx, &rows(&mut rng, m * nq * d), &[m, nq, d])
+                .expect("q");
+        let tk = Tensor::from_f32_as_bf16(&ctx, &k, &[kvh, max_seq, d]).expect("k");
+        let tv = Tensor::from_f32_as_bf16(&ctx, &v, &[kvh, max_seq, d]).expect("v");
+        let out = Tensor::zeros(&ctx, &[m, nq, d], DType::BF16).expect("out");
+        let first = Tensor::zeros(&ctx, &[m, nq, d], DType::BF16).expect("out");
+        let scale = 1.0 / (d as f32).sqrt();
+        let pass = ctx.begin().expect("pass");
+        sdpa_prefill(&ctx, &pass, &tq, &tk, &tv, &out, base_len, scale).expect("sdpa");
+        sdpa_prefill_with(
+            &ctx,
+            &pass,
+            SDPA_PREFILL_FIRST_PORT,
+            &tq,
+            &tk,
+            &tv,
+            &first,
+            base_len.into(),
+            scale,
+        )
+        .expect("first port");
+        pass.commit_wait().expect("commit");
+        let bits = |t: &Tensor| -> Vec<u32> {
+            t.to_f32().expect("read").iter().map(|x| x.to_bits()).collect()
+        };
+        let (got, want) = (bits(&out), bits(&first));
+        let differ = got.iter().zip(&want).filter(|(g, w)| g != w).count();
+        assert_eq!(
+            differ,
+            0,
+            "M={m} NQ={nq} KVH={kvh} base {base_len}: {differ} of {} outputs differ from the first port",
+            got.len()
+        );
+        assert!(want.iter().any(|&b| b != 0), "M={m}: empty output");
+    }
+}
+
 #[test]
 fn scatter_kv_places_rows() {
     let ctx = MetalContext::new().expect("metal context");
@@ -452,7 +526,7 @@ fn sdpa_small_m_timing() {
         let partials =
             Tensor::zeros(&ctx, &[nq, splits, d], DType::F32).expect("partials");
         let stats = Tensor::zeros(&ctx, &[nq, splits, 2], DType::F32).expect("stats");
-        for m in [1usize, 2, 4] {
+        for m in [1usize, 3, 4, 512] {
             let q = Tensor::from_f32_as_bf16(
                 &ctx,
                 &(0..m * nq * d)
@@ -462,9 +536,17 @@ fn sdpa_small_m_timing() {
             )
             .expect("q");
             let out = Tensor::zeros(&ctx, &[m, nq, d], DType::BF16).expect("out");
-            for variant in ["prefill", "decode-per-row"] {
+            #[cfg(target_os = "linux")]
+            let variants = ["prefill", "first-port", "decode-per-row"];
+            #[cfg(not(target_os = "linux"))]
+            let variants = ["prefill", "decode-per-row"];
+            for variant in variants {
+                // A dispatch pair per row and layer is not a route for a chunk.
+                if variant == "decode-per-row" && m > 4 {
+                    continue;
+                }
                 let mut best = f64::MAX;
-                for _ in 0..3 {
+                for _ in 0..5 {
                     let pass = ctx.begin_concurrent().expect("pass");
                     for _ in 0..layers {
                         if variant == "prefill" {
@@ -479,6 +561,20 @@ fn sdpa_small_m_timing() {
                                 0.0625,
                             )
                             .expect("prefill");
+                        } else if variant == "first-port" {
+                            #[cfg(target_os = "linux")]
+                            sdpa_prefill_with(
+                                &ctx,
+                                &pass,
+                                SDPA_PREFILL_FIRST_PORT,
+                                &q,
+                                &k,
+                                &v,
+                                &out,
+                                (len - m).into(),
+                                0.0625,
+                            )
+                            .expect("first port");
                         } else {
                             for r in 0..m {
                                 let qr = q.view(r * nq * d, &[nq, d]).expect("q row");

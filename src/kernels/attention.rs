@@ -554,7 +554,33 @@ pub fn sdpa_prefill<'t>(
     base_len: impl Into<Pos<'t>>,
     scale: f32,
 ) -> Result<()> {
-    let base_len = base_len.into();
+    sdpa_prefill_with(
+        ctx,
+        pass,
+        SDPA_PREFILL_KERNEL,
+        q,
+        k_cache,
+        v_cache,
+        out,
+        base_len.into(),
+        scale,
+    )
+}
+
+/// [`sdpa_prefill`] with the kernel named (the tests' reference kernel takes
+/// the shipped one's arguments).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sdpa_prefill_with(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    kernel: &'static str,
+    q: &Tensor,
+    k_cache: &Tensor,
+    v_cache: &Tensor,
+    out: &Tensor,
+    base_len: Pos<'_>,
+    scale: f32,
+) -> Result<()> {
     ensure!(
         Kv::pair_format(&k_cache.into(), &v_cache.into())? == KvFormat::Bf16,
         "the dense prefill kernel reads bf16 caches (stage a q8 one with kv_dequant_q8)"
@@ -576,7 +602,7 @@ pub fn sdpa_prefill<'t>(
         d == FA_D,
         "head dim {d} is not the compiled flash-attention head dim {FA_D}"
     );
-    let pipeline = ctx.pipeline(SDPA_PREFILL_KERNEL, SOURCE, MslVersion::V4_0)?;
+    let pipeline = ctx.pipeline(kernel, SOURCE, MslVersion::V4_0)?;
     pass.dispatch_with(
         &pipeline,
         &[q.binding(), k_cache.binding(), v_cache.binding(), out.binding()],

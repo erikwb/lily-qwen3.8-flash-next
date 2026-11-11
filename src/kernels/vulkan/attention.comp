@@ -266,8 +266,30 @@ void main() {
 //                        tile's eight key blocks.
 // A key block wholly at or past the tile's causal end (k_end) is not
 // computed: its scores are masked and its probabilities zero, which add
-// nothing. Blocks that reach past the tensors (keys past len_total, query
-// rows past M) are staged, as the Metal tensors' extents bound them.
+// nothing.
+//
+// How the operands reach the matrix units is this port's (matmul.glsl), the
+// arithmetic and its order the first port's, which is kept test-only
+// (tests/vulkan/attention_test.comp) and matched bit for bit. Twelve layers
+// (`sdpa_small_m_timing`, 2026-11-10) of three rows over 1 100 positions,
+// the verify pass of speculative decode: 3.35 ms with the first port, 1.60
+// here; of 512 rows over 2 048: 19.7 and 11.3.
+// - The query tile is staged once, in the lanes' order, not once per key
+//   tile from device memory: a Q operand is one 16-byte load from
+//   threadgroup memory. With three rows a threadgroup's time is the chain of
+//   its key tiles, and the first port spent most of each tile's on eight
+//   guarded 2-byte loads per lane and head-dim step for a tile of Q that is
+//   the same for every key tile. 2.09 ms with this alone.
+// - K and V are read by 4- and 8-byte loads at 32-bit indices (MAT_B_OF_PAIRS,
+//   MAT_B_OF_ROWS), a key past the cache's rows clamped to the last (its
+//   probability is zero); P is stored with a row's even keys and its odd
+//   ones apart, so a lane's four are one load (MAT_A_OF_ELEMENTS), and the
+//   scores four to a vector, so a softmax thread loads its sixteen in four.
+// - A step's loads, of both operands, are issued before the first is used:
+//   a thread waits at that use for all of them at once. 1.61 ms.
+// What is left per key tile is its sixteen head-dim steps, its eight key
+// blocks of P V and three barriers, each a wait or two: the chain a few
+// rows cannot shorten in one threadgroup per head.
 #ifdef KERNEL_sdpa_prefill_nax_qdev128
 #define FA_BQ 16
 #define FA_BK 128
@@ -278,14 +300,73 @@ void main() {
 const uint FA_D = 256; // head dim (the model's, fixed)
 const uint FA_LANES = 32 * FA_SG / FA_BQ;
 
-shared float s_tile[FA_BQ * FA_BK];
-shared bfloat16_t p_tile[FA_BQ * FA_BK];
+// The scores, row-major, four keys to a vector.
+shared vec4 s_tile[FA_BQ * FA_BK / 4];
+// The probabilities: vector ((16 b + row) * 4 + 2 half + odd) holds keys
+// 8 half + odd + 2 j, j in 0..4, of key block b: a lane's four elements of a
+// row of the P operand (matmul.glsl).
+shared bf16vec4 p_tile[FA_BQ * FA_BK / 4];
 shared float row_max[FA_BQ], row_sum[FA_BQ], row_alpha[FA_BQ];
-// Not in the Metal kernel: the edge blocks' staging (matmul.glsl).
-shared bfloat16_t mat_stage[MAT_STAGE_ELEMENTS(FA_SG)];
+// The query tile in the lanes' order: vector 32 t + lane holds a lane's eight
+// elements of the operand of head dims 16 t .. 16 t + 15.
+shared uvec4 q_tile[FA_D / 16 * 32];
 
-// The right operand of P V: V's rows are the product's K, not transposed.
-#define MAT_LOAD_B_ROWS(b, rows, at, stride) coopMatLoad(b, rows, at, stride, gl_CooperativeMatrixLayoutRowMajor)
+// S = Q K^T over the head dim for the subgroup's two key blocks. `k_at##b`
+// are the elements of the lane's four keys of block b. A step's nine loads
+// are issued before any is used (matmul.glsl: a thread waits at the first
+// use, and a threadgroup's time here is its chain of steps).
+#define FA_SCORES(pair)                                                                       \
+    for (uint t = 0; t < FA_D / 16; ++t) {                                                    \
+        uint d0 = 16 * t;                                                                     \
+        uvec4 k0w = uvec4(pair(k_head, k_at0.x + d0), pair(k_head, k_at0.y + d0),             \
+                          pair(k_head, k_at0.z + d0), pair(k_head, k_at0.w + d0));            \
+        uvec4 k1w = uvec4(pair(k_head, k_at1.x + d0), pair(k_head, k_at1.y + d0),             \
+                          pair(k_head, k_at1.z + d0), pair(k_head, k_at1.w + d0));            \
+        uvec4 qw = q_tile[gl_SubgroupInvocationID + 32 * t];                                  \
+        MatA mq;                                                                              \
+        MatB mk;                                                                              \
+        MAT_OF_WORDS(mq, qw)                                                                  \
+        MAT_B_OF_PAIRS(mk, k0w.x, k0w.y, k0w.z, k0w.w)                                        \
+        s_acc0 = coopMatMulAdd(mq, mk, s_acc0);                                               \
+        MAT_B_OF_PAIRS(mk, k1w.x, k1w.y, k1w.z, k1w.w)                                        \
+        s_acc1 = coopMatMulAdd(mq, mk, s_acc1);                                               \
+    }
+// acc += P V for the tile's key block b: `v_at` are the elements of the
+// lane's two keys at the subgroup's first head dims.
+#define FA_VALUE_LOAD(half, i) uvec2 v0w##i = half(v_head, v_at.x + 16 * i), v1w##i = half(v_head, v_at.y + 16 * i);
+#define FA_VALUE_STEP(i)                                                                      \
+    MAT_B_OF_ROWS(mv, v0w##i, v1w##i)                                                         \
+    acc##i = coopMatMulAdd(mp, mv, acc##i);
+#define FA_VALUES(half)                                                                       \
+    for (uint b = 0; b < FA_BK / 16; ++b) {                                                   \
+        int key0 = k0 + 16 * int(b);                                                          \
+        if (key0 >= k_end) break;                                                             \
+        uvec2 v_at = min(uvec2(key0) + uvec2(lane_row, lane_row + 1), uvec2(last_key)) * FA_D + (64 * sg + lane_col); \
+        FA_VALUE_LOAD(half, 0) FA_VALUE_LOAD(half, 1) FA_VALUE_LOAD(half, 2) FA_VALUE_LOAD(half, 3) \
+        bf16vec4 p0w = p_tile[p_at + 64 * b], p1w = p_tile[p_at + 64 * b + 4];                \
+        MatA mp;                                                                              \
+        MatB mv;                                                                              \
+        MAT_A_OF_ELEMENTS(mp, p0w, p1w)                                                       \
+        FA_VALUE_STEP(0) FA_VALUE_STEP(1) FA_VALUE_STEP(2) FA_VALUE_STEP(3)                   \
+    }
+#define FA_SCALE(i)                                                                           \
+    for (uint e = 0; e < 4; ++e) acc##i[e] *= alpha0;                                         \
+    for (uint e = 4; e < 8; ++e) acc##i[e] *= alpha1;
+// A lane's four head dims of its two rows of an accumulator: one store each.
+#define FA_STORE(i)                                                                           \
+    for (uint h = 0; h < 2; ++h) {                                                            \
+        uint row = uint(q0) + lane_row + h;                                                   \
+        if (row < M) {                                                                        \
+            vec4 o = vec4(acc##i[4 * h], acc##i[4 * h + 1], acc##i[4 * h + 2], acc##i[4 * h + 3]) / \
+                     (h == 0 ? sum0 : sum1);                                                  \
+            uint64_t o_row = arg(3) + 2 * (uint64_t(row * nq + hq) * FA_D);                   \
+            if (wide_out) {                                                                   \
+                MAT_STORE_HALF(o_row, 64 * sg + 16 * i + lane_col, o);                        \
+            } else {                                                                          \
+                MAT_STORE_HALF_UNALIGNED(o_row, 64 * sg + 16 * i + lane_col, o);              \
+            }                                                                                 \
+        }                                                                                     \
+    }
 
 void main() {
     uint max_seq = arg_u32(4), base_len = arg_u32(5), M = arg_u32(6), nq = arg_u32(7), group = arg_u32(8);
@@ -305,7 +386,6 @@ void main() {
         row_max[tid] = NEG_INFINITY;
         row_sum[tid] = 0.0;
     }
-    barrier();
 
     uint64_t k_head = arg(1) + 2 * (uint64_t(hq / group) * max_seq * FA_D);
     uint64_t v_head = arg(2) + 2 * (uint64_t(hq / group) * max_seq * FA_D);
@@ -313,45 +393,58 @@ void main() {
     uint64_t q_rows = arg(0) + 2 * (uint64_t(uint(q0) * nq + hq) * FA_D);
     uint q_stride = nq * FA_D;
     uint q_valid = min(uint(FA_BQ), M - uint(q0));
+    bool wide = ((arg(0) | arg(1) | arg(2)) & 3) == 0, wide_out = (arg(3) & 3) == 0;
 
-    MatC acc[4];
-    for (uint i = 0; i < 4; ++i) acc[i] = MatC(0.0);
+    // The query tile, once: a thread assembles four lanes' operands of one
+    // head-dim step, each the even or the odd bfloats of eight head dims of
+    // two rows (a row past M reads the last: its scores are never used).
+    {
+        uint t = tid / 8;
+        [[unroll]] for (uint j = 0; j < 4; ++j) {
+            uint lane = 4 * (tid % 8) + j;
+            uint row = (lane & 6) | ((lane >> 1) & 8);
+            uint d = 16 * t + 8 * (lane & 1), odd16 = 16 * ((lane >> 3) & 1);
+            uint at0 = min(row, q_valid - 1) * q_stride + d, at1 = min(row + 1, q_valid - 1) * q_stride + d;
+            uvec4 w0, w1;
+            if (wide) {
+                w0 = MAT_VECTOR(q_rows, at0);
+                w1 = MAT_VECTOR(q_rows, at1);
+            } else {
+                w0 = MAT_VECTOR_UNALIGNED(q_rows, at0);
+                w1 = MAT_VECTOR_UNALIGNED(q_rows, at1);
+            }
+            w0 = (w0 >> odd16) & 0xFFFFu;
+            w1 = (w1 >> odd16) & 0xFFFFu;
+            q_tile[32 * t + lane] = uvec4(w0.x | (w0.y << 16), w0.z | (w0.w << 16), w1.x | (w1.y << 16), w1.z | (w1.w << 16));
+        }
+    }
+    barrier();
+
+    uint lane_row = mat_lane_row(), lane_col = mat_lane_col();
+    uint p_at = lane_row * 4 + 2 * mat_a_half() + mat_a_odd();
+    uint last_key = uint(len_total) - 1;
+
+    MatC acc0 = MatC(0.0), acc1 = MatC(0.0), acc2 = MatC(0.0), acc3 = MatC(0.0);
 
     int k_end = min(len_total, int(base_len) + q0 + FA_BQ);
     for (int k0 = 0; k0 < k_end; k0 += FA_BK) {
         // S = Q K^T.
-        MatC s_acc[2];
-        s_acc[0] = MatC(0.0);
-        s_acc[1] = MatC(0.0);
         int key_s = k0 + 32 * int(sg);
         if (key_s < k_end) {
-            for (uint d0 = 0; d0 < FA_D; d0 += 16) {
-                MatA mq;
-                if (q_valid < 16) {
-                    MAT_STAGE(q_rows + 2 * d0, q_stride, q_valid, 16u)
-                    MAT_LOAD_STAGED_A(mq);
-                } else {
-                    MAT_LOAD_A(mq, BF16(q_rows).v, d0, q_stride);
-                }
-                for (uint b = 0; b < 2; ++b) {
-                    int key0 = key_s + 16 * int(b);
-                    if (key0 >= k_end) break;
-                    uint keys = min(16u, uint(len_total - key0));
-                    uint64_t k_rows = k_head + 2 * (uint64_t(key0) * FA_D);
-                    MatB mk;
-                    if (keys < 16) {
-                        MAT_STAGE(k_rows + 2 * d0, FA_D, keys, 16u)
-                        MAT_LOAD_STAGED_B(mk);
-                    } else {
-                        MAT_LOAD_B(mk, BF16(k_rows).v, d0, FA_D);
-                    }
-                    s_acc[b] = coopMatMulAdd(mq, mk, s_acc[b]);
-                }
+            MatC s_acc0 = MatC(0.0), s_acc1 = MatC(0.0);
+            // The lane's four keys of each block (a key past the cache's
+            // rows reads the last: its score is masked), at its two rows of
+            // the head dim.
+            uvec4 keys = uvec4(key_s) + lane_col + uvec4(0, 1, 2, 3);
+            uvec4 k_at0 = min(keys, uvec4(last_key)) * FA_D + lane_row;
+            uvec4 k_at1 = min(keys + 16, uvec4(last_key)) * FA_D + lane_row;
+            if (wide) {
+                FA_SCORES(MAT_PAIR)
+            } else {
+                FA_SCORES(MAT_PAIR_UNALIGNED)
             }
-            for (uint b = 0; b < 2; ++b) {
-                if (key_s + 16 * int(b) >= k_end) break;
-                coopMatStore(s_acc[b], s_tile, 32 * sg + 16 * b, FA_BK, gl_CooperativeMatrixLayoutRowMajor);
-            }
+            coopMatStore(s_acc0, s_tile, 8 * sg, FA_BK / 4, gl_CooperativeMatrixLayoutRowMajor);
+            if (key_s + 16 < k_end) coopMatStore(s_acc1, s_tile, 8 * sg + 4, FA_BK / 4, gl_CooperativeMatrixLayoutRowMajor);
         }
         barrier();
 
@@ -366,19 +459,24 @@ void main() {
             float prev_max = row_max[row];
             float local = prev_max;
             // This lane's scores, read once for both loops of the Metal kernel.
-            float sv[cols];
-            for (uint j = 0; j < cols; ++j) {
-                sv[j] = s_tile[row * FA_BK + j0 + j] * scale;
-                if (int(j0 + j) < limit) local = max(local, sv[j]);
+            vec4 sv[cols / 4];
+            [[unroll]] for (uint j = 0; j < cols / 4; ++j) sv[j] = s_tile[(row * FA_BK + j0) / 4 + j] * scale;
+            [[unroll]] for (uint j = 0; j < cols; ++j) {
+                if (int(j0 + j) < limit) local = max(local, sv[j / 4][j % 4]);
             }
             for (uint off = 1u; off < FA_LANES; off <<= 1) local = max(local, subgroupShuffleXor(local, off));
             float mx = local;
             float alpha = exp(prev_max - mx);
             float psum = 0.0;
-            for (uint j = 0; j < cols; ++j) {
-                float p = int(j0 + j) < limit ? exp(sv[j] - mx) : 0.0;
-                p_tile[row * FA_BK + j0 + j] = bfloat16_t(p);
-                psum += p;
+            float p[cols];
+            [[unroll]] for (uint j = 0; j < cols; ++j) {
+                p[j] = int(j0 + j) < limit ? exp(sv[j / 4][j % 4] - mx) : 0.0;
+                psum += p[j];
+            }
+            // Key block lane8 of the row: its two halves' even keys and odd ones.
+            [[unroll]] for (uint j = 0; j < 4; ++j) {
+                uint c = 8 * (j / 2) + (j % 2);
+                p_tile[(16 * lane8 + row) * 4 + j] = bf16(vec4(p[c], p[c + 2], p[c + 4], p[c + 6]));
             }
             for (uint off = 1u; off < FA_LANES; off <<= 1) psum += subgroupShuffleXor(psum, off);
             if (lane8 == 0u) {
@@ -390,13 +488,19 @@ void main() {
             int grow = q0 + int(tid);
             int limit = min(min(int(base_len) + grow + 1, len_total) - k0, FA_BK);
             float mx = row_max[tid];
-            for (int j = 0; j < limit; ++j) mx = max(mx, s_tile[tid * FA_BK + j] * scale);
+            for (int j = 0; j < limit; ++j) mx = max(mx, s_tile[(tid * FA_BK + j) / 4][j % 4] * scale);
             float alpha = exp(row_max[tid] - mx);
             float s = row_sum[tid] * alpha;
-            for (int j = 0; j < FA_BK; ++j) {
-                float p = j < limit ? exp(s_tile[tid * FA_BK + j] * scale - mx) : 0.0;
-                p_tile[tid * FA_BK + j] = bfloat16_t(p);
-                s += j < limit ? p : 0.0;
+            for (int j0 = 0; j0 < FA_BK; j0 += 8) {
+                // Eight keys: a vector of the even ones and one of the odd.
+                float p[8];
+                for (int j = 0; j < 8; ++j) {
+                    p[j] = j0 + j < limit ? exp(s_tile[(tid * FA_BK + j0 + j) / 4][(j0 + j) % 4] * scale - mx) : 0.0;
+                    s += j0 + j < limit ? p[j] : 0.0;
+                }
+                uint at = (uint(j0) / 16 * 16 + tid) * 4 + 2 * (uint(j0) / 8 % 2);
+                p_tile[at] = bf16(vec4(p[0], p[2], p[4], p[6]));
+                p_tile[at + 1] = bf16(vec4(p[1], p[3], p[5], p[7]));
             }
             row_max[tid] = mx;
             row_sum[tid] = s;
@@ -407,46 +511,21 @@ void main() {
         // acc = acc * alpha[row] + P V. A lane's elements of a block are in
         // two rows, four each.
         {
-            float alpha0 = row_alpha[mat_row(0)], alpha1 = row_alpha[mat_row(4)];
-            for (uint i = 0; i < 4; ++i) {
-                for (uint e = 0; e < 4; ++e) acc[i][e] *= alpha0;
-                for (uint e = 4; e < 8; ++e) acc[i][e] *= alpha1;
-            }
+            float alpha0 = row_alpha[lane_row], alpha1 = row_alpha[lane_row + 1];
+            FA_SCALE(0) FA_SCALE(1) FA_SCALE(2) FA_SCALE(3)
         }
-        for (uint b = 0; b < FA_BK / 16; ++b) {
-            int key0 = k0 + 16 * int(b);
-            if (key0 >= k_end) break;
-            uint keys = min(16u, uint(len_total - key0));
-            uint64_t v_rows = v_head + 2 * (uint64_t(key0) * FA_D);
-            MatA mp;
-            MAT_LOAD_A(mp, p_tile, 16 * b, FA_BK);
-            for (uint i = 0; i < 4; ++i) {
-                uint d0 = 64 * sg + 16 * i;
-                MatB mv;
-                if (keys < 16) {
-                    MAT_STAGE(v_rows + 2 * d0, FA_D, keys, 16u)
-                    MAT_LOAD_B_ROWS(mv, mat_stage, gl_SubgroupID * 256, 16);
-                } else {
-                    MAT_LOAD_B_ROWS(mv, BF16(v_rows).v, d0, FA_D);
-                }
-                acc[i] = coopMatMulAdd(mp, mv, acc[i]);
-            }
+        if (wide) {
+            FA_VALUES(MAT_HALF)
+        } else {
+            FA_VALUES(MAT_HALF_UNALIGNED)
         }
         // Finish the matrix ops before reusing p_tile and s_tile.
         barrier();
     }
 
     {
-        float sum0 = row_sum[mat_row(0)], sum1 = row_sum[mat_row(4)];
-        for (uint i = 0; i < 4; ++i) {
-            for (uint e = 0; e < 8; ++e) {
-                uint row = mat_row(e), col = 64 * sg + 16 * i + mat_col(e);
-                if (uint(q0) + row < M) {
-                    BF16(arg(3) + 2 * (uint64_t((uint(q0) + row) * nq + hq) * FA_D)).v[col] =
-                        bfloat16_t(acc[i][e] / (e < 4 ? sum0 : sum1));
-                }
-            }
-        }
+        float sum0 = row_sum[lane_row], sum1 = row_sum[lane_row + 1];
+        FA_STORE(0) FA_STORE(1) FA_STORE(2) FA_STORE(3)
     }
 }
 #endif

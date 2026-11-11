@@ -594,12 +594,28 @@ fn gemm_q4_grouped_nt_previous(
     n_blocks: usize,
     tile: MoeTile,
 ) -> Result<()> {
-    let (_, k) = check_quant(w)?;
-    let n = c.shape()[1];
     let name = match tile {
         MoeTile::T32Sg4 => "gemm_q4_nt_nax_grouped_ref_t32x4",
         MoeTile::T64Sg4 => "gemm_q4_nt_nax_grouped_ref_t64x4",
     };
+    gemm_q4_grouped_named(ctx, pass, name, a, w, c, blocks, n_blocks, tile)
+}
+
+/// Dispatches the grouped kernel `name` with the shipped kernel's arguments.
+#[allow(clippy::too_many_arguments)]
+fn gemm_q4_grouped_named(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    name: &'static str,
+    a: &Tensor,
+    w: &QuantWeights,
+    c: &Tensor,
+    blocks: &Tensor,
+    n_blocks: usize,
+    tile: MoeTile,
+) -> Result<()> {
+    let (_, k) = check_quant(w)?;
+    let n = c.shape()[1];
     let pipeline = ctx.pipeline(name, TEST_SOURCE, MslVersion::V4_0)?;
     pass.dispatch_at(
         &pipeline,
@@ -744,8 +760,11 @@ fn usage_counts(layer: usize, s: usize) -> Vec<usize> {
 /// profiles (`LILY_GROUPED_M` tokens per chunk, default 4096; 8192 is 160
 /// rows per expert), shipped against the previous kernel, interleaved.
 /// Prints ms per layer and TFLOP/s for gate + up and for down, and checks
-/// the two bit for bit. `cargo test --release --lib -- --ignored
-/// --nocapture grouped_expert_gemm_timing`.
+/// the two bit for bit. `LILY_GROUPED_ARMS=kernel,kernel,...` times those
+/// 64x4 kernels instead (a name with no built-in shader loads from
+/// `LILY_VK_SHADER_DIR`) and prints how many outputs differ from the first's.
+/// `cargo test --release --lib -- --ignored --nocapture
+/// grouped_expert_gemm_timing`.
 #[test]
 #[ignore = "timing only"]
 fn grouped_expert_gemm_timing() {
@@ -783,21 +802,41 @@ fn grouped_expert_gemm_timing() {
             (upload(&gu), gu.len() / 4, upload(&dn), dn.len() / 4)
         })
         .collect();
-    type Gemm = fn(
-        &MetalContext,
-        &ComputePass<'_>,
-        &Tensor,
-        &QuantWeights,
-        &Tensor,
-        &Tensor,
-        usize,
-        MoeTile,
-    ) -> Result<()>;
-    let arms: [(&str, Gemm); 2] =
-        [("previous", gemm_q4_grouped_nt_previous), ("shipped", gemm_q4_grouped_nt)];
+    type Gemm = Box<
+        dyn Fn(
+            &MetalContext,
+            &ComputePass<'_>,
+            &Tensor,
+            &QuantWeights,
+            &Tensor,
+            &Tensor,
+            usize,
+            MoeTile,
+        ) -> Result<()>,
+    >;
+    let named = std::env::var("LILY_GROUPED_ARMS").ok();
+    let arms: Vec<(&'static str, Gemm)> = match &named {
+        None => vec![
+            ("previous", Box::new(gemm_q4_grouped_nt_previous)),
+            ("shipped", Box::new(gemm_q4_grouped_nt)),
+        ],
+        Some(names) => names
+            .split(',')
+            .map(|name| {
+                let name: &'static str = name.to_string().leak();
+                let gemm: Gemm =
+                    Box::new(move |ctx, pass, a, w, c, blocks, n_blocks, tile| {
+                        gemm_q4_grouped_named(
+                            ctx, pass, name, a, w, c, blocks, n_blocks, tile,
+                        )
+                    });
+                (name, gemm)
+            })
+            .collect(),
+    };
 
     let mut bits = Vec::new();
-    for (_, gemm) in arms {
+    for (_, gemm) in &arms {
         let (bgu, nbgu, bdn, nbdn) = &maps[0];
         let pass = ctx.begin().expect("pass");
         gemm(&ctx, &pass, &gx, &gate, &eg, bgu, *nbgu, tile).expect("gate");
@@ -805,7 +844,19 @@ fn grouped_expert_gemm_timing() {
         pass.commit_wait().expect("commit");
         bits.push((output_bits(&eg), output_bits(&ed)));
     }
-    assert!(bits[0] == bits[1], "shipped and previous kernels differ");
+    if named.is_none() {
+        assert!(bits[0] == bits[1], "shipped and previous kernels differ");
+    }
+    for ((name, _), b) in arms.iter().zip(&bits).skip(1) {
+        let differ =
+            |x: &[u32], y: &[u32]| x.iter().zip(y).filter(|(x, y)| x != y).count();
+        eprintln!(
+            "{name}: {} gate and {} down outputs differ from {}'s",
+            differ(&b.0, &bits[0].0),
+            differ(&b.1, &bits[0].1),
+            arms[0].0
+        );
+    }
 
     let mut times = vec![[Vec::new(), Vec::new()]; arms.len()];
     let warm = crate::kernels::qsa::tests::chain_warmup();
@@ -814,7 +865,7 @@ fn grouped_expert_gemm_timing() {
         let timed = warm.elapsed() >= crate::kernels::qsa::tests::chain_warmup_ms();
         for j in 0..arms.len() {
             let which = (round + j) % arms.len();
-            let gemm = arms[which].1;
+            let gemm = &arms[which].1;
             for (op, out) in times[which].iter_mut().enumerate() {
                 let pass = ctx.begin().expect("pass");
                 for (bgu, nbgu, bdn, nbdn) in &maps {

@@ -1,0 +1,192 @@
+#version 460
+// The reference kernel of tests/unit/kernels/attention.rs: the dense prefill
+// attention as it was first ported (2026-11-10), every operand block a
+// coopMatLoad (the edge blocks staged), Q staged again for every key tile.
+// The shipped kernel (src/kernels/vulkan/attention.comp) does the same
+// arithmetic in the same order and must match it bit for bit.
+#include "common.glsl"
+#include "attention_common.glsl"
+#include "matmul.glsl"
+
+#define NEG_INFINITY (-1.0 / 0.0)
+
+#ifdef KERNEL_sdpa_prefill_nax_qdev128_ref
+#define FA_BQ 16
+#define FA_BK 128
+#define FA_SG 4
+#endif
+
+#ifdef FA_BQ
+const uint FA_D = 256; // head dim (the model's, fixed)
+const uint FA_LANES = 32 * FA_SG / FA_BQ;
+
+shared float s_tile[FA_BQ * FA_BK];
+shared bfloat16_t p_tile[FA_BQ * FA_BK];
+shared float row_max[FA_BQ], row_sum[FA_BQ], row_alpha[FA_BQ];
+// Not in the Metal kernel: the edge blocks' staging (matmul.glsl).
+shared bfloat16_t mat_stage[MAT_STAGE_ELEMENTS(FA_SG)];
+
+void main() {
+    uint max_seq = arg_u32(4), base_len = arg_u32(5), M = arg_u32(6), nq = arg_u32(7), group = arg_u32(8);
+    float scale = arg_f32(9);
+    uint parallel_softmax = arg_u32(10), descending_blocks = arg_u32(11);
+    uvec2 tg = threadgroup_position_in_grid.xy;
+    uint tid = thread_index_in_threadgroup, sg = simdgroup_index_in_threadgroup;
+
+    uint qb = descending_blocks != 0u ? ((M + FA_BQ - 1) / FA_BQ) - 1u - tg.x : tg.x;
+    int q0 = int(qb) * FA_BQ;
+    uint hq = tg.y;
+    int len_total = int(base_len) + int(M);
+
+    // Tile layout requires SG * 32 threads.
+    if (threads_per_threadgroup.x != 32 * FA_SG) return;
+    if (tid < FA_BQ) {
+        row_max[tid] = NEG_INFINITY;
+        row_sum[tid] = 0.0;
+    }
+    barrier();
+
+    uint64_t k_head = arg(1) + 2 * (uint64_t(hq / group) * max_seq * FA_D);
+    uint64_t v_head = arg(2) + 2 * (uint64_t(hq / group) * max_seq * FA_D);
+    // The tile's query rows: row r of it is q_stride elements after row r - 1.
+    uint64_t q_rows = arg(0) + 2 * (uint64_t(uint(q0) * nq + hq) * FA_D);
+    uint q_stride = nq * FA_D;
+    uint q_valid = min(uint(FA_BQ), M - uint(q0));
+
+    MatC acc[4];
+    for (uint i = 0; i < 4; ++i) acc[i] = MatC(0.0);
+
+    int k_end = min(len_total, int(base_len) + q0 + FA_BQ);
+    for (int k0 = 0; k0 < k_end; k0 += FA_BK) {
+        // S = Q K^T.
+        MatC s_acc[2];
+        s_acc[0] = MatC(0.0);
+        s_acc[1] = MatC(0.0);
+        int key_s = k0 + 32 * int(sg);
+        if (key_s < k_end) {
+            for (uint d0 = 0; d0 < FA_D; d0 += 16) {
+                MatA mq;
+                if (q_valid < 16) {
+                    MAT_STAGE(q_rows + 2 * d0, q_stride, q_valid, 16u)
+                    MAT_LOAD_STAGED_A(mq);
+                } else {
+                    MAT_LOAD_A(mq, BF16(q_rows).v, d0, q_stride);
+                }
+                for (uint b = 0; b < 2; ++b) {
+                    int key0 = key_s + 16 * int(b);
+                    if (key0 >= k_end) break;
+                    uint keys = min(16u, uint(len_total - key0));
+                    uint64_t k_rows = k_head + 2 * (uint64_t(key0) * FA_D);
+                    MatB mk;
+                    if (keys < 16) {
+                        MAT_STAGE(k_rows + 2 * d0, FA_D, keys, 16u)
+                        MAT_LOAD_STAGED_B(mk);
+                    } else {
+                        MAT_LOAD_B(mk, BF16(k_rows).v, d0, FA_D);
+                    }
+                    s_acc[b] = coopMatMulAdd(mq, mk, s_acc[b]);
+                }
+            }
+            for (uint b = 0; b < 2; ++b) {
+                if (key_s + 16 * int(b) >= k_end) break;
+                coopMatStore(s_acc[b], s_tile, 32 * sg + 16 * b, FA_BK, gl_CooperativeMatrixLayoutRowMajor);
+            }
+        }
+        barrier();
+
+        // The parallel reduction is not bit-identical to the serial path.
+        if (parallel_softmax != 0u) {
+            uint row = tid / FA_LANES;
+            uint lane8 = tid % FA_LANES;
+            const uint cols = FA_BK / FA_LANES;
+            uint j0 = lane8 * cols;
+            int grow = q0 + int(row);
+            int limit = min(min(int(base_len) + grow + 1, len_total) - k0, FA_BK);
+            float prev_max = row_max[row];
+            float local = prev_max;
+            // This lane's scores, read once for both loops of the Metal kernel.
+            float sv[cols];
+            for (uint j = 0; j < cols; ++j) {
+                sv[j] = s_tile[row * FA_BK + j0 + j] * scale;
+                if (int(j0 + j) < limit) local = max(local, sv[j]);
+            }
+            for (uint off = 1u; off < FA_LANES; off <<= 1) local = max(local, subgroupShuffleXor(local, off));
+            float mx = local;
+            float alpha = exp(prev_max - mx);
+            float psum = 0.0;
+            for (uint j = 0; j < cols; ++j) {
+                float p = int(j0 + j) < limit ? exp(sv[j] - mx) : 0.0;
+                p_tile[row * FA_BK + j0 + j] = bfloat16_t(p);
+                psum += p;
+            }
+            for (uint off = 1u; off < FA_LANES; off <<= 1) psum += subgroupShuffleXor(psum, off);
+            if (lane8 == 0u) {
+                row_sum[row] = row_sum[row] * alpha + psum;
+                row_max[row] = mx;
+                row_alpha[row] = alpha;
+            }
+        } else if (tid < FA_BQ) {
+            int grow = q0 + int(tid);
+            int limit = min(min(int(base_len) + grow + 1, len_total) - k0, FA_BK);
+            float mx = row_max[tid];
+            for (int j = 0; j < limit; ++j) mx = max(mx, s_tile[tid * FA_BK + j] * scale);
+            float alpha = exp(row_max[tid] - mx);
+            float s = row_sum[tid] * alpha;
+            for (int j = 0; j < FA_BK; ++j) {
+                float p = j < limit ? exp(s_tile[tid * FA_BK + j] * scale - mx) : 0.0;
+                p_tile[tid * FA_BK + j] = bfloat16_t(p);
+                s += j < limit ? p : 0.0;
+            }
+            row_max[tid] = mx;
+            row_sum[tid] = s;
+            row_alpha[tid] = alpha;
+        }
+        barrier();
+
+        // acc = acc * alpha[row] + P V. A lane's elements of a block are in
+        // two rows, four each.
+        {
+            float alpha0 = row_alpha[mat_row(0)], alpha1 = row_alpha[mat_row(4)];
+            for (uint i = 0; i < 4; ++i) {
+                for (uint e = 0; e < 4; ++e) acc[i][e] *= alpha0;
+                for (uint e = 4; e < 8; ++e) acc[i][e] *= alpha1;
+            }
+        }
+        for (uint b = 0; b < FA_BK / 16; ++b) {
+            int key0 = k0 + 16 * int(b);
+            if (key0 >= k_end) break;
+            uint keys = min(16u, uint(len_total - key0));
+            uint64_t v_rows = v_head + 2 * (uint64_t(key0) * FA_D);
+            MatA mp;
+            MAT_LOAD_A(mp, p_tile, 16 * b, FA_BK);
+            for (uint i = 0; i < 4; ++i) {
+                uint d0 = 64 * sg + 16 * i;
+                MatB mv;
+                if (keys < 16) {
+                    MAT_STAGE(v_rows + 2 * d0, FA_D, keys, 16u)
+                    MAT_LOAD_B_ROWS(mv, mat_stage, gl_SubgroupID * 256, 16);
+                } else {
+                    MAT_LOAD_B_ROWS(mv, BF16(v_rows).v, d0, FA_D);
+                }
+                acc[i] = coopMatMulAdd(mp, mv, acc[i]);
+            }
+        }
+        // Finish the matrix ops before reusing p_tile and s_tile.
+        barrier();
+    }
+
+    {
+        float sum0 = row_sum[mat_row(0)], sum1 = row_sum[mat_row(4)];
+        for (uint i = 0; i < 4; ++i) {
+            for (uint e = 0; e < 8; ++e) {
+                uint row = mat_row(e), col = 64 * sg + 16 * i + mat_col(e);
+                if (uint(q0) + row < M) {
+                    BF16(arg(3) + 2 * (uint64_t((uint(q0) + row) * nq + hq) * FA_D)).v[col] =
+                        bfloat16_t(acc[i][e] / (e < 4 ? sum0 : sum1));
+                }
+            }
+        }
+    }
+}
+#endif
+
