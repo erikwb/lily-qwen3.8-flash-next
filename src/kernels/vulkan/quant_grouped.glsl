@@ -10,25 +10,32 @@
 // weight rows into qg_tile (qg_store_word).
 //
 // A threadgroup of four subgroups computes a QG_BM x 64 tile of C: subgroup s
-// its columns 16 s.., in 16-row blocks, as many as the tile has rows for
-// (where Metal picks the product's height among BM, BM/2 and BM/4).
+// its columns 16 s.., in 16-row blocks.
 //
-// Unlike Metal's, the product does not read A from device memory: the
-// threadgroup stages its rows 64 elements of K at a time, as it does B's.
-// Every load from a device address costs a dozen instructions on this driver
-// (its sparse-residency guard), and an operand block is two rows per lane, so
-// a lane loading its own elements pays that 8 times per K step of 16 and
-// block where staging pays it once per 64 and row tile; measured on the
-// model's shapes, 24.4 against 16.7 ms per layer of gate and up.
+// Where the port differs from Metal's kernel, and why (ms per layer of gate
+// and up at the model's shapes, `grouped_expert_gemm_timing`):
+//
+// - The product does not read A from device memory: the threadgroup stages
+//   the tile's rows 64 elements of K at a time, as it does B's. A load from
+//   device memory costs many times a load from threadgroup memory here, and
+//   an operand block is two rows per lane: a lane loading its own elements
+//   pays that eight times per K step of 16 on a 64-row tile, where staging
+//   loads each 16 bytes of the tile once. 23.5 ms with A read directly, 14.1
+//   staged. (coopMatLoad from a device address is slower again: it multiplies
+//   row and stride in 64 bits for every element it loads.)
+// - The product always runs over all QG_BM rows (the A tile is zero past the
+//   tile's), where Metal picks its height among BM, BM/2 and BM/4. The
+//   matrix units make the extra blocks cheap; a branch per block around them
+//   cost 19.4 ms against 15.0.
 #include "matmul.glsl"
 
 // The B tile, 64 rows of QG_LD elements. As bf16vec4 a thread stores four
 // dequantized weights at once; coopMatLoad counts in these vectors.
 shared bf16vec4 qg_tile[64 * QG_LD / 4];
 // The A tile: QG_BM rows of 64 elements, zero past the tile's rows. A lane's
-// elements of an operand block are four of a row, every other one of eight
-// (mat_row, mat_a_col), so each eight are stored as two vectors: the even
-// elements, then the odd ones.
+// elements of an operand block are four each of two rows, every other one of
+// eight (mat_row, mat_a_col), so each eight are stored as two vectors, the
+// even elements and the odd ones, and a lane loads its four as one.
 shared bf16vec4 qg_a[QG_BM * 16];
 
 // Dequantizes one Q4 word into the B tile, at vector `at`.

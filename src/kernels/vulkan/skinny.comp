@@ -4,7 +4,7 @@
 // like the dequant + GEMM fallback they replace; the register-A variants
 // (m <= 8) dot the raw codes like the decode GEMV. The comments there say why
 // each is as it is; the bodies (skinny_common.glsl) are the same arithmetic
-// in the same order.
+// in the same order, except where a comment there says what differs.
 #include "common.glsl"
 #include "quant_common.glsl"
 

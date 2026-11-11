@@ -3,7 +3,8 @@
 // and embedding gather with bf16 activations and fp32 accumulation, and the
 // grouped Q4 GEMM. Q4 codes pack eight low-nibble-first values per word;
 // w = scale * q + bias. The comments there say why each kernel is as it is;
-// this is the same arithmetic in the same order.
+// this is the same arithmetic in the same order, except where a comment here
+// says what differs.
 #include "common.glsl"
 #include "quant_common.glsl"
 
