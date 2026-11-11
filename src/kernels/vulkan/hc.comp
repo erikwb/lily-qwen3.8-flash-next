@@ -88,7 +88,9 @@ void main() {
 #endif
 
 // ---------------------------------------------------------------------------
-// The fused read gate (hc.metal says how it is laid out and why).
+// The fused read gate (hc.metal says what the two kernels compute and why).
+// The down kernels are laid out as the Metal ones; the up kernels are not
+// (see there).
 
 #define HC_MAX_G 8
 
@@ -120,6 +122,12 @@ void hc_widen_block(uvec4 a, uvec4 b, out vec4 v[4]) {
 void hc_load_block(uint64_t p, uint i, out vec4 v[4]) {
     U32x4 w = U32x4(p);
     hc_widen_block(w.v[2 * i], w.v[2 * i + 1], v);
+}
+
+// bf16 number `at` (0 to 7) of the eight in four words, widened.
+float hc_half(uvec4 w, uint at) {
+    uint word = at < 4u ? (at < 2u ? w.x : w.y) : (at < 6u ? w.z : w.w);
+    return uintBitsToFloat((at & 1u) != 0u ? word & 0xFFFF0000u : word << 16);
 }
 
 // The quant group of the block a lane loads, i / bpg, for a loop over
@@ -286,9 +294,7 @@ void main() {
 
 // hc_read_up_mix_q8_g<GG> (single row: the kernel applies the scaled SiLU to
 // `down` itself) and hc_read_up_mix_q8_g<GG>_m<MB> (MB rows on the
-// precomputed activation): the Metal template parameters GG and MB are
-// compile-time constants per kernel, so the per-stream and per-row arrays
-// stay in registers.
+// precomputed activation); GG and MB are compile-time constants per kernel.
 #if defined(KERNEL_hc_read_up_mix_q8_g1)
 #define GG 1
 #elif defined(KERNEL_hc_read_up_mix_q8_g2)
@@ -403,122 +409,149 @@ void main() {
 #define MB 4
 #endif
 
-#ifdef GG
-void main() {
-    uint H = arg_u32(8), R = arg_u32(9), GS = arg_u32(10);
-#ifdef MB
-    float w_bias = arg_f32(11);
-#else
-    float inv_g = arg_f32(11), w_bias = arg_f32(12);
-#endif
-    uint col = threadgroup_position_in_grid.x * (threads_per_threadgroup.x / 32) + simdgroup_index_in_threadgroup;
-    uint lane = thread_index_in_simdgroup;
-    if (col >= H) return;  // whole subgroup
-    uint words = R / 4;
-    uint blocks = words / 4;
-    uint bpg = GS / 16;
-    uint groups = R / GS;
-    // Each stream's weight row (g*H + col): where its uint4 blocks and its
-    // scales/biases start, as 32-bit element offsets (Metal: 64-bit pointers
-    // per stream; the weight is [G*H, R] and far below 2^32 blocks, and 64-bit
-    // addresses per stream cost registers).
-    U32x4 codes = U32x4(arg(0));
-    BF16 scales = BF16(arg(1)), biases = BF16(arg(2));
-    uint co[GG], so[GG];
-    [[unroll]] for (uint g = 0; g < GG; ++g) {
-        uint row = g * H + col;
-        co[g] = row * blocks;
-        so[g] = row * groups;
-    }
 
-    BF16 norm_w = BF16(arg(5));
-    F32 inv_rms = F32(arg(6));
-#ifndef MB
-    // The gate epilogue's normalized stream values (hn) are loaded before the
-    // weight loop (Metal loads them after the reduction), which takes 5-10%
-    // off the kernel on this driver. (The MB-row kernels keep them after the
-    // loop: GG * MB more live registers cost them more than it saves.)
-    BF16 hyper = BF16(arg(4));
-    float hn[GG];
-    [[unroll]] for (uint g = 0; g < GG; ++g) {
-        uint e = g * H + col;
-        hn[g] = float(bf16_rne(float(hyper.v[e]) * inv_rms.v[g] * (w_bias + float(norm_w.v[e]))));
-    }
-    float sum[GG];
-    [[unroll]] for (uint g = 0; g < GG; ++g) sum[g] = 0.0;
-    HC_GROUP_INIT(lane, bpg)
-    for (uint i = lane; i < blocks; i += 32) {
-        uvec4 w4[GG];
-        [[unroll]] for (uint g = 0; g < GG; ++g) w4[g] = codes.v[co[g] + i];
-        vec4 act[4];
-        hc_load_block(arg(3), i, act);
-        [[unroll]] for (uint j = 0; j < 4; ++j) {
-            vec4 v = act[j] * inv_g;
-            act[j] = vec4(bf16_rne(v / (1.0 + exp(-v))));
-        }
-        [[unroll]] for (uint g = 0; g < GG; ++g) {
-            float s = float(scales.v[so[g] + q]);
-            float b = float(biases.v[so[g] + q]);
-            sum[g] += hc_dot_q8(hc_unpack_q8(w4[g].x), s, b, act[0])
-                + hc_dot_q8(hc_unpack_q8(w4[g].y), s, b, act[1])
-                + hc_dot_q8(hc_unpack_q8(w4[g].z), s, b, act[2])
-                + hc_dot_q8(hc_unpack_q8(w4[g].w), s, b, act[3]);
-        }
-        HC_GROUP_NEXT(bpg)
-    }
-    float acc = 0.0;
-    [[unroll]] for (uint g = 0; g < GG; ++g) {
-        float logit = float(bf16_rne(subgroupAdd(sum[g])));
-        float gate = 1.0 / (1.0 + exp(-logit));
-        acc += gate * hn[g];
-    }
-    if (lane == 0) BF16(arg(7)).v[col] = bf16_rne(acc / float(GG));
+// The Metal kernels run a subgroup per output column, lane i on block i of
+// each stream's weight row: with R 320 that is 20 lanes of 32 at work, and
+// every column's subgroup computes the activation's SiLU again. Instructions
+// are what this kernel costs here (the direct port ran 2.2 M subgroup
+// instructions a read, where the cores do about 0.28 M a microsecond:
+// elementwise.rs, `level_shape_probe`, 2026-11-10), so the layout is one
+// where all lanes work and nothing is computed twice:
+// - A subgroup's eight quads are eight weight rows (the streams of 8 / GG
+//   columns), and a quad's four lanes take the four blocks of one of the
+//   row's quant-group-sized quarters of 64 codes a turn, R / 64 turns.
+// - What a row's reduction adds is what the Metal kernel's subgroup sum
+//   adds, in its order: the hardware sum is a tree over adjacent lanes
+//   (`subgroup_sum_order_probe`), so its lanes 4j .. 4j+3 are the 4-lane
+//   clustered sum of turn j, and the eight of those are added as the tree
+//   adds them.
+// - The activation is staged once per threadgroup (its first MB subgroups, a
+//   row each) in threadgroup memory, where every turn reads it.
+// - A row's scales and biases are 16 bytes each, loaded once.
+// - The gate epilogue runs once per quad, its streams' gates and normalized
+//   values brought to the column's lanes by broadcast.
+// Given the same inputs the result is the direct port's bit for bit, for the
+// single-row kernels; the MB-row kernels now equal the single-row kernel on
+// every row, where the direct port's differed from it in the last bit of a
+// few values in 100 000 (hc.rs tests, `up_layouts_agree_on_wide_data`).
+// Measured in the chain (`hc_read_chain_timing`, `fused_batched_read_gate_
+// timing`, us per read at H 2560, 4 streams, R 320, 2026-11-10): one row 17.5
+// to 13.2 (Metal 7.7), three rows 31.0 to 15.0, four rows 40.8 to 18.2. What
+// is left of the one-row kernel is its 3.3 MB of weights and a floor: with
+// no weight load it takes 9.8, with no load at all 7.7.
+#ifdef GG
+#extension GL_KHR_shader_subgroup_clustered : require
+#ifdef MB
+#define UP_MB MB
 #else
+#define UP_MB 1
+#define UP_SILU
+#endif
+#define UP_CPS (8 / GG)  // columns of a subgroup
+#define UP_ACT 1024      // vec4s of staged activation (hc.rs: `HC_UP_ACT_MAX`)
+shared vec4 up_act[UP_ACT];
+void main() {
+    // The params are one struct (hc.rs: `dispatch_read_up_mix`), two loads.
+    uvec4 p0 = U32x4(arg(8)).v[0], p1 = U32x4(arg(8)).v[1];
+    // bshift: log2 of the 16-code blocks per quant group; groups: per row.
+    uint H = p0.x, R = p0.y, bshift = p0.z, groups = p0.w;
+    float w_bias = uintBitsToFloat(p1.x);
+    uint sg = simdgroup_index_in_threadgroup, lane = thread_index_in_simdgroup;
+    uint quad = lane >> 2, p = lane & 3u;
+    uint c = quad / GG, g = quad - c * GG;
+    uint col = (threadgroup_position_in_grid.x * (threads_per_threadgroup.x / 32) + sg) * UP_CPS + c;
+    bool live = c < UP_CPS && col < H;
+    uint blocks = R >> 4, turns = R >> 6;
     uint K = GG * H;
-    float sum[GG * MB];
-    [[unroll]] for (uint e = 0; e < GG * MB; ++e) sum[e] = 0.0;
-    HC_GROUP_INIT(lane, bpg)
-    U32x4 actw = U32x4(arg(3));
-    for (uint i = lane; i < blocks; i += 32) {
-        // Every row's activation block, loaded once as words and widened per
-        // stream (Metal reloads it per stream from L1; here each load
-        // carries the driver's address translation).
-        uvec4 araw[MB][2];
-        [[unroll]] for (uint m = 0; m < MB; ++m) {
-            araw[m][0] = actw.v[2 * (m * blocks + i)];
-            araw[m][1] = actw.v[2 * (m * blocks + i) + 1];
+    // A quad past the columns (or past 8 / GG whole columns) runs on row 0
+    // and stores nothing: no branch on it in what follows.
+    uint wrow = live ? g * H + col : 0u;
+
+    // Subgroup m stages row m of the activation.
+    if (sg < UP_MB) {
+        for (uint i = lane; i < blocks; i += 32) {
+            vec4 a[4];
+            hc_load_block(arg(3), sg * blocks + i, a);
+#ifdef UP_SILU
+            [[unroll]] for (uint j = 0; j < 4; ++j) {
+                vec4 v = a[j] * uintBitsToFloat(p1.y);
+                a[j] = vec4(bf16_rne(v / (1.0 + exp(-v))));
+            }
+#endif
+            [[unroll]] for (uint j = 0; j < 4; ++j) up_act[sg * (R >> 2) + 4 * i + j] = a[j];
         }
-        [[unroll]] for (uint g = 0; g < GG; ++g) {
-            uvec4 w4 = codes.v[co[g] + i];
-            float s = float(scales.v[so[g] + q]);
-            float b = float(biases.v[so[g] + q]);
+    }
+    // Meanwhile a quad's lanes load what is its row's alone: the scales and
+    // biases (up to seven groups fit a 16-byte window on a 4-byte boundary
+    // that stays inside the tensor; more are loaded per turn) and the
+    // normalized stream value of its column.
+    bool window = groups <= 7u;
+    uvec4 sw = uvec4(0), bw = uvec4(0);
+    uint sh = 0;
+    if (window) {
+        uint e = wrow * groups;
+        uint e0 = min(e & ~1u, K * groups - 8u);
+        sh = e - e0;
+        sw = U32x4(arg(1) + 2 * uint64_t(e0)).v[0];
+        bw = U32x4(arg(2) + 2 * uint64_t(e0)).v[0];
+    }
+    float hn[UP_MB];
+    float gain = w_bias + float(BF16(arg(5)).v[wrow]);
+    [[unroll]] for (uint m = 0; m < UP_MB; ++m)
+        hn[m] = float(bf16_rne(float(BF16(arg(4)).v[m * K + wrow]) * F32(arg(6)).v[m * GG + g] * gain));
+    barrier();
+
+    // Turn j: block 4j + p of the row (hc.rs keeps R to the eight turns of
+    // one subgroup sum).
+    U32x4 codes = U32x4(arg(0));
+    uint co = wrow * blocks;
+    float qs[8 * UP_MB];
+    [[unroll]] for (uint j = 0; j < 8; ++j) {
+        float a[UP_MB];
+        [[unroll]] for (uint m = 0; m < UP_MB; ++m) a[m] = 0.0;
+        if (j < turns) {
+            uint b = 4 * j + p;
+            uvec4 w4 = codes.v[co + b];
+            uint q = b >> bshift;
+            float s, bi;
+            if (window) {
+                s = hc_half(sw, sh + q);
+                bi = hc_half(bw, sh + q);
+            } else {
+                s = float(BF16(arg(1)).v[wrow * groups + q]);
+                bi = float(BF16(arg(2)).v[wrow * groups + q]);
+            }
             vec4 q0 = hc_unpack_q8(w4.x);
             vec4 q1 = hc_unpack_q8(w4.y);
             vec4 q2 = hc_unpack_q8(w4.z);
             vec4 q3 = hc_unpack_q8(w4.w);
-            [[unroll]] for (uint m = 0; m < MB; ++m) {
-                vec4 av[4];
-                hc_widen_block(araw[m][0], araw[m][1], av);
-                sum[g * MB + m] += hc_dot_q8(q0, s, b, av[0])
-                    + hc_dot_q8(q1, s, b, av[1])
-                    + hc_dot_q8(q2, s, b, av[2])
-                    + hc_dot_q8(q3, s, b, av[3]);
+            [[unroll]] for (uint m = 0; m < UP_MB; ++m) {
+                uint at = m * (R >> 2) + 4 * b;
+                a[m] = hc_dot_q8(q0, s, bi, up_act[at])
+                    + hc_dot_q8(q1, s, bi, up_act[at + 1])
+                    + hc_dot_q8(q2, s, bi, up_act[at + 2])
+                    + hc_dot_q8(q3, s, bi, up_act[at + 3]);
             }
         }
-        HC_GROUP_NEXT(bpg)
+        [[unroll]] for (uint m = 0; m < UP_MB; ++m) qs[j * UP_MB + m] = subgroupClusteredAdd(a[m], 4);
     }
-    [[unroll]] for (uint m = 0; m < MB; ++m) {
-        BF16 hyper_m = BF16(arg(4) + 2 * uint64_t(m) * K);
+    [[unroll]] for (uint m = 0; m < UP_MB; ++m) {
+        float total = ((qs[m] + qs[UP_MB + m]) + (qs[2 * UP_MB + m] + qs[3 * UP_MB + m]))
+            + ((qs[4 * UP_MB + m] + qs[5 * UP_MB + m]) + (qs[6 * UP_MB + m] + qs[7 * UP_MB + m]));
+        float logit = float(bf16_rne(total));
+        float gate = 1.0 / (1.0 + exp(-logit));
+        // hc_mix_bf16 over the column's streams, whose quads' first lanes
+        // are 4 * (c * GG + s).
         float acc = 0.0;
-        [[unroll]] for (uint g = 0; g < GG; ++g) {
-            float logit = float(bf16_rne(subgroupAdd(sum[g * MB + m])));
-            float gate = 1.0 / (1.0 + exp(-logit));
-            uint e = g * H + col;
-            float hn = float(bf16_rne(float(hyper_m.v[e]) * inv_rms.v[m * GG + g] * (w_bias + float(norm_w.v[e]))));
-            acc += gate * hn;
+        [[unroll]] for (uint s = 0; s < GG; ++s) {
+            float gv = 0.0, hv = 0.0;
+            [[unroll]] for (uint cc = 0; cc < UP_CPS; ++cc) {
+                gv = c == cc ? subgroupBroadcast(gate, 4 * (cc * GG + s)) : gv;
+                hv = c == cc ? subgroupBroadcast(hn[m], 4 * (cc * GG + s)) : hv;
+            }
+            acc += gv * hv;
         }
-        if (lane == 0) BF16(arg(7) + 2 * uint64_t(m) * H).v[col] = bf16_rne(acc / float(GG));
+        if (live && p == 0u && g == 0u) BF16(arg(7)).v[m * H + col] = bf16_rne(acc / float(GG));
     }
-#endif
 }
 #endif

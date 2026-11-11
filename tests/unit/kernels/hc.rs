@@ -1301,6 +1301,8 @@ fn hc_read_chain_timing() {
     let inj = zeros(&[g], DType::BF16);
     let mixed = zeros(&[h], DType::BF16);
     let inv_rms = zeros(&[g], DType::F32);
+    // LILY_HC_NO_INJECT: the read of the final mixer, which has no inject rows.
+    let with_inject = std::env::var_os("LILY_HC_NO_INJECT").is_none();
     let pairs: Vec<(&'static str, &'static str)> = std::env::var("LILY_HC_KERNELS")
         .map(|v| {
             v.split(',')
@@ -1325,11 +1327,12 @@ fn hc_read_chain_timing() {
                 let pass = ctx.begin_concurrent().expect("pass");
                 for (d, u, j) in &weights {
                     if run_down {
+                        let j = with_inject.then_some(j);
                         let dims = check_read_down(
                             &t_hyper,
                             &t_norm,
                             d,
-                            Some(j),
+                            j,
                             &down,
                             &inj,
                             &inv_rms,
@@ -1345,7 +1348,7 @@ fn hc_read_chain_timing() {
                             &t_hyper,
                             &t_norm,
                             d,
-                            Some(j),
+                            j,
                             &down,
                             &inj,
                             &inv_rms,
@@ -1389,5 +1392,220 @@ fn hc_read_chain_timing() {
             b[2] * 1e6,
             up_bytes / b[2] / 1e3,
         );
+    }
+}
+
+/// The Vulkan up kernel's layout against the direct port of the Metal
+/// kernel (`hc_read_up_mix_q8_g4_old.spv` in `LILY_VK_SHADER_DIR`, built
+/// from the port's source), bit for bit, on activations and weights with a
+/// wide range: logits that saturate the SiLU either way, zeros, scales and
+/// biases of both signs. A diagnostic: needs that shader. Run with
+/// `--ignored --nocapture`.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "diagnostic; needs the direct port's shader in LILY_VK_SHADER_DIR"]
+fn up_layouts_agree_on_wide_data() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(99);
+    let (h, g, r) = (2560usize, 4usize, 320usize);
+    let k = g * h;
+    const GS: usize = 64;
+    let old = ctx.pipeline("hc_read_up_mix_q8_g4_old", "", MslVersion::V3_1).expect("old kernel");
+    for trial in 0..16 {
+        let wide = |rng: &mut StdRng, n: usize, span: f32| -> Vec<f32> {
+            (0..n)
+                .map(|_| match rng.gen_range(0..8) {
+                    0 => 0.0,
+                    1 => rng.gen_range(-span..span) * 1e-4,
+                    2 => rng.gen_range(-span..span) * 30.0,
+                    _ => rng.gen_range(-span..span),
+                })
+                .collect()
+        };
+        let down = cpu_ref::round_bf16(&wide(&mut rng, r, 4.0 * (trial + 1) as f32));
+        let hyper = cpu_ref::round_bf16(&wide(&mut rng, k, 3.0));
+        let norm_w = cpu_ref::round_bf16(&random(&mut rng, k, -0.5, 0.5));
+        let inv_rms: Vec<f32> = (0..g).map(|_| rng.gen_range(0.05f32..3.0)).collect();
+        let words = r / 4;
+        let groups = r / GS;
+        let codes: Vec<u32> = (0..k * words).map(|_| rng.r#gen()).collect();
+        let bf = |v: Vec<f32>| -> Vec<bf16> { v.iter().map(|&x| bf16::from_f32(x)).collect() };
+        let scales = bf((0..k * groups).map(|_| rng.gen_range(-0.01f32..0.01)).collect());
+        let biases = bf((0..k * groups).map(|_| rng.gen_range(-1.0f32..1.0)).collect());
+        let up = QuantWeights {
+            codes: Tensor::from_bytes(&ctx, bytemuck::cast_slice(&codes), &[k, words], DType::U32)
+                .expect("codes"),
+            scales: Tensor::from_bytes(&ctx, bytemuck::cast_slice(&scales), &[k, groups], DType::BF16)
+                .expect("scales"),
+            biases: Tensor::from_bytes(&ctx, bytemuck::cast_slice(&biases), &[k, groups], DType::BF16)
+                .expect("biases"),
+            group_size: GS,
+            bits: 8,
+        };
+        let t_down = Tensor::from_f32_as_bf16(&ctx, &down, &[r]).expect("down");
+        let t_hyper = Tensor::from_f32_as_bf16(&ctx, &hyper, &[k]).expect("hyper");
+        let t_norm = Tensor::from_f32_as_bf16(&ctx, &norm_w, &[k]).expect("norm");
+        let t_rms = Tensor::from_f32(&ctx, &inv_rms, &[g]).expect("rms");
+        let mixed_new = Tensor::zeros(&ctx, &[h], DType::BF16).expect("new");
+        let mixed_old = Tensor::zeros(&ctx, &[h], DType::BF16).expect("old");
+        let pass = ctx.begin().expect("pass");
+        hc_read_up_mix_q8(
+            &ctx, &pass, &up, &t_down, &t_hyper, &t_norm, &t_rms, &mixed_new, h, g, 1.0,
+        )
+        .expect("new");
+        // The direct port's dispatch (hc.rs before the Vulkan layout).
+        pass.dispatch_at(
+            &old,
+            &[
+                up.codes.binding(),
+                up.scales.binding(),
+                up.biases.binding(),
+                t_down.binding(),
+                t_hyper.binding(),
+                t_norm.binding(),
+                t_rms.binding(),
+                mixed_old.binding(),
+            ],
+            &[
+                &u32_bytes(h),
+                &u32_bytes(r),
+                &u32_bytes(GS),
+                &(1.0f32 / g as f32).to_ne_bytes(),
+                &1.0f32.to_ne_bytes(),
+            ],
+            Grid::Threadgroups { groups: (h.div_ceil(8), 1, 1), threadgroup: (256, 1, 1) },
+        )
+        .expect("old");
+        pass.commit_wait().expect("commit");
+        let bits = |t: &Tensor| -> Vec<u32> { t.to_f32().expect("read").iter().map(|v| v.to_bits()).collect() };
+        let (a, b) = (bits(&mixed_new), bits(&mixed_old));
+        // The three-row kernels on the same data (rows of one activation
+        // scaled apart).
+        {
+            let m = 3usize;
+            let old3 = ctx
+                .pipeline("hc_read_up_mix_q8_g4_m3_old", "", MslVersion::V3_1)
+                .expect("old rows kernel");
+            let down3: Vec<f32> =
+                (0..m).flat_map(|row| down.iter().map(move |v| v * (row as f32 * 0.5 + 0.25))).collect();
+            let down3 = cpu_ref::round_bf16(&down3);
+            let hyper3 = cpu_ref::round_bf16(&wide(&mut rng, m * k, 3.0));
+            let rms3: Vec<f32> = (0..m * g).map(|_| rng.gen_range(0.05f32..3.0)).collect();
+            let t_down3 = Tensor::from_f32_as_bf16(&ctx, &down3, &[m, r]).expect("down3");
+            let t_act3 = Tensor::zeros(&ctx, &[m, r], DType::BF16).expect("act3");
+            let t_hyper3 = Tensor::from_f32_as_bf16(&ctx, &hyper3, &[m, k]).expect("hyper3");
+            let t_rms3 = Tensor::from_f32(&ctx, &rms3, &[m, g]).expect("rms3");
+            let new3 = Tensor::zeros(&ctx, &[m, h], DType::BF16).expect("new3");
+            let was3 = Tensor::zeros(&ctx, &[m, h], DType::BF16).expect("old3");
+            let pass = ctx.begin().expect("pass");
+            silu_scaled_bf16(&ctx, &pass, &t_down3, &t_act3, 1.0 / g as f32).expect("silu");
+            hc_read_up_mix_q8_rows(
+                &ctx, &pass, &up, &t_act3, &t_hyper3, &t_norm, &t_rms3, &new3, h, g, 1.0,
+            )
+            .expect("new rows");
+            pass.dispatch_at(
+                &old3,
+                &[
+                    up.codes.binding(),
+                    up.scales.binding(),
+                    up.biases.binding(),
+                    t_act3.binding(),
+                    t_hyper3.binding(),
+                    t_norm.binding(),
+                    t_rms3.binding(),
+                    was3.binding(),
+                ],
+                &[&u32_bytes(h), &u32_bytes(r), &u32_bytes(GS), &1.0f32.to_ne_bytes()],
+                Grid::Threadgroups { groups: (h.div_ceil(8), 1, 1), threadgroup: (256, 1, 1) },
+            )
+            .expect("old rows");
+            pass.commit_wait().expect("commit");
+            let (a3, b3) = (bits(&new3), bits(&was3));
+            let n = (0..m * h).filter(|&i| a3[i] != b3[i]).count();
+            // Each row through the single-row kernel, which both must equal.
+            let one = Tensor::zeros(&ctx, &[m, h], DType::BF16).expect("one");
+            let pass = ctx.begin().expect("pass");
+            for row in 0..m {
+                hc_read_up_mix_q8(
+                    &ctx,
+                    &pass,
+                    &up,
+                    &t_down3.view(row * r, &[r]).unwrap(),
+                    &t_hyper3.view(row * k, &[k]).unwrap(),
+                    &t_norm,
+                    &t_rms3.view(row * g, &[g]).unwrap(),
+                    &one.view(row * h, &[h]).unwrap(),
+                    h,
+                    g,
+                    1.0,
+                )
+                .expect("single");
+            }
+            pass.commit_wait().expect("commit");
+            let c3 = bits(&one);
+            let (new_off, old_off) = (
+                (0..m * h).filter(|&i| a3[i] != c3[i]).count(),
+                (0..m * h).filter(|&i| b3[i] != c3[i]).count(),
+            );
+            eprintln!(
+                "trial {trial}: three rows: {n} of {} values differ between the layouts; from the single-row kernel, this layout {new_off}, the direct port {old_off}",
+                m * h
+            );
+        }
+        let diff: Vec<usize> = (0..h).filter(|&i| a[i] != b[i]).collect();
+        eprintln!(
+            "trial {trial}: {} of {h} columns differ{}",
+            diff.len(),
+            diff.first().map_or(String::new(), |&i| format!(
+                " (first: column {i}, new {:#010x} old {:#010x})",
+                a[i], b[i]
+            ))
+        );
+    }
+}
+
+/// The write-gate inject at the model's shape as decode runs it, a chain of
+/// barriered levels, for every kernel in `LILY_INJECT_KERNELS` (comma
+/// separated; default the shipped one; others come from
+/// `LILY_VK_SHADER_DIR`, with its bindings and grid): what a small kernel's
+/// parts cost. Microseconds per level, best of several passes, the order
+/// rotated. Run with `--ignored --nocapture`.
+#[test]
+#[ignore = "timing only"]
+fn inject_chain_timing() {
+    let ctx = MetalContext::new().expect("metal context");
+    let (h, g) = (2560usize, 4usize);
+    let names: Vec<&'static str> = std::env::var("LILY_INJECT_KERNELS")
+        .map(|v| v.split(',').map(|n| &*Box::leak(n.to_string().into_boxed_str())).collect())
+        .unwrap_or_else(|_| vec!["hc_inject_bf16"]);
+    let hyper = Tensor::zeros(&ctx, &[1, g * h], DType::BF16).expect("hyper");
+    let branch = Tensor::zeros(&ctx, &[1, h], DType::BF16).expect("branch");
+    let inj = Tensor::zeros(&ctx, &[1, g], DType::BF16).expect("inj");
+    let levels = 256usize;
+    let mut best = vec![f64::INFINITY; names.len()];
+    for round in 0..6 {
+        for k in 0..names.len() {
+            let which = (round + k) % names.len();
+            let pipeline = ctx.pipeline(names[which], SOURCE, MslVersion::V3_1).expect("kernel");
+            let pass = ctx.begin_concurrent().expect("pass");
+            for _ in 0..levels {
+                pass.dispatch_at(
+                    &pipeline,
+                    &[hyper.binding(), branch.binding(), inj.binding()],
+                    &[&u32_bytes(h), &u32_bytes(g), &(1.0f32 / g as f32).to_ne_bytes()],
+                    Grid::Threads { grid: (g * h, 1, 1), threadgroup: (TG, 1, 1) },
+                )
+                .expect("dispatch");
+                pass.level_barrier(&[&hyper]).expect("barrier");
+            }
+            let done = pass.commit().expect("commit").wait_retain().expect("wait");
+            let t = done.timing().expect("timing");
+            if round > 0 {
+                best[which] = best[which].min((t.gpu_end_secs - t.gpu_start_secs) / levels as f64);
+            }
+        }
+    }
+    for (name, secs) in names.iter().zip(&best) {
+        eprintln!("{name}: {:.2} us per level", secs * 1e6);
     }
 }

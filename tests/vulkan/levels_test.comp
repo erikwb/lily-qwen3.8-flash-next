@@ -1,0 +1,315 @@
+#version 460
+// Probe kernels of the tiny-level timing tests (tests/unit/kernels/
+// elementwise.rs, `tiny_level_floor_probe`): what a dispatch costs before it
+// does anything, by grid and threadgroup shape and by what its threads load.
+#include "common.glsl"
+
+// Nothing at all.
+#ifdef KERNEL_lv_nop
+void main() {}
+#endif
+
+// A guarded Grid::Threads kernel that does nothing.
+#ifdef KERNEL_lv_guard
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+}
+#endif
+
+// One word per thread (copy_u32).
+#ifdef KERNEL_lv_copy1
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    uint gid = thread_position_in_grid.x;
+    U32(arg(1)).v[gid] = U32(arg(0)).v[gid];
+}
+#endif
+
+// Four words per thread, loaded and stored as one vector.
+#ifdef KERNEL_lv_copy4
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    uint gid = thread_position_in_grid.x;
+    U32x4(arg(1)).v[gid] = U32x4(arg(0)).v[gid];
+}
+#endif
+
+// copy_u32 with four params loaded per thread and a division, as the small
+// kernels of the decode step have.
+#ifdef KERNEL_lv_copy1_params
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    uint a = arg_u32(2), b = arg_u32(3), c = arg_u32(4), d = arg_u32(5);
+    uint gid = thread_position_in_grid.x;
+    uint g = gid / a, i = gid % a;
+    U32(arg(1)).v[g * a + i] = U32(arg(0)).v[gid] + b + c + d;
+}
+#endif
+
+// ALU only: `n` rounds of eight dependent multiply-adds per thread.
+#ifdef KERNEL_lv_alu
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    uint n = arg_u32(2), gid = thread_position_in_grid.x;
+    float a = float(gid) * 1e-3, b = F32(arg(0)).v[0] + 1.0001;
+    for (uint i = 0; i < n; ++i) {
+        a = fma(a, b, 0.5);
+        a = fma(a, b, 0.25);
+        a = fma(a, b, 0.125);
+        a = fma(a, b, 0.5);
+        a = fma(a, b, 0.25);
+        a = fma(a, b, 0.125);
+        a = fma(a, b, 0.5);
+        a = fma(a, b, 0.25);
+    }
+    if (a == 12345.0) U32(arg(1)).v[gid & 1023u] = floatBitsToUint(a);
+}
+#endif
+
+// A streaming read with `rounds` rounds per thread, each issuing W
+// independent 16-byte loads before anything uses them, then `alu` rounds of
+// eight multiply-adds on what was loaded.
+#if defined(KERNEL_lv_read_w1)
+#define LV_W 1
+#elif defined(KERNEL_lv_read_w2)
+#define LV_W 2
+#elif defined(KERNEL_lv_read_w4)
+#define LV_W 4
+#elif defined(KERNEL_lv_read_w8)
+#define LV_W 8
+#endif
+#ifdef LV_W
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    U32x4 src = U32x4(arg(0));
+    uint rounds = arg_u32(2), alu = arg_u32(3), pre = arg_u32(4), fat = arg_u32(5);
+    uint gid = thread_position_in_grid.x, gsz = lily_dispatch.grid.x;
+    uvec4 acc = uvec4(0);
+    float a = 1.0;
+    // `fat` != 0: 64 more registers live across every load.
+    vec4 hold[16];
+    if (fat != 0u) {
+        [[unroll]] for (uint i = 0; i < 16; ++i) hold[i] = vec4(F32x4(arg(1)).v[i & 3u]) + float(gid + i);
+    }
+    float c = float(gid) * 1e-3;
+    for (uint r = 0; r < rounds; ++r) {
+        uint base = gid + r * LV_W * gsz;
+        uvec4 v[LV_W];
+        [[unroll]] for (uint w = 0; w < LV_W; ++w) v[w] = src.v[base + w * gsz];
+        // `pre` rounds of multiply-adds between the loads' issue and their use.
+        for (uint i = 0; i < pre; ++i) {
+            c = fma(c, 1.0001, 0.5);
+            c = fma(c, 1.0001, 0.25);
+            c = fma(c, 1.0001, 0.125);
+            c = fma(c, 1.0001, 0.5);
+            c = fma(c, 1.0001, 0.25);
+            c = fma(c, 1.0001, 0.125);
+            c = fma(c, 1.0001, 0.5);
+            c = fma(c, 1.0001, 0.25);
+        }
+        [[unroll]] for (uint w = 0; w < LV_W; ++w) acc ^= v[w];
+        float b = uintBitsToFloat((acc.x & 0xffu) | 0x3f800000u);
+        for (uint i = 0; i < alu; ++i) {
+            a = fma(a, b, 0.5);
+            a = fma(a, b, 0.25);
+            a = fma(a, b, 0.125);
+            a = fma(a, b, 0.5);
+            a = fma(a, b, 0.25);
+            a = fma(a, b, 0.125);
+            a = fma(a, b, 0.5);
+            a = fma(a, b, 0.25);
+        }
+    }
+    uint x = acc.x ^ acc.y ^ acc.z ^ acc.w;
+    if (fat != 0u) {
+        vec4 t = vec4(0.0);
+        [[unroll]] for (uint i = 0; i < 16; ++i) t += hold[i];
+        a += t.x + t.y + t.z + t.w;
+    }
+    if (x == 0x12345678u || a == 12345.0 || c == 12345.0) U32(arg(1)).v[gid & 1023u] = x;
+}
+#endif
+
+// `n` dependent rounds of one 4-byte load per thread over a region of
+// `mask + 1` words (small: cache resident), then `nb` threadgroup barriers
+// with a shared-memory round trip each.
+#ifdef KERNEL_lv_rounds
+shared float lv_sh[1024];
+void main() {
+    F32 src = F32(arg(0));
+    uint n = arg_u32(2), mask = arg_u32(3), nb = arg_u32(4), wide = arg_u32(5);
+    uint gid = gl_GlobalInvocationID.x, tid = gl_LocalInvocationIndex;
+    float acc = 0.0;
+    if (wide == 0u) {
+        for (uint r = 0; r < n; ++r) acc += src.v[(gid + r * 4099u) & mask];
+    } else {
+        // The same bytes with eight loads issued per round.
+        for (uint r = 0; r < n; r += 8) {
+            float v[8];
+            [[unroll]] for (uint j = 0; j < 8; ++j) v[j] = src.v[(gid + (r + j) * 4099u) & mask];
+            [[unroll]] for (uint j = 0; j < 8; ++j) acc += v[j];
+        }
+    }
+    for (uint b = 0; b < nb; ++b) {
+        lv_sh[tid] = acc;
+        barrier();
+        acc += lv_sh[tid ^ 1u];
+        barrier();
+    }
+    if (acc == 12345.0) U32(arg(1)).v[gid & 1023u] = floatBitsToUint(acc);
+}
+#endif
+
+// The order of the hardware reductions: out[0] = subgroupAdd(x[lane]),
+// out[1 + q] = the 4-lane clustered sum of quad q, one subgroup per row of x.
+#ifdef KERNEL_lv_reduce
+#extension GL_KHR_shader_subgroup_clustered : require
+void main() {
+    uint row = gl_WorkGroupID.x, lane = gl_SubgroupInvocationID;
+    float x = F32(arg(0)).v[row * 32 + lane];
+    float full = subgroupAdd(x);
+    float quad = subgroupClusteredAdd(x, 4);
+    F32 o = F32(arg(1));
+    if (lane == 0) o.v[row * 16] = full;
+    if ((lane & 3u) == 0u) o.v[row * 16 + 1 + (lane >> 2)] = quad;
+}
+#endif
+
+// What an instruction costs: `n` rounds of eight operations of one kind in a
+// dependent chain (lv_op_loop: the loop alone).
+#if defined(KERNEL_lv_op_loop) || defined(KERNEL_lv_op_fma) || defined(KERNEL_lv_op_add) || defined(KERNEL_lv_op_u2f) || defined(KERNEL_lv_op_bfe) || defined(KERNEL_lv_op_exp) || defined(KERNEL_lv_op_rcp) || defined(KERNEL_lv_op_bcast) || defined(KERNEL_lv_op_quad) || defined(KERNEL_lv_op_red) || defined(KERNEL_lv_op_lload) || defined(KERNEL_lv_op_dload) || defined(KERNEL_lv_op_branch) || defined(KERNEL_lv_op_rne) || defined(KERNEL_lv_op_f2u) || defined(KERNEL_lv_op_sel) || defined(KERNEL_lv_op_imul) || defined(KERNEL_lv_op_lstore) || defined(KERNEL_lv_op_xor2) || defined(KERNEL_lv_op_andx) || defined(KERNEL_lv_op_shrx) || defined(KERNEL_lv_op_bfex) || defined(KERNEL_lv_op_orx) || defined(KERNEL_lv_op_addx) || defined(KERNEL_lv_op_cvt) || defined(KERNEL_lv_op_mul) || defined(KERNEL_lv_op_magic) || defined(KERNEL_lv_op_unpack) || defined(KERNEL_lv_op_unpackm)
+#extension GL_KHR_shader_subgroup_clustered : require
+shared float lv_s[256];
+void main() {
+    uint n = arg_u32(2), gid = gl_GlobalInvocationID.x, tid = gl_LocalInvocationIndex;
+    F32 src = F32(arg(0));
+    float a = float(gid) * 1e-3 + 0.5, b = 1.0001;
+    uint u = gid * 2654435761u + n;
+    for (uint i = 0; i < n; ++i) {
+#define X8(op) op op op op op op op op
+#if defined(KERNEL_lv_op_fma)
+        X8(a = fma(a, b, 0.5);)
+#elif defined(KERNEL_lv_op_add)
+        X8(a = a + b;)
+#elif defined(KERNEL_lv_op_u2f)
+        X8(a = float(floatBitsToUint(a) & 0xFFFFu);)
+#elif defined(KERNEL_lv_op_f2u)
+        X8(u = uint(uintBitsToFloat((u & 0xFFFFu) | 0x41000000u));)
+#elif defined(KERNEL_lv_op_bfe)
+        X8(u = ((u >> 3) & 0xFFFFu) + u;)
+#elif defined(KERNEL_lv_op_imul)
+        X8(u = u * 5u + 1u;)
+#elif defined(KERNEL_lv_op_sel)
+        X8(u = u < 0x80000000u ? u + 3u : u - 5u;)
+#elif defined(KERNEL_lv_op_exp)
+        X8(a = exp(-a);)
+#elif defined(KERNEL_lv_op_rcp)
+        X8(a = 1.0 / (1.0 + a);)
+#elif defined(KERNEL_lv_op_rne)
+        X8(u = floatBitsToUint(a); a = uintBitsToFloat((u + 0x7FFFu + ((u >> 16) & 1u)) & 0xFFFF0000u) * b;)
+#elif defined(KERNEL_lv_op_bcast)
+        X8(a = subgroupBroadcast(a, 5) + b;)
+#elif defined(KERNEL_lv_op_quad)
+        X8(a = subgroupClusteredAdd(a, 4) * 0.25;)
+#elif defined(KERNEL_lv_op_red)
+        X8(a = subgroupAdd(a) * 0.03125;)
+#elif defined(KERNEL_lv_op_lload)
+        X8(a = lv_s[floatBitsToUint(a) & 255u] + b;)
+#elif defined(KERNEL_lv_op_lstore)
+        X8(lv_s[tid & 255u] = a; a += b;)
+#elif defined(KERNEL_lv_op_dload)
+        X8(a = src.v[floatBitsToUint(a) & 1023u] + b;)
+#elif defined(KERNEL_lv_op_xor2)
+        X8(u = (u ^ 0x5bd1e995u) ^ (u >> 31);)
+#elif defined(KERNEL_lv_op_andx)
+        X8(u = (u & 0x7FFFFFFFu) ^ 0x5bd1e995u; u ^= u >> 31;)
+#elif defined(KERNEL_lv_op_shrx)
+        X8(u = (u >> 1) ^ 0x5bd1e995u; u ^= u >> 31;)
+#elif defined(KERNEL_lv_op_bfex)
+        X8(u = ((u >> 8) & 0xFFu) ^ 0x5bd1e995u; u ^= u >> 31;)
+#elif defined(KERNEL_lv_op_orx)
+        X8(u = (u | 0x4B000000u) ^ 0x5bd1e995u; u ^= u >> 31;)
+#elif defined(KERNEL_lv_op_addx)
+        X8(u = (u + 12345u) ^ 0x5bd1e995u; u ^= u >> 31;)
+#elif defined(KERNEL_lv_op_cvt)
+        X8(u = floatBitsToUint(float(u)) ^ 0x5bd1e995u; u ^= u >> 31;)
+#elif defined(KERNEL_lv_op_mul)
+        X8(a = a * b; b = b * 0.999;)
+#elif defined(KERNEL_lv_op_unpack)
+        // Eight words' Q8 unpack and dot, as the quantized kernels have it.
+        X8({ vec4 q = vec4(float(u & 0xFFu), float((u >> 8) & 0xFFu), float((u >> 16) & 0xFFu), float(u >> 24)); a += dot(q, vec4(b, a, b, a)); u += 0x01020304u; })
+#elif defined(KERNEL_lv_op_unpackm)
+        // The same through the float mantissa: 2^23 + code, less 2^23.
+        X8({ vec4 q = uintBitsToFloat(uvec4(u & 0xFFu, (u >> 8) & 0xFFu, (u >> 16) & 0xFFu, u >> 24) | 0x4B000000u) - 8388608.0; a += dot(q, vec4(b, a, b, a)); u += 0x01020304u; })
+#elif defined(KERNEL_lv_op_branch)
+        X8(if (n > i + 0x40000000u) { a = a * b; } u += 1u;)
+#else
+        u += 1u;
+#endif
+    }
+    if (a == 12345.0 || u == 0x12345678u) U32(arg(1)).v[gid & 1023u] = floatBitsToUint(a) + u;
+}
+#endif
+
+// lv_op_unpack's loop with LV_FAT more registers live across it.
+#if defined(KERNEL_lv_fat0)
+#define LV_FAT 0
+#elif defined(KERNEL_lv_fat32)
+#define LV_FAT 32
+#elif defined(KERNEL_lv_fat64)
+#define LV_FAT 64
+#elif defined(KERNEL_lv_fat96)
+#define LV_FAT 96
+#endif
+#ifdef LV_FAT
+void main() {
+    uint n = arg_u32(2), gid = gl_GlobalInvocationID.x;
+    float a = float(gid) * 1e-3 + 0.5, b = 1.0001;
+    uint u = gid * 2654435761u + n;
+#if LV_FAT > 0
+    float hold[LV_FAT];
+    [[unroll]] for (uint i = 0; i < LV_FAT; ++i) hold[i] = F32(arg(0)).v[i & 3u] + float(gid + i);
+#endif
+    for (uint i = 0; i < n; ++i) {
+        [[unroll]] for (uint k = 0; k < 8; ++k) {
+            vec4 q = vec4(float(u & 0xFFu), float((u >> 8) & 0xFFu), float((u >> 16) & 0xFFu), float(u >> 24));
+            a += dot(q, vec4(b, a, b, a));
+            u += 0x01020304u;
+        }
+    }
+#if LV_FAT > 0
+    [[unroll]] for (uint i = 0; i < LV_FAT; ++i) a += hold[i];
+#endif
+    if (a == 12345.0 || u == 0x12345678u) U32(arg(1)).v[gid & 1023u] = floatBitsToUint(a) + u;
+}
+#endif
+
+// Whether threadgroup memory or a barrier in a shader changes how fast its
+// subgroups run: lv_op_unpack's loop after nothing (lv_tg_plain), after a
+// store to threadgroup memory (lv_tg_shared), and after a store and a
+// barrier (lv_tg_barrier).
+#if defined(KERNEL_lv_tg_plain) || defined(KERNEL_lv_tg_shared) || defined(KERNEL_lv_tg_barrier)
+#ifndef KERNEL_lv_tg_plain
+shared float lv_tg[1024];
+#endif
+void main() {
+    uint n = arg_u32(2), gid = gl_GlobalInvocationID.x;
+    float a = float(gid) * 1e-3 + 0.5, b = 1.0001;
+    uint u = gid * 2654435761u + n;
+#ifndef KERNEL_lv_tg_plain
+    lv_tg[gl_LocalInvocationIndex] = a;
+#endif
+#ifdef KERNEL_lv_tg_barrier
+    barrier();
+    a += lv_tg[gl_LocalInvocationIndex ^ 1u];
+#endif
+    for (uint i = 0; i < n; ++i) {
+        [[unroll]] for (uint k = 0; k < 8; ++k) {
+            vec4 q = vec4(float(u & 0xFFu), float((u >> 8) & 0xFFu), float((u >> 16) & 0xFFu), float(u >> 24));
+            a += dot(q, vec4(b, a, b, a));
+            u += 0x01020304u;
+        }
+    }
+    if (a == 12345.0 || u == 0x12345678u) U32(arg(1)).v[gid & 1023u] = floatBitsToUint(a) + u;
+}
+#endif

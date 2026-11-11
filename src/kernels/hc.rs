@@ -16,6 +16,10 @@ const HC_MAX_G: usize = 8;
 /// Output columns per threadgroup of the fused up kernel (one simdgroup each);
 /// timing is flat from 4 to 16.
 const HC_UP_COLS: usize = 8;
+/// Elements of activation (`rows * lowrank`) the fused up kernels stage in
+/// threadgroup memory on Vulkan (`UP_ACT` vec4s in hc.comp).
+#[cfg(target_os = "linux")]
+const HC_UP_ACT_MAX: usize = 4096;
 /// Rows per dispatch the fused small-batch read-gate kernels
 /// ([`hc_read_down_q8_rows`], [`hc_read_up_mix_q8_rows`]) are instantiated
 /// for (`HC_MAX_MB`): the verify pass and the draft head's catch-up rows.
@@ -182,6 +186,17 @@ pub fn fused_read_supported(
     groups: usize,
 ) -> bool {
     let q8 = |w: &QuantWeights| w.bits == 8 && w.group_size.is_multiple_of(16);
+    // The Vulkan kernels' layout (hc.comp) takes less: quant groups of a
+    // power of two, a low rank its quads tile and its staging holds.
+    #[cfg(target_os = "linux")]
+    let q8 = |w: &QuantWeights| q8(w) && w.group_size.is_power_of_two();
+    #[cfg(target_os = "linux")]
+    if !up.in_features().is_multiple_of(64)
+        || up.in_features() > 512
+        || HC_FUSED_MAX_ROWS * up.in_features() > HC_UP_ACT_MAX
+    {
+        return false;
+    }
     (1..=HC_MAX_G).contains(&groups)
         && h.is_multiple_of(16)
         && q8(down)
@@ -537,18 +552,58 @@ fn dispatch_read_up_mix(
     }
     params.push(&wb_b);
     let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
+    let buffers = [
+        up.codes.binding(),
+        up.scales.binding(),
+        up.biases.binding(),
+        down.binding(),
+        hyper.binding(),
+        w.binding(),
+        inv_rms.binding(),
+        mixed.binding(),
+    ];
+    // Vulkan (hc.comp): a subgroup's eight quads are the weight rows of
+    // `8 / groups` columns, a threadgroup stages the activation for its
+    // eight subgroups; the params are one struct.
+    #[cfg(target_os = "linux")]
+    {
+        let gs = up.group_size;
+        ensure!(gs.is_power_of_two(), "quant group {gs} is not a power of two");
+        ensure!(
+            r.is_multiple_of(64) && r <= 512,
+            "low rank {r} is not a multiple of 64 up to 512"
+        );
+        ensure!(
+            rows * r <= HC_UP_ACT_MAX,
+            "{rows} rows of low rank {r} exceed the staged activation ({HC_UP_ACT_MAX})"
+        );
+        let bshift = (gs / 16).trailing_zeros() as usize;
+        let words: [[u8; 4]; 8] = [
+            u32_bytes(h),
+            u32_bytes(r),
+            u32_bytes(bshift),
+            u32_bytes(r / gs),
+            wb_b,
+            ig_b,
+            u32_bytes(0),
+            u32_bytes(0),
+        ];
+        let _ = (&params, with_inv_g);
+        let cols = HC_UP_COLS * (8 / groups);
+        return pass.dispatch_at(
+            &pipeline,
+            &buffers,
+            &[words.as_flattened()],
+            Grid::Threadgroups {
+                groups: (h.div_ceil(cols), 1, 1),
+                threadgroup: (HC_UP_COLS * 32, 1, 1),
+            },
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
     pass.dispatch_at(
         &pipeline,
-        &[
-            up.codes.binding(),
-            up.scales.binding(),
-            up.biases.binding(),
-            down.binding(),
-            hyper.binding(),
-            w.binding(),
-            inv_rms.binding(),
-            mixed.binding(),
-        ],
+        &buffers,
         &params,
         Grid::Threadgroups {
             groups: (h.div_ceil(HC_UP_COLS), 1, 1),
