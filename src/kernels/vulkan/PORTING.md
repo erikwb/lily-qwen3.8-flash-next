@@ -160,7 +160,7 @@ Things this driver and compiler do that a plain translation trips over:
 ## What is fast on this compiler and GPU
 
 Measured while tuning the kernels (2026-11-10 and 11, M5 Max); the Mesa
-branch `ewb/lily-compiler` removes some of these costs, the daily Mesa has
+branch `ewb/lily-mesa` removes some of these costs, the daily Mesa has
 all of them.
 
 - **Loads are the unit of cost.** A load from cache costs about what five
@@ -185,13 +185,26 @@ all of them.
   shuffle costs about twenty adds. `subgroupAdd` is one instruction and adds
   as a pairwise tree over adjacent lanes (tests pin it: kernels rely on it
   for bit-identical sums).
-- **Loops** with constant trip counts unroll; an iteration left as a loop
-  costs about six adds of overhead. A division by a non-constant is about
-  twenty instructions: make the divisor a power of two and shift.
-- **Dispatches on one level do not overlap** on this driver: three cost the
-  sum of each alone, where Metal runs them side by side. Fuse independent
-  same-level work into one dispatch (`gemv_quant_sets`). A tiny level costs
-  2 to 4 us, a barrier about 0.35 us.
+- **Loops.** Put `[[unroll]]` or `[[dont_unroll]]` on every hot loop whose
+  bound the compiler can see. Left alone, a loop of at most 32 trips with
+  trips times body under about 830 instructions is unrolled, and when the
+  bound is not a constant the copies are a nest of guarded blocks that ran
+  slower than the loop (the small-m MoE down kernel: 35 us against 28). An
+  iteration left as a loop costs about six adds of overhead. A division by
+  a non-constant is about twenty instructions: make the divisor a power of
+  two and shift.
+- **A load waits for every line its lanes touch**: do not point idle lanes
+  at other lines to read ahead. Work that follows a streaming pass from
+  cache is not hidden under it either.
+- **Dispatches with no barrier between them run side by side** on the
+  combined Mesa (`ewb/lily-mesa`; one after another on the daily Mesa).
+  Independent same-level work is cheapest as separate dispatches when the
+  weights are small (the router level: 13.4 us as three against 14.6
+  fused) and fused when they are large (the attention level: 71.7 fused
+  against 78.9). A small dispatch beside a large one still costs about
+  half its lone time; a tiny level costs 2.5 to 3 us, a barrier about
+  0.35 us. A kernel with more than 512 bytes of per-thread scratch keeps
+  its barriers and runs alone.
 - **The matrix lane layout** (`mat_a_col` and friends in matmul.glsl) is
   shared with Mesa's lowering: a change must land in both.
 - **`fma()`** may be split by the compiler; a `precise dot()` is an in-order
