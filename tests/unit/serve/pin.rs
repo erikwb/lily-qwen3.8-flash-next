@@ -178,8 +178,10 @@ fn user_wired_count(address: usize) -> u16 {
 
 /// Linux: 1 while the mapping that holds `address` is `mlock`ed (its
 /// `VmFlags` in `/proc/self/smaps` carry `lo`, `VM_LOCKED`), 0 otherwise.
-/// Linux keeps no count, only the flag on the whole mapping.
+/// Linux keeps no count, only the flag on the whole mapping. Not what the
+/// pin does there (see `wired`); kept for the host memory of other tests.
 #[cfg(target_os = "linux")]
+#[allow(dead_code)]
 fn user_wired_count(address: usize) -> u16 {
     let smaps = std::fs::read_to_string("/proc/self/smaps").expect("smaps");
     let mut inside = false;
@@ -213,11 +215,19 @@ fn buffers(ctx: &MetalContext) -> Vec<Buffer> {
         .collect()
 }
 
+#[cfg(target_os = "macos")]
 fn wired(buffers: &[Buffer]) -> Vec<bool> {
     buffers
         .iter()
         .map(|b| user_wired_count(b.contents().as_ptr() as usize) > 0)
         .collect()
+}
+
+/// Linux: whether each buffer's GPU memory is kept resident (memory
+/// priority 1.0), which is how the pin wires it there.
+#[cfg(target_os = "linux")]
+fn wired(buffers: &[Buffer]) -> Vec<bool> {
+    buffers.iter().map(|b| b.kept_resident()).collect()
 }
 
 static PRESSURE: AtomicU32 = AtomicU32::new(1);
@@ -330,7 +340,13 @@ fn the_pin_keeps_its_buffers_alive_and_unlocks_before_releasing_them() {
     // The engine drops its model (the other handles) while the pin lives:
     // the memory stays allocated, and locked.
     assert!(handles.iter().all(|h| h.upgrade().is_some()));
+    #[cfg(target_os = "macos")]
     assert!(user_wired_count(first) > 0);
+    #[cfg(target_os = "linux")]
+    {
+        let _ = first;
+        assert!(handles[0].upgrade().is_some_and(|b| b.kept_resident()));
+    }
     // Dropping the pin unlocks first, then frees.
     drop(pin);
     assert!(
@@ -467,7 +483,7 @@ fn warning_waits_for_the_requests_in_flight_and_anything_above_it_does_not() {
 /// machine without Metal or `mlock`.
 fn pinned_state(in_flight: usize) -> State {
     State {
-        ranges: Vec::new(),
+        locks: Locks::default(),
         pinned: true,
         mirror: Arc::new(AtomicBool::new(true)),
         stop: false,
@@ -557,8 +573,11 @@ fn a_failed_lock_unlocks_what_it_locked_and_waits_for_the_next_period() {
     let mut pin = WeightPin::new(bufs.clone(), PinDecision::Pin, 60, normal_pressure)
         .expect("pin");
     // A last range that cannot be locked: an address nothing maps.
-    let bogus = (8usize << 40, 1usize << 20);
-    pin.shared.lock().ranges.push(bogus);
+    #[cfg(not(target_os = "linux"))]
+    pin.shared.lock().locks.push((8usize << 40, 1usize << 20));
+    // Linux: as on a device that cannot keep memory resident.
+    #[cfg(target_os = "linux")]
+    let residencies = pin.shared.lock().locks.take();
     let t0 = Instant::now();
     assert!(!pin.before_request(t0).pinned(), "the lock failed");
     assert_eq!(
@@ -569,7 +588,12 @@ fn a_failed_lock_unlocks_what_it_locked_and_waits_for_the_next_period() {
     pin.after_request(t0);
     assert_eq!(pin.keep_warm_remaining(t0), None, "unpinned: no keep-alive");
     // Not retried within the period...
-    pin.shared.lock().ranges.pop();
+    #[cfg(not(target_os = "linux"))]
+    pin.shared.lock().locks.pop();
+    #[cfg(target_os = "linux")]
+    {
+        pin.shared.lock().locks = residencies;
+    }
     assert!(!pin.before_request(t0 + Duration::from_secs(30)).pinned());
     pin.after_request(t0 + Duration::from_secs(30));
     // ...but at the next one.
@@ -600,4 +624,44 @@ fn the_hold_is_read_at_each_use_from_the_runtime_settings_handle() {
     assert_eq!(pin.hold(), None, "0 holds until pressure or the unload");
     hold.store(90, Ordering::Release);
     assert_eq!(pin.hold(), Some(Duration::from_secs(90)));
+}
+
+/// The device total of memory the GPU driver keeps resident at userspace's
+/// request (`user_kept` in its `gpu_memory` sysfs file), where the kernel
+/// reports one.
+#[cfg(target_os = "linux")]
+fn kernel_kept_bytes() -> Option<u64> {
+    for entry in std::fs::read_dir("/sys/class/drm").ok()?.flatten() {
+        if let Ok(text) = std::fs::read_to_string(entry.path().join("device/gpu_memory")) {
+            return text
+                .lines()
+                .find_map(|line| line.strip_prefix("user_kept "))
+                .and_then(|value| value.trim().parse().ok());
+        }
+    }
+    None
+}
+
+/// Linux: the kernel, not only the pin's bookkeeping, keeps the pinned
+/// buffers resident while the pin holds, and lets them go at its release.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_kernel_keeps_pinned_memory_resident() {
+    let _serial = serial();
+    let ctx = MetalContext::new().expect("metal");
+    if !ctx.can_keep_resident() {
+        eprintln!("skipped: the Vulkan device cannot keep memory resident");
+        return;
+    }
+    let bufs = buffers(&ctx);
+    let payload: u64 = bufs.iter().map(|b| b.length() as u64).sum();
+    let before = kernel_kept_bytes().expect("gpu_memory reports user_kept");
+    let mut pin =
+        WeightPin::new(bufs.clone(), PinDecision::Pin, 60, normal_pressure).expect("pin");
+    assert!(pin.before_request(Instant::now()).pinned());
+    let pinned = kernel_kept_bytes().expect("user_kept");
+    assert!(pinned >= before + payload, "{before} -> {pinned} with {payload} pinned");
+    drop(pin);
+    let after = kernel_kept_bytes().expect("user_kept");
+    assert!(after + payload <= pinned, "{pinned} -> {after} after the release");
 }

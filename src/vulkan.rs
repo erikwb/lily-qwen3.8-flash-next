@@ -32,9 +32,11 @@
 //! - **GPU time** is the host's: a pass's span runs from its first
 //!   submission, or the end of the pass before it, to the completion the
 //!   watcher saw. The per-kernel profile submits and waits for each dispatch
-//!   alone, which adds a job's fixed cost (some 150 us, against kernels of
-//!   10 to 100) to each: a profiling context measures that cost on a trivial
-//!   dispatch when it is made and takes it off every sample
+//!   alone and times it with GPU timestamps written around its dispatch
+//!   ([`ProfileStamps`]), so a job's fixed cost (some 150 us, against kernels
+//!   of 10 to 100) is not in the sample. On a device without timestamps it
+//!   takes host time around each dispatch instead, less that cost as a
+//!   trivial dispatch measures it when the context is made
 //!   ([`MetalContext::calibrate_profile`]).
 
 use std::cell::{Cell, RefCell};
@@ -151,6 +153,7 @@ const COOPERATIVE_MATRIX_EXTENSION: &CStr = c"VK_KHR_cooperative_matrix";
 struct Dev {
     _entry: ash::Entry,
     instance: ash::Instance,
+    physical: vk::PhysicalDevice,
     device: ash::Device,
     queue: vk::Queue,
     queue_family: u32,
@@ -163,6 +166,20 @@ struct Dev {
     pipelines: Mutex<HashMap<(&'static str, [u32; 3]), vk::Pipeline>>,
     allocated: AtomicUsize,
     allocations: AtomicUsize,
+    /// VK_EXT_external_memory_host, when the device has it: buffers over host
+    /// memory, without a copy.
+    host_import: Option<HostImport>,
+    /// VK_EXT_pageable_device_local_memory, when the device has it: memory
+    /// priority 1.0 keeps a buffer's memory resident.
+    priority: Option<ash::ext::pageable_device_local_memory::Device>,
+}
+
+/// How the device imports host memory.
+struct HostImport {
+    fns: ash::ext::external_memory_host::Device,
+    /// `minImportedHostPointerAlignment`: the address and size of host memory
+    /// a buffer is made over are multiples of it.
+    alignment: usize,
 }
 
 // SAFETY: Vulkan handles are plain values; the queue is used by the
@@ -238,6 +255,17 @@ impl Dev {
                 shader_bfloat16_dot_product: 0,
                 shader_bfloat16_cooperative_matrix: 0,
             };
+            // Memory priorities, when the driver can keep memory resident:
+            // chained after bfloat while queried, and kept there (enabled)
+            // only when both features are there.
+            let can_prioritize = has(ash::ext::memory_priority::NAME)
+                && has(ash::ext::pageable_device_local_memory::NAME);
+            let mut pageable = vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT::default();
+            let mut priority = vk::PhysicalDeviceMemoryPriorityFeaturesEXT::default();
+            if can_prioritize {
+                priority.p_next = (&raw mut pageable).cast();
+                bfloat.p_next = (&raw mut priority).cast();
+            }
             let mut cooperative = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default();
             cooperative.p_next = (&raw mut bfloat).cast();
             let mut v13 = vk::PhysicalDeviceVulkan13Features::default();
@@ -262,11 +290,25 @@ impl Dev {
             features.features = vk::PhysicalDeviceFeatures::default()
                 .shader_int64(true)
                 .shader_int16(true);
+            let prioritize = can_prioritize
+                && priority.memory_priority == vk::TRUE
+                && pageable.pageable_device_local_memory == vk::TRUE;
+            if !prioritize {
+                bfloat.p_next = std::ptr::null_mut();
+            }
+            let import = has(ash::ext::external_memory_host::NAME);
 
             let queues = [vk::DeviceQueueCreateInfo::default()
                 .queue_family_index(queue_family)
                 .queue_priorities(&[1.0])];
-            let names = [COOPERATIVE_MATRIX_EXTENSION.as_ptr(), BFLOAT16_EXTENSION.as_ptr()];
+            let mut names = vec![COOPERATIVE_MATRIX_EXTENSION.as_ptr(), BFLOAT16_EXTENSION.as_ptr()];
+            if prioritize {
+                names.push(ash::ext::memory_priority::NAME.as_ptr());
+                names.push(ash::ext::pageable_device_local_memory::NAME.as_ptr());
+            }
+            if import {
+                names.push(ash::ext::external_memory_host::NAME.as_ptr());
+            }
             let mut info = vk::DeviceCreateInfo::default()
                 .queue_create_infos(&queues)
                 .enabled_extension_names(&names);
@@ -301,9 +343,25 @@ impl Dev {
             let heap = memory.memory_types[memory_type as usize].heap_index;
             let heap_bytes = memory.memory_heaps[heap as usize].size;
 
+            let host_import = if import {
+                let mut host = vk::PhysicalDeviceExternalMemoryHostPropertiesEXT::default();
+                let mut properties = vk::PhysicalDeviceProperties2::default().push_next(&mut host);
+                instance.get_physical_device_properties2(physical, &mut properties);
+                Some(HostImport {
+                    fns: ash::ext::external_memory_host::Device::new(&instance, &device),
+                    alignment: usize::try_from(host.min_imported_host_pointer_alignment)?
+                        .max(1),
+                })
+            } else {
+                None
+            };
+            let priority = prioritize
+                .then(|| ash::ext::pageable_device_local_memory::Device::new(&instance, &device));
+
             Ok(Arc::new(Self {
                 _entry: entry,
                 instance,
+                physical,
                 device,
                 queue,
                 queue_family,
@@ -315,6 +373,8 @@ impl Dev {
                 pipelines: Mutex::new(HashMap::new()),
                 allocated: AtomicUsize::new(0),
                 allocations: AtomicUsize::new(0),
+                host_import,
+                priority,
             }))
         }
     }
@@ -461,7 +521,183 @@ impl Dev {
                 len,
                 reserved: requirements.size as usize,
                 address,
+                file: None,
+                kept: Arc::new(AtomicBool::new(false)),
             }))
+        }
+    }
+
+    /// A buffer over the `len` bytes of host memory at `ptr`, which the GPU
+    /// then reads and writes in place (VK_EXT_external_memory_host). `ptr`
+    /// must be aligned to the import alignment; the buffer covers whole
+    /// alignment units, so the memory up to the next one must be the
+    /// caller's too. `file`, a mapping of a file, is unmapped when the buffer
+    /// is dropped.
+    ///
+    /// # Safety
+    ///
+    /// The memory stays allocated and mapped while the buffer lives.
+    unsafe fn import_host(
+        self: &Arc<Self>,
+        ptr: NonNull<c_void>,
+        len: usize,
+        file: Option<FileMapping>,
+    ) -> Result<Buffer> {
+        let host = self
+            .host_import
+            .as_ref()
+            .ok_or_else(|| anyhow!("the Vulkan device cannot import host memory"))?;
+        ensure!(len > 0, "a buffer over zero bytes of host memory");
+        ensure!(
+            ptr.as_ptr() as usize % host.alignment == 0,
+            "host memory at {:p} is not aligned to {} bytes",
+            ptr.as_ptr(),
+            host.alignment
+        );
+        let size = len.next_multiple_of(host.alignment) as u64;
+        let handle = vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT;
+        // SAFETY: plain Vulkan calls; every failure path frees what it made.
+        unsafe {
+            let mut pointer = vk::MemoryHostPointerPropertiesEXT::default();
+            (host.fns.fp().get_memory_host_pointer_properties_ext)(
+                self.device.handle(),
+                handle,
+                ptr.as_ptr(),
+                &mut pointer,
+            )
+            .result()
+            .context("querying the memory types of host memory")?;
+            let mut external = vk::ExternalMemoryBufferCreateInfo::default().handle_types(handle);
+            let buffer = self.device.create_buffer(
+                &vk::BufferCreateInfo::default()
+                    .size(size)
+                    .usage(
+                        vk::BufferUsageFlags::STORAGE_BUFFER
+                            | vk::BufferUsageFlags::TRANSFER_SRC
+                            | vk::BufferUsageFlags::TRANSFER_DST
+                            | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                    )
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                    .push_next(&mut external),
+                None,
+            )?;
+            let requirements = self.device.get_buffer_memory_requirements(buffer);
+            let types = pointer.memory_type_bits & requirements.memory_type_bits;
+            if types == 0 || requirements.size > size {
+                self.device.destroy_buffer(buffer, None);
+                bail!(
+                    "no memory type for a {size}-byte buffer over host memory \
+                     (host types {:#x}, buffer types {:#x}, {} bytes needed)",
+                    pointer.memory_type_bits,
+                    requirements.memory_type_bits,
+                    requirements.size
+                );
+            }
+            let mut flags = vk::MemoryAllocateFlagsInfo::default()
+                .flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+            let mut import = vk::ImportMemoryHostPointerInfoEXT::default()
+                .handle_type(handle)
+                .host_pointer(ptr.as_ptr());
+            let memory = match self.device.allocate_memory(
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(size)
+                    .memory_type_index(types.trailing_zeros())
+                    .push_next(&mut flags)
+                    .push_next(&mut import),
+                None,
+            ) {
+                Ok(memory) => memory,
+                Err(e) => {
+                    self.device.destroy_buffer(buffer, None);
+                    bail!("failed to import {size} bytes of host memory at {:p}: {e}", ptr.as_ptr());
+                }
+            };
+            if let Err(e) = self.device.bind_buffer_memory(buffer, memory, 0) {
+                self.device.destroy_buffer(buffer, None);
+                self.device.free_memory(memory, None);
+                bail!("failed to bind a buffer over host memory: {e}");
+            }
+            let address = self.device.get_buffer_device_address(
+                &vk::BufferDeviceAddressInfo::default().buffer(buffer),
+            );
+            self.allocated.fetch_add(size as usize, Ordering::Relaxed);
+            self.allocations.fetch_add(1, Ordering::Relaxed);
+            Ok(Rc::new(GpuBuffer {
+                dev: self.clone(),
+                buffer,
+                memory,
+                ptr,
+                len,
+                reserved: size as usize,
+                address,
+                file,
+                kept: Arc::new(AtomicBool::new(false)),
+            }))
+        }
+    }
+}
+
+/// A read-only shared mapping of part of a file, which a buffer over it
+/// unmaps when it is dropped.
+struct FileMapping {
+    ptr: NonNull<c_void>,
+    len: usize,
+}
+
+impl FileMapping {
+    /// Maps `len` bytes of `file` at `offset`, both multiples of the page
+    /// size, and all of them inside the file.
+    fn new(file: &std::fs::File, offset: u64, len: usize) -> Result<Self> {
+        use std::os::fd::AsRawFd;
+        let end = offset.checked_add(len as u64).ok_or_else(|| anyhow!("mapping past 2^64"))?;
+        ensure!(end <= file.metadata()?.len(), "mapping past the end of the file");
+        // SAFETY: a new mapping the kernel places; checked below.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                libc::off_t::try_from(offset)?,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            bail!("mmap of {len} bytes: {}", std::io::Error::last_os_error());
+        }
+        Ok(Self { ptr: NonNull::new(ptr).ok_or_else(|| anyhow!("mmap at 0"))?, len })
+    }
+}
+
+impl Drop for FileMapping {
+    fn drop(&mut self) {
+        // SAFETY: the mapping made in `new`, which nothing uses any more.
+        unsafe { libc::munmap(self.ptr.as_ptr(), self.len) };
+    }
+}
+
+/// Keeps a buffer's memory resident or lets the driver reclaim it again
+/// (memory priority 1.0 or the default 0.5), from any thread: the pin's
+/// monitor thread releases through it. The buffer it was taken from must
+/// outlive it.
+pub struct Residency {
+    dev: Arc<Dev>,
+    memory: vk::DeviceMemory,
+    kept: Arc<AtomicBool>,
+}
+
+impl Residency {
+    pub fn keep(&self, keep: bool) {
+        if let Some(priority) = &self.dev.priority {
+            // SAFETY: memory of the live buffer this was taken from.
+            unsafe {
+                (priority.fp().set_device_memory_priority_ext)(
+                    self.dev.device.handle(),
+                    self.memory,
+                    if keep { 1.0 } else { 0.5 },
+                )
+            };
+            self.kept.store(keep, Ordering::Release);
         }
     }
 }
@@ -474,6 +710,10 @@ pub struct GpuBuffer {
     len: usize,
     reserved: usize,
     address: u64,
+    /// The file mapping the buffer is made over, unmapped after it.
+    file: Option<FileMapping>,
+    /// Whether [`Residency::keep`] last kept the memory resident.
+    kept: Arc<AtomicBool>,
 }
 
 impl GpuBuffer {
@@ -491,6 +731,22 @@ impl GpuBuffer {
     pub fn length(&self) -> usize {
         self.len
     }
+
+    /// The handle that keeps this buffer's memory resident, when the device
+    /// can (VK_EXT_pageable_device_local_memory).
+    pub fn residency(&self) -> Option<Residency> {
+        self.dev.priority.as_ref()?;
+        Some(Residency {
+            dev: self.dev.clone(),
+            memory: self.memory,
+            kept: self.kept.clone(),
+        })
+    }
+
+    /// Whether the memory is kept resident ([`Residency::keep`]).
+    pub fn kept_resident(&self) -> bool {
+        self.kept.load(Ordering::Acquire)
+    }
 }
 
 impl Drop for GpuBuffer {
@@ -501,6 +757,8 @@ impl Drop for GpuBuffer {
             self.dev.device.destroy_buffer(self.buffer, None);
             self.dev.device.free_memory(self.memory, None);
         }
+        // A file mapping goes after the memory made over it.
+        self.file = None;
         self.dev.allocated.fetch_sub(self.reserved, Ordering::Relaxed);
         self.dev.allocations.fetch_sub(1, Ordering::Relaxed);
     }
@@ -689,8 +947,72 @@ const GATE_SPIN: Duration = Duration::from_micros(200);
 const GATE_PATIENCE: Duration = Duration::from_secs(30);
 
 /// What one dispatch submitted and waited for alone costs beside its
-/// kernel, in nanoseconds: taken off every profile sample.
+/// kernel, in nanoseconds: taken off every host-timed profile sample.
 static PROFILE_FLOOR_NS: AtomicU64 = AtomicU64::new(0);
+
+/// The two timestamps of the per-kernel profile: a profiled command buffer
+/// writes query 0 before its dispatch and query 1 after it, and the
+/// submitter, which runs it alone, reads them once it completed and resets
+/// them for the next.
+#[derive(Clone, Copy)]
+struct ProfileStamps {
+    pool: vk::QueryPool,
+    /// Nanoseconds per timestamp tick (`timestampPeriod`).
+    period_ns: f64,
+    /// The bits of a timestamp the queue writes (`timestampValidBits`).
+    mask: u64,
+}
+
+impl ProfileStamps {
+    /// The pool, if the queue writes timestamps.
+    fn new(dev: &Dev) -> Result<Option<Self>> {
+        // SAFETY: valid handles.
+        let (period_ns, bits) = unsafe {
+            let physical = dev.physical;
+            let properties = dev.instance.get_physical_device_properties(physical);
+            let families = dev.instance.get_physical_device_queue_family_properties(physical);
+            (
+                f64::from(properties.limits.timestamp_period),
+                families[dev.queue_family as usize].timestamp_valid_bits,
+            )
+        };
+        if bits == 0 || period_ns <= 0.0 {
+            return Ok(None);
+        }
+        // SAFETY: a valid device; host query reset is core in Vulkan 1.2.
+        let pool = unsafe {
+            let pool = dev.device.create_query_pool(
+                &vk::QueryPoolCreateInfo::default()
+                    .query_type(vk::QueryType::TIMESTAMP)
+                    .query_count(2),
+                None,
+            )?;
+            dev.device.reset_query_pool(pool, 0, 2);
+            pool
+        };
+        let mask = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
+        Ok(Some(Self { pool, period_ns, mask }))
+    }
+
+    /// The seconds between the two timestamps of the command buffer that
+    /// just completed; resets them for the next.
+    fn take(&self, device: &ash::Device) -> Result<f64> {
+        let mut stamps = [0u64; 2];
+        // SAFETY: the command buffer that wrote them has completed; nothing
+        // else uses the queries until they are reset here.
+        unsafe {
+            device.get_query_pool_results(
+                self.pool,
+                0,
+                &mut stamps,
+                vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+            )?;
+            device.reset_query_pool(self.pool, 0, 2);
+        }
+        let ticks = (stamps[1] & self.mask).wrapping_sub(stamps[0] & self.mask) & self.mask;
+        Ok(ticks as f64 * self.period_ns * 1e-9)
+    }
+}
 
 struct Submitter {
     dev: Arc<Dev>,
@@ -699,6 +1021,8 @@ struct Submitter {
     completions: Sender<Completion>,
     window: u64,
     profile: bool,
+    /// Profile mode: the timestamps around each dispatch, if the device has them.
+    stamps: Option<ProfileStamps>,
     serial: u64,
 }
 
@@ -720,11 +1044,21 @@ impl Submitter {
                             self.fault.record(format!("{e:#}"));
                         } else if self.profile {
                             self.wait_completed(self.serial);
-                            let floor = PROFILE_FLOOR_NS.load(Ordering::Relaxed) as f64 * 1e-9;
-                            kernels.push(profile::KernelSample {
-                                name,
-                                gpu_secs: (host_secs() - at - floor).max(0.0),
-                            });
+                            let gpu_secs = match &self.stamps {
+                                Some(stamps) => match stamps.take(&self.dev.device) {
+                                    Ok(secs) => secs,
+                                    Err(e) => {
+                                        self.fault.record(format!("profile timestamps: {e:#}"));
+                                        0.0
+                                    }
+                                },
+                                None => {
+                                    let floor =
+                                        PROFILE_FLOOR_NS.load(Ordering::Relaxed) as f64 * 1e-9;
+                                    (host_secs() - at - floor).max(0.0)
+                                }
+                            };
+                            kernels.push(profile::KernelSample { name, gpu_secs });
                         }
                     }
                     Item::Wait(event, value) => self.gate(event, *value),
@@ -868,6 +1202,8 @@ pub struct MetalContext {
     built: AtomicU64,
     build_nanos: AtomicU64,
     profile: bool,
+    /// Profile mode: the timestamps around each dispatch ([`ProfileStamps`]).
+    stamps: Option<ProfileStamps>,
     batch: (usize, usize),
     recorded: RefCell<Option<Vec<Weak<GpuBuffer>>>>,
 }
@@ -879,6 +1215,10 @@ impl Drop for MetalContext {
         self.work = None;
         for thread in self.threads.drain(..) {
             let _ = thread.join();
+        }
+        if let Some(stamps) = self.stamps.take() {
+            // SAFETY: the submitter, its last user, has ended.
+            unsafe { self.dev.device.destroy_query_pool(stamps.pool, None) };
         }
     }
 }
@@ -895,6 +1235,7 @@ impl MetalContext {
     /// Like [`Self::new`], with the per-kernel profile mode chosen explicitly.
     pub fn new_with_profile(profile: bool) -> Result<Self> {
         let dev = Dev::new()?;
+        let stamps = if profile { ProfileStamps::new(&dev)? } else { None };
         let fault = Arc::new(Fault::default());
         let fence = SharedEvent::new();
         let (work, submissions) = channel();
@@ -906,6 +1247,7 @@ impl MetalContext {
             completions,
             window: env_usize("LILY_VK_WINDOW").map_or(WINDOW, |v| v as u64),
             profile,
+            stamps,
             serial: 0,
         };
         let threads = vec![
@@ -932,10 +1274,11 @@ impl MetalContext {
             built: AtomicU64::new(0),
             build_nanos: AtomicU64::new(0),
             profile,
+            stamps,
             batch,
             recorded: RefCell::new(None),
         };
-        if profile {
+        if profile && stamps.is_none() {
             ctx.calibrate_profile()?;
         }
         Ok(ctx)
@@ -1024,11 +1367,14 @@ impl MetalContext {
         Ok(BufferRecording { ctx: self })
     }
 
-    /// A buffer holding `len` bytes of `path` at `offset`. Metal maps the
-    /// file's pages; Vulkan has no buffer over host pages here, so this
-    /// reads them: the buffer is anonymous memory the OS cannot drop. As on
-    /// Metal the buffer starts at the page boundary at or below `offset`,
-    /// and the second value is the requested range's offset inside it.
+    /// A buffer holding `len` bytes of `path` at `offset`. As on Metal the
+    /// buffer starts at the page boundary at or below `offset`, and the
+    /// second value is the requested range's offset inside it. With
+    /// VK_EXT_external_memory_host the buffer is a read-only mapping of the
+    /// file: the GPU reads the page cache itself, which the driver holds
+    /// while the buffer lives. Without it, or when the mapped range would
+    /// pass the end of the file (the import takes whole pages of the
+    /// device's alignment), this reads the bytes into anonymous memory.
     pub fn new_buffer_mapped(
         &self,
         path: &std::path::Path,
@@ -1037,13 +1383,31 @@ impl MetalContext {
     ) -> Result<(Buffer, usize)> {
         use std::os::unix::fs::FileExt;
         ensure!(len > 0, "mapped buffer of zero bytes");
+        let file = std::fs::File::open(path)
+            .with_context(|| format!("opening {} for mapping", path.display()))?;
+        if let Some(host) = &self.dev.host_import {
+            // SAFETY: sysconf has no preconditions.
+            let page = (unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize).max(host.alignment);
+            let base = offset - offset % page as u64;
+            let inner = usize::try_from(offset - base)?;
+            let mapped = FileMapping::new(&file, base, (inner + len).next_multiple_of(page))
+                .and_then(|mapping| {
+                    // SAFETY: the buffer owns the mapping it is made over.
+                    unsafe { self.dev.import_host(mapping.ptr, inner + len, Some(mapping)) }
+                });
+            match mapped {
+                Ok(buf) => return Ok((buf, inner)),
+                Err(e) if std::env::var_os("LILY_TRACE_MAPPED").is_some() => {
+                    eprintln!("mapped buffer of {}: reading instead: {e:#}", path.display());
+                }
+                Err(_) => {}
+            }
+        }
         // SAFETY: sysconf has no preconditions.
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
         let base = offset - offset % page;
         let inner = usize::try_from(offset - base)?;
         let buf = self.dev.new_buffer(inner + len, false)?;
-        let file = std::fs::File::open(path)
-            .with_context(|| format!("opening {} for mapping", path.display()))?;
         // SAFETY: the buffer was just allocated with `inner + len` bytes.
         let bytes = unsafe {
             core::slice::from_raw_parts_mut(buf.contents().as_ptr().cast::<u8>(), inner + len)
@@ -1053,18 +1417,29 @@ impl MetalContext {
         Ok((buf, inner))
     }
 
-    /// A buffer over host memory the caller keeps. Vulkan cannot wrap host
-    /// pages here; nothing on a machine that holds the whole model needs it.
+    /// A buffer over host memory the caller keeps, which the GPU reads and
+    /// writes in place: VK_EXT_external_memory_host, where the device has it
+    /// (`ptr` aligned to its import alignment, the page size here, and the
+    /// memory up to the next multiple of it the caller's). Without it this
+    /// fails, as before.
     ///
     /// # Safety
     ///
     /// As on Metal.
-    pub unsafe fn new_buffer_no_copy(
-        &self,
-        _ptr: NonNull<c_void>,
-        _len: usize,
-    ) -> Result<Buffer> {
-        bail!("the Vulkan backend has no buffers over host memory (the expert cache needs them)")
+    pub unsafe fn new_buffer_no_copy(&self, ptr: NonNull<c_void>, len: usize) -> Result<Buffer> {
+        if self.dev.host_import.is_none() {
+            bail!(
+                "the Vulkan device has no buffers over host memory \
+                 (VK_EXT_external_memory_host; the expert cache needs them)"
+            );
+        }
+        // SAFETY: the caller keeps the memory, as on Metal.
+        unsafe { self.dev.import_host(ptr, len, None) }
+    }
+
+    /// Whether buffers can be kept resident ([`GpuBuffer::residency`]).
+    pub fn can_keep_resident(&self) -> bool {
+        self.dev.priority.is_some()
     }
 
     pub fn new_buffer_with_bytes(&self, bytes: &[u8]) -> Result<Buffer> {
@@ -1494,8 +1869,20 @@ impl<'a> ComputePass<'a> {
         let mut slot = self.slot.borrow_mut();
         let inner = slot.get();
         if open.is_none() {
+            let cmd = inner.begin()?;
+            if let Some(stamps) = &self.ctx.stamps {
+                // SAFETY: the command buffer is recording.
+                unsafe {
+                    self.ctx.dev.device.cmd_write_timestamp(
+                        cmd,
+                        vk::PipelineStageFlags::TOP_OF_PIPE,
+                        stamps.pool,
+                        0,
+                    )
+                };
+            }
             *open = Some(OpenSegment {
-                cmd: inner.begin()?,
+                cmd,
                 dispatches: 0,
                 bound: vk::Pipeline::null(),
                 kernel: "(no dispatch)",
@@ -1508,7 +1895,17 @@ impl<'a> ComputePass<'a> {
     fn close_segment(&self) -> Result<()> {
         if let Some(seg) = self.open.borrow_mut().take() {
             // SAFETY: the command buffer is recording.
-            unsafe { self.ctx.dev.device.end_command_buffer(seg.cmd) }?;
+            unsafe {
+                if let Some(stamps) = &self.ctx.stamps {
+                    self.ctx.dev.device.cmd_write_timestamp(
+                        seg.cmd,
+                        vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                        stamps.pool,
+                        1,
+                    );
+                }
+                self.ctx.dev.device.end_command_buffer(seg.cmd)
+            }?;
             self.program.borrow_mut().push(Item::Cmd(seg.cmd, seg.kernel));
         }
         Ok(())

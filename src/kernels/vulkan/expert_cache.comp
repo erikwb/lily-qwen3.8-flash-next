@@ -1,0 +1,26 @@
+#version 460
+// The kernel of src/qwen4exp/expert_cache.rs (WARM_SRC): one SIMD group
+// polling a host-written word until it reaches the resolution's generation,
+// or `cap` polls pass. The word is host memory the GPU reads through a no-copy
+// buffer (MetalContext::new_buffer_no_copy).
+//
+// Each poll is an acquire load, where Metal's is relaxed: the loop stores
+// nothing, and the compiler deletes a loop of relaxed loads whose values
+// only decide when it ends (65536 polls then took 0.01 ms; with acquire
+// loads 10 to 18 ms, as on Metal).
+#extension GL_KHR_memory_scope_semantics : require
+#include "common.glsl"
+
+#ifdef KERNEL_expert_cache_warm
+layout(buffer_reference, scalar, buffer_reference_align = 4) coherent buffer HostU32 { uint v[]; };
+
+void main() {
+    HostU32 flag = HostU32(arg(0));
+    uint gen = arg_u32(1), cap = arg_u32(2);
+    for (uint i = 0; i < cap; i++) {
+        uint seen = atomicLoad(flag.v[0], gl_ScopeDevice, gl_StorageSemanticsBuffer,
+                               gl_SemanticsAcquire);
+        if (int(seen - gen) >= 0) break;
+    }
+}
+#endif

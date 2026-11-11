@@ -40,6 +40,14 @@
 //! queue's residency set is not dropped; once the pin is released, for
 //! whatever reason, it submits nothing.
 //!
+//! On Linux the buffers are GPU memory objects of the Vulkan driver, whose
+//! CPU mapping is device memory that `mlock` does not lock; what pages them
+//! out is the driver's own reclaim of an idle GPU's memory. There the pin
+//! sets each buffer's memory priority to 1.0, which keeps it resident
+//! (VK_EXT_pageable_device_local_memory), and releasing sets the default
+//! 0.5 back. A device without that extension cannot pin: the first request
+//! of each active period logs `pin failed` and serves unpinned.
+//!
 //! What is pinned: [`LanguageModel::weight_buffers`], the buffers the load
 //! read the weights into, the vision tower included. Never the expert
 //! cache's slab, the session caches, the scratch or the paged n-gram table.
@@ -258,9 +266,52 @@ pub fn page_ranges(buffers: &[Buffer]) -> (Vec<(usize, usize)>, u64) {
     (merged.into_iter().map(|(s, e)| (s, e - s)).collect(), total)
 }
 
+/// What the pin locks: the buffers' memory as [`page_ranges`], `mlock`ed.
+#[cfg(not(target_os = "linux"))]
+type Locks = Vec<(usize, usize)>;
+
+/// What the pin locks on Linux: each buffer's GPU memory, kept resident by
+/// its priority; `None` when the device cannot do that.
+#[cfg(target_os = "linux")]
+type Locks = Option<Vec<crate::metal::Residency>>;
+
+#[cfg(not(target_os = "linux"))]
+fn locks_of(buffers: &[Buffer]) -> Locks {
+    page_ranges(buffers).0
+}
+
+#[cfg(target_os = "linux")]
+fn locks_of(buffers: &[Buffer]) -> Locks {
+    buffers.iter().map(|b| b.residency()).collect()
+}
+
+/// Keeps every buffer resident (memory priority 1.0). Setting a priority
+/// cannot fail; a device without priorities cannot pin at all.
+#[cfg(target_os = "linux")]
+fn lock_all(locks: &Locks) -> std::result::Result<(), String> {
+    let residencies = locks.as_ref().ok_or_else(|| {
+        "the Vulkan device cannot keep memory resident \
+         (no VK_EXT_pageable_device_local_memory)"
+            .to_owned()
+    })?;
+    for residency in residencies {
+        residency.keep(true);
+    }
+    Ok(())
+}
+
+/// Gives the buffers back to the driver's reclaim (the default priority).
+#[cfg(target_os = "linux")]
+fn unlock_all(locks: &Locks) {
+    for residency in locks.iter().flatten() {
+        residency.keep(false);
+    }
+}
+
 /// Locks every range, or none: on a failure the ranges locked before it are
 /// unlocked again (the failing call itself wires nothing; the kernel rolls a
 /// partial wiring back).
+#[cfg(not(target_os = "linux"))]
 fn lock_all(ranges: &[(usize, usize)]) -> std::result::Result<(), String> {
     for (i, &(start, len)) in ranges.iter().enumerate() {
         // SAFETY: a page-aligned range of buffers the pin keeps alive.
@@ -279,6 +330,7 @@ fn lock_all(ranges: &[(usize, usize)]) -> std::result::Result<(), String> {
     Ok(())
 }
 
+#[cfg(not(target_os = "linux"))]
 fn unlock_all(ranges: &[(usize, usize)]) {
     for &(start, len) in ranges {
         // SAFETY: a range this pin locked, of buffers it keeps alive.
@@ -292,9 +344,9 @@ fn unlock_all(ranges: &[(usize, usize)]) {
     }
 }
 
-/// What the engine thread and the monitor thread share. The ranges are raw
-/// addresses; the memory behind them stays allocated because the
-/// [`WeightPin`] holds its buffers until after the last unlock.
+/// What the engine thread and the monitor thread share. The locks are raw
+/// addresses or memory handles; the memory behind them stays allocated
+/// because the [`WeightPin`] holds its buffers until after the last unlock.
 struct Shared {
     state: Mutex<State>,
     wake: Condvar,
@@ -304,7 +356,7 @@ struct Shared {
 }
 
 struct State {
-    ranges: Vec<(usize, usize)>,
+    locks: Locks,
     /// Changed only through [`State::set_pinned`], which keeps `mirror` equal.
     pinned: bool,
     /// `pinned`, readable without this lock: the dashboard reads it from
@@ -361,7 +413,7 @@ impl State {
     fn release(&mut self, line: &str) {
         self.deferred = None;
         if self.pinned {
-            unlock_all(&self.ranges);
+            unlock_all(&self.locks);
             self.set_pinned(false);
             eprintln!("{line}");
         }
@@ -484,10 +536,11 @@ impl WeightPin {
         hold_secs: u64,
         pressure: fn() -> Option<u32>,
     ) -> Result<Self> {
-        let (ranges, bytes) = page_ranges(&buffers);
+        let bytes = page_ranges(&buffers).1;
+        let locks = locks_of(&buffers);
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
-                ranges,
+                locks,
                 pinned: false,
                 mirror: Arc::new(AtomicBool::new(false)),
                 stop: false,
@@ -600,7 +653,7 @@ impl WeightPin {
             return false;
         }
         let started = Instant::now();
-        match lock_all(&state.ranges) {
+        match lock_all(&state.locks) {
             Ok(()) => {
                 state.set_pinned(true);
                 self.pressure_logged = false;
