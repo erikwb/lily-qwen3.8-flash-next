@@ -1395,6 +1395,126 @@ fn hc_read_chain_timing() {
     }
 }
 
+/// The small-batch read gate as the verify pass runs it: a chain of (down,
+/// barrier, up, barrier) over 64 distinct weight sets in one concurrent
+/// pass, plus the down-only and up-only chains, at each row count of
+/// `LILY_HC_ROWS` (comma separated, default 1,3) and for every `down:up`
+/// kernel pair of `LILY_HC_ROWS_KERNELS` (comma separated, `{m}` stands for
+/// the row count; default the shipped pair). GPU microseconds per level,
+/// best of several passes, order rotated. Run with `--ignored --nocapture`.
+#[test]
+#[ignore = "timing only"]
+fn hc_read_rows_chain_timing() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(26);
+    let (h, g, r) = (2560usize, 4usize, 320usize);
+    let k = g * h;
+    let sets = 64;
+    let norm_w = cpu_ref::round_bf16(&random(&mut rng, k, -0.5, 0.5));
+    let weights: Vec<(QuantWeights, QuantWeights, QuantWeights)> = (0..sets)
+        .map(|_| {
+            (
+                random_q8(&ctx, &mut rng, r, k).0,
+                random_q8(&ctx, &mut rng, k, r).0,
+                random_q8(&ctx, &mut rng, g, k).0,
+            )
+        })
+        .collect();
+    let t_norm = Tensor::from_f32_as_bf16(&ctx, &norm_w, &[k]).expect("norm");
+    let rows: Vec<usize> = std::env::var("LILY_HC_ROWS")
+        .unwrap_or_else(|_| "1,3".into())
+        .split(',')
+        .map(|m| m.parse().expect("row count"))
+        .collect();
+    let pairs: Vec<String> = std::env::var("LILY_HC_ROWS_KERNELS")
+        .unwrap_or_else(|_| format!("hc_read_down_q8_m{{m}}:hc_read_up_mix_q8_g{g}_m{{m}}"))
+        .split(',')
+        .map(str::to_string)
+        .collect();
+    let leak = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
+    for m in rows {
+        let hyper = cpu_ref::round_bf16(&random(&mut rng, m * k, -3.0, 3.0));
+        let t_hyper = Tensor::from_f32_as_bf16(&ctx, &hyper, &[m, k]).expect("hyper");
+        let zeros =
+            |shape: &[usize], dtype| Tensor::zeros(&ctx, shape, dtype).expect("scratch");
+        let down = zeros(&[m, r], DType::BF16);
+        let inj = zeros(&[m, g], DType::BF16);
+        let act = zeros(&[m, r], DType::BF16);
+        let mixed = zeros(&[m, h], DType::BF16);
+        let inv_rms = zeros(&[m, g], DType::F32);
+        let names: Vec<(&'static str, &'static str)> = pairs
+            .iter()
+            .map(|p| {
+                let (d, u) = p.split_once(':').expect("down:up");
+                let m = m.to_string();
+                (leak(d.replace("{m}", &m)), leak(u.replace("{m}", &m)))
+            })
+            .collect();
+        let modes = [("pair", true, true), ("down", true, false), ("up", false, true)];
+        let mut best = vec![[f64::INFINITY; 3]; names.len()];
+        for round in 0..7 {
+            for k_pair in 0..names.len() {
+                let which = (round + k_pair) % names.len();
+                let (dname, uname) = names[which];
+                for (mode, &(_, run_down, run_up)) in modes.iter().enumerate() {
+                    let pass = ctx.begin_concurrent().expect("pass");
+                    for (d, u, j) in &weights {
+                        if run_down {
+                            let dims = check_read_down(
+                                &t_hyper, &t_norm, d, Some(j), &down, &inj, &inv_rms, h,
+                                g, m,
+                            )
+                            .unwrap();
+                            dispatch_read_down(
+                                &ctx,
+                                &pass,
+                                dname,
+                                &t_hyper,
+                                &t_norm,
+                                d,
+                                Some(j),
+                                &down,
+                                &inj,
+                                &inv_rms,
+                                Some(&act),
+                                dims,
+                                h,
+                                g,
+                                1e-6,
+                                1.0,
+                            )
+                            .unwrap();
+                            pass.level_barrier(&[&down, &inj, &inv_rms, &act]).unwrap();
+                        }
+                        if run_up {
+                            dispatch_read_up_mix(
+                                &ctx, &pass, uname, u, &act, &t_hyper, &t_norm, &inv_rms,
+                                &mixed, h, g, m, false, 1.0,
+                            )
+                            .unwrap();
+                            pass.level_barrier(&[&mixed]).unwrap();
+                        }
+                    }
+                    let done = pass.commit().expect("commit").wait_retain().expect("wait");
+                    let t = done.timing().expect("timing");
+                    if round > 0 {
+                        best[which][mode] = best[which][mode]
+                            .min((t.gpu_end_secs - t.gpu_start_secs) / sets as f64);
+                    }
+                }
+            }
+        }
+        for ((dname, uname), b) in names.iter().zip(&best) {
+            eprintln!(
+                "m={m} {dname} + {uname}: pair {:.2} us | down {:.2} us | up {:.2} us",
+                b[0] * 1e6,
+                b[1] * 1e6,
+                b[2] * 1e6,
+            );
+        }
+    }
+}
+
 /// The Vulkan up kernel's layout against the direct port of the Metal
 /// kernel (`hc_read_up_mix_q8_g4_old.spv` in `LILY_VK_SHADER_DIR`, built
 /// from the port's source), bit for bit, on activations and weights with a

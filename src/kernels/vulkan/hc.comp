@@ -199,6 +199,17 @@ void main() {
 // hc_read_down_q8 over MB rows (hc_read_down_q8_rows_body). Metal calls the
 // body in two branches (inject, down); here the branch only picks the
 // operands and one body is compiled.
+//
+// A threadgroup takes RPT consecutive weight rows (down rows, then inject
+// rows), where the Metal kernel takes one: each lane runs the Metal lane's
+// walk for every one of them, so a row's sums are added as there, but the
+// MB hyper blocks and the norm block a lane loads, the normalized x * gain
+// and the x . x sums are shared by the RPT rows instead of being loaded and
+// computed per row. Those are what grows with MB (a weight block is 1
+// load of 3 + 2 MB). `hc_read_rows_chain_timing`, H 2560, 4 streams, R 320,
+// three rows, us per down level (2026-11-11): one row a threadgroup 17.4,
+// two 15.5 to 15.8, four 17.9. One row (MB 1) keeps one: two were no
+// faster. Bit for bit the single-row kernel's per row (hc.rs tests).
 #if defined(KERNEL_hc_read_down_q8_m1)
 #define MB 1
 #elif defined(KERNEL_hc_read_down_q8_m2)
@@ -207,88 +218,117 @@ void main() {
 #define MB 3
 #elif defined(KERNEL_hc_read_down_q8_m4)
 #define MB 4
+#elif defined(KERNEL_hc_read_down_q8_m3_t1)
+// The Metal layout, one row a threadgroup, for `hc_read_rows_chain_timing`.
+#define MB 3
+#define RPT 1
 #endif
 #ifdef MB
 #define HC_READ_DOWN_ROWS
+#ifndef RPT
+#if MB == 1
+#define RPT 1
+#else
+#define RPT 2
+#endif
+#endif
 #endif
 
 #ifdef HC_READ_DOWN_ROWS
-shared float part[MB * HC_MAX_G];
+shared float part[RPT * MB * HC_MAX_G];
 shared float rms[MB * HC_MAX_G];
 void main() {
     uint H = arg_u32(12), G = arg_u32(13), R = arg_u32(14), NI = arg_u32(15), GS = arg_u32(16);
     float eps = arg_f32(17), w_bias = arg_f32(18), inv_g = arg_f32(19);
-    uint row = threadgroup_position_in_grid.x, tid = thread_index_in_threadgroup;
+    uint tid = thread_index_in_threadgroup;
     uint g = simdgroup_index_in_threadgroup, lane = thread_index_in_simdgroup;
-    if (row >= R + NI) return;  // whole threadgroup
-    bool is_down = row < R;
-    uint r = is_down ? row : row - R;
-    uint N = is_down ? R : NI;
+    uint row0 = threadgroup_position_in_grid.x * RPT;
+    if (row0 >= R + NI) return;  // whole threadgroup
     uint K = G * H;
     uint words = K / 4;
     uint bpg = GS / 16;
     uint groups = K / GS;
     uint stream_blocks = H / 16;
-    U32x4 wrow = U32x4(arg(is_down ? 2 : 5) + 4 * uint64_t(r) * words);
-    BF16 scales = BF16(arg(is_down ? 3 : 6) + 2 * (r * groups));
-    BF16 biases = BF16(arg(is_down ? 4 : 7) + 2 * (r * groups));
-    float acc_w[MB];
+    // Row t of the threadgroup's (a row past the last runs on the last and
+    // stores nothing).
+    U32x4 wrow[RPT];
+    BF16 scales[RPT], biases[RPT];
+    [[unroll]] for (uint t = 0; t < RPT; ++t) {
+        uint row = min(row0 + t, R + NI - 1);
+        bool is_down = row < R;
+        uint r = is_down ? row : row - R;
+        wrow[t] = U32x4(arg(is_down ? 2 : 5) + 4 * uint64_t(r) * words);
+        scales[t] = BF16(arg(is_down ? 3 : 6) + 2 * (r * groups));
+        biases[t] = BF16(arg(is_down ? 4 : 7) + 2 * (r * groups));
+    }
+    float acc_w[RPT * MB];
     float acc_x2[MB];
     [[unroll]] for (uint m = 0; m < MB; ++m) {
-        acc_w[m] = 0.0;
         acc_x2[m] = 0.0;
+        [[unroll]] for (uint t = 0; t < RPT; ++t) acc_w[t * MB + m] = 0.0;
     }
     uint i_end = (g + 1) * stream_blocks;
     HC_GROUP_INIT(g * stream_blocks + lane, bpg)
     for (uint i = g * stream_blocks + lane; i < i_end; i += 32) {
-        float s = float(scales.v[q]);
-        float b = float(biases.v[q]);
-        uvec4 w4 = wrow.v[i];
+        float s[RPT], b[RPT];
+        uvec4 w4[RPT];
+        [[unroll]] for (uint t = 0; t < RPT; ++t) {
+            s[t] = float(scales[t].v[q]);
+            b[t] = float(biases[t].v[q]);
+            w4[t] = wrow[t].v[i];
+        }
         vec4 nb[4], xb[MB][4];
         hc_load_block(arg(1), i, nb);
         // Row m's block i is block m * K/16 + i of hyper (32-bit: the rows
         // are [MB, G*H]).
         [[unroll]] for (uint m = 0; m < MB; ++m) hc_load_block(arg(0), m * (K / 16) + i, xb[m]);
         [[unroll]] for (uint j = 0; j < 4; ++j) {
-            vec4 qf = hc_unpack_q8(w4[j]);
             vec4 gain = w_bias + nb[j];
+            vec4 qf[RPT];
+            [[unroll]] for (uint t = 0; t < RPT; ++t) qf[t] = hc_unpack_q8(w4[t][j]);
             [[unroll]] for (uint m = 0; m < MB; ++m) {
                 vec4 x = xb[m][j];
                 vec4 xn = x * gain;
-                acc_w[m] += hc_dot_q8(qf, s, b, xn);
+                [[unroll]] for (uint t = 0; t < RPT; ++t)
+                    acc_w[t * MB + m] += hc_dot_q8(qf[t], s[t], b[t], xn);
                 acc_x2[m] += dot(x, x);
             }
         }
         HC_GROUP_NEXT(bpg)
     }
     [[unroll]] for (uint m = 0; m < MB; ++m) {
-        acc_w[m] = subgroupAdd(acc_w[m]);
         acc_x2[m] = subgroupAdd(acc_x2[m]);
+        [[unroll]] for (uint t = 0; t < RPT; ++t) acc_w[t * MB + m] = subgroupAdd(acc_w[t * MB + m]);
     }
     if (lane == 0) {
         [[unroll]] for (uint m = 0; m < MB; ++m) {
             float inv = inversesqrt(acc_x2[m] / float(H) + eps);
-            part[m * HC_MAX_G + g] = acc_w[m] * inv;
             rms[m * HC_MAX_G + g] = inv;
+            [[unroll]] for (uint t = 0; t < RPT; ++t) part[(t * MB + m) * HC_MAX_G + g] = acc_w[t * MB + m] * inv;
         }
     }
     barrier();
-    if (tid == 0) {
-        BF16 out_ = BF16(arg(is_down ? 8 : 9)), act = BF16(arg(11));
-        for (uint m = 0; m < MB; ++m) {
+    // Thread t * MB + m stores row t's output of hyper row m.
+    if (tid < RPT * MB) {
+        uint t = tid / MB, m = tid - t * MB;
+        uint row = row0 + t;
+        if (row < R + NI) {
+            bool is_down = row < R;
+            uint r = is_down ? row : row - R;
+            uint N = is_down ? R : NI;
             float total = 0.0;
-            for (uint s = 0; s < G; ++s) total += part[m * HC_MAX_G + s];
+            for (uint s = 0; s < G; ++s) total += part[(t * MB + m) * HC_MAX_G + s];
             bfloat16_t logit = bf16_rne(total);
-            out_.v[m * N + r] = logit;
+            BF16(arg(is_down ? 8 : 9)).v[m * N + r] = logit;
             if (is_down) {
                 // silu_scaled_bf16 on the bf16 logit.
                 float v = float(logit) * inv_g;
-                act.v[m * N + r] = bf16_rne(v / (1.0 + exp(-v)));
+                BF16(arg(11)).v[m * N + r] = bf16_rne(v / (1.0 + exp(-v)));
             }
         }
     }
-    // The down row 0 threadgroup publishes the stream RMS for the up kernel.
-    if (is_down && r == 0 && tid < MB * G) F32(arg(10)).v[tid] = rms[(tid / G) * HC_MAX_G + tid % G];
+    // The threadgroup of down row 0 publishes the stream RMS for the up kernel.
+    if (row0 == 0 && R > 0 && tid < MB * G) F32(arg(10)).v[tid] = rms[(tid / G) * HC_MAX_G + tid % G];
 }
 #endif
 

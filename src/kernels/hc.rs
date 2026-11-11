@@ -328,10 +328,27 @@ fn dispatch_read_down(
         &buffers,
         &params,
         Grid::Threadgroups {
-            groups: (r + n_inj, 1, 1),
+            groups: ((r + n_inj).div_ceil(read_down_rows_per_tg(name)), 1, 1),
             threadgroup: (32 * groups, 1, 1),
         },
     )
+}
+
+/// Weight rows a threadgroup of the fused down kernel `name` takes (`RPT`
+/// in hc.comp): one on Metal and for the single-row kernels; on Vulkan the
+/// small-batch kernels share their hyper and norm loads between rows.
+fn read_down_rows_per_tg(name: &str) -> usize {
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(t) = name.rsplit_once("_t").and_then(|(_, t)| t.parse().ok()) {
+            return t;
+        }
+        if name.starts_with("hc_read_down_q8_m") && name != "hc_read_down_q8_m1" {
+            return 2;
+        }
+    }
+    let _ = name;
+    1
 }
 
 /// Fused decode read gate, first half: `down = W_down . rmsnorm_grouped(hyper)`
