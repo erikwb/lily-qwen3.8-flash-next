@@ -4,84 +4,90 @@
 // grouped Q4 GEMM. Q4 codes pack eight low-nibble-first values per word;
 // w = scale * q + bias. The comments there say why each kernel is as it is;
 // this is the same arithmetic in the same order, except where a comment here
-// says what differs.
+// says what differs (the Q4 GEMVs: quant_rows.glsl).
 #include "common.glsl"
 #include "quant_common.glsl"
 
-// Q4 GEMV: one subgroup per row (gemv_q4_bf16_2row: half a subgroup); GS
-// must be divisible by 64.
-#if defined(KERNEL_gemv_q4_bf16) || defined(KERNEL_gemv_q4_bf16_f32out) || defined(KERNEL_gemv_q4_bf16_2row)
-#ifdef KERNEL_gemv_q4_bf16_2row
-#define LANES 16
-#else
-#define LANES 32
+// The Q4 GEMVs are the raw-code projection body (quant_rows.glsl) at one
+// activation row: a lane computes one weight row per block, or two that
+// share the block's activation work (`_2row`, which quant.rs picks for the
+// larger matrices), and `gemv_q4_sets` up to four GEMVs of one activation
+// vector in one dispatch, for the projections that share a dependency level.
+// They take that body's params (K, N, GS and the lanes per row set), not the
+// Metal kernels' (K, GS), and its grid.
+#if defined(KERNEL_gemv_q4_bf16) || defined(KERNEL_gemv_q4_bf16_f32out) || defined(KERNEL_gemv_q4_sets)
+#define QR_BITS 4
+#define QR_RR 1
 #endif
-
-// Affine-dequantized dot product for one Q4 code word and its eight
-// activations (one 16-byte load).
-float dot_word_q4(uint word, float s, float b, uvec4 x) {
-    vec4 xlo = bf4_bits(x.xy), xhi = bf4_bits(x.zw);
-    float qx = dot(q4_lo(word), xlo) + dot(q4_hi(word), xhi);
-    float xs = dot(xlo, vec4(1.0)) + dot(xhi, vec4(1.0));
-    return s * qx + b * xs;
-}
-
-void main() {
-    BF16 scales = BF16(arg(1)), biases = BF16(arg(2));
-    U32x4 xv = U32x4(arg(3));
-    uint K = arg_u32(5), GS = arg_u32(6);
-    uint lane = thread_index_in_threadgroup;
-    uint sublane = lane % LANES;
-    uint row = threadgroup_position_in_grid.x * (32 / LANES) + lane / LANES;
-    uint words = K / 8, blocks = words / 4, bpg = GS / 32, groups = K / GS;
-    U32x4 wrow = U32x4(arg(0) + uint64_t(row) * (4 * words));
-    float sum = 0.0;
-    for (uint i = sublane; i < blocks; i += LANES) {
-        uint g = i / bpg;
-        float s = float(scales.v[row * groups + g]);
-        float b = float(biases.v[row * groups + g]);
-        uvec4 w4 = wrow.v[i];
-        sum += dot_word_q4(w4.x, s, b, xv.v[4 * i]) + dot_word_q4(w4.y, s, b, xv.v[4 * i + 1])
-             + dot_word_q4(w4.z, s, b, xv.v[4 * i + 2]) + dot_word_q4(w4.w, s, b, xv.v[4 * i + 3]);
-    }
-#if LANES == 16
-    // Each half's sum. Metal folds it into the half's first lane by four
-    // shuffles; a shuffle is a dozen instructions on this driver and the
-    // reduction one, so the halves are reduced apart (-0.0 adds nothing).
-    float lower = subgroupAdd(lane < 16 ? sum : -0.0);
-    float upper = subgroupAdd(lane < 16 ? -0.0 : sum);
-    sum = lane < 16 ? lower : upper;
-#else
-    sum = subgroupAdd(sum);
+#if defined(KERNEL_gemv_q4_bf16_2row) || defined(KERNEL_gemv_q4_bf16_f32out_2row) || defined(KERNEL_gemv_q4_sets_2row)
+#define QR_BITS 4
+#define QR_RR 2
 #endif
-    if (sublane == 0) {
-#ifdef KERNEL_gemv_q4_bf16_f32out
-        F32(arg(4)).v[row] = sum;
-#else
-        BF16(arg(4)).v[row] = bfloat16_t(sum);
+#if defined(KERNEL_gemv_q4_bf16_f32out) || defined(KERNEL_gemv_q4_bf16_f32out_2row)
+#define QR_F32
 #endif
-    }
-}
+#if defined(KERNEL_gemv_q4_sets) || defined(KERNEL_gemv_q4_sets_2row)
+#define QR_SETS
+#endif
+#ifdef QR_BITS
+#define QR_MB 1
+#include "quant_rows.glsl"
 #endif
 
 // Q8 GEMV: uint4 blocks of 16 elements (a code word holds four, low byte
-// first); GS must be divisible by 16.
-#if defined(KERNEL_gemv_q8_bf16) || defined(KERNEL_gemv_q8_bf16_f32out)
+// first), one subgroup per row as on Metal; GS must be divisible by 16 and a
+// power of two. Its arithmetic stays the Metal kernel's: hc.comp's fused read
+// reproduces this GEMV bit for bit and its tests assert that. What differs
+// is the block's quant group, a shift where Metal divides (about twenty
+// instructions per block on this compiler).
+//
+// gemv_q8_sets is the same over up to four weights of one K and GS in one
+// dispatch, row after row along the grid, each output the bits the GEMV
+// alone gives it: buffers and params as quant_rows.glsl's QR_SETS (buffers
+// 0 codes, 1 scales, 2 biases, 3 x, 4 y; 5 + 4 * (s - 1) and the three after
+// the codes, scales, biases and y of set s = 1..3; params 17 K, 18 N of set
+// 0, 19 GS, 21..23 N of sets 1..3, 0 for none, 24 a mask whose bit s says
+// set s's output is f32). Dispatches that share a dependency level do not
+// overlap on this driver as they do on Metal: measured 2026-11-10
+// (`dense_shared_levels_timing`), a decode step's router level (the 1.3 MB
+// router, the 3.3 MB shared gate/up projection and the one-row shared gate,
+// all reading the layer's input) takes 18.9 us as three dispatches, the sum
+// of what each takes alone, and 14.0 as one.
+#if defined(KERNEL_gemv_q8_bf16) || defined(KERNEL_gemv_q8_bf16_f32out) || defined(KERNEL_gemv_q8_sets)
 float dot_word_q8(uint word, float s, float b, uvec2 xw) {
     vec4 x = bf4_bits(xw);
     return s * dot(q8_codes(word), x) + b * dot(x, vec4(1.0));
 }
 
 void main() {
-    BF16 scales = BF16(arg(1)), biases = BF16(arg(2));
+    uint64_t codes = arg(0), scales_at = arg(1), biases_at = arg(2), y = arg(4);
     U32x4 xv = U32x4(arg(3));
-    uint K = arg_u32(5), GS = arg_u32(6);
     uint row = threadgroup_position_in_grid.x, lane = thread_index_in_threadgroup;
-    uint words = K / 4, blocks = words / 4, bpg = GS / 16, groups = K / GS;
-    U32x4 wrow = U32x4(arg(0) + uint64_t(row) * (4 * words));
+#ifdef KERNEL_gemv_q8_sets
+    uint K = arg_u32(17), N = arg_u32(18), GS = arg_u32(19), f32_mask = arg_u32(24);
+    bool f32_out = (f32_mask & 1u) != 0u;
+    // The weight this row belongs to: each takes its N rows of the grid.
+    [[unroll]] for (uint s = 1; s < 4; ++s) {
+        if (row >= N) {
+            row -= N;
+            codes = arg(1 + 4 * s);
+            scales_at = arg(2 + 4 * s);
+            biases_at = arg(3 + 4 * s);
+            y = arg(4 + 4 * s);
+            N = arg_u32(20 + s);
+            f32_out = (f32_mask >> s & 1u) != 0u;
+        }
+    }
+#else
+    uint K = arg_u32(5), GS = arg_u32(6);
+#endif
+    BF16 scales = BF16(scales_at), biases = BF16(biases_at);
+    uint words = K / 4, blocks = words / 4, gs_log2 = uint(findLSB(GS));
+    uint gshift = gs_log2 - 4, groups = K >> gs_log2;
+    U32x4 wrow = U32x4(codes + uint64_t(row) * (4 * words));
     float sum = 0.0;
     for (uint i = lane; i < blocks; i += 32) {
-        uint g = i / bpg;
+        uint g = i >> gshift;
         float s = float(scales.v[row * groups + g]);
         float b = float(biases.v[row * groups + g]);
         uvec4 w4 = wrow.v[i];
@@ -92,17 +98,25 @@ void main() {
     }
     sum = subgroupAdd(sum);
     if (lane == 0) {
-#ifdef KERNEL_gemv_q8_bf16_f32out
-        F32(arg(4)).v[row] = sum;
+#if defined(KERNEL_gemv_q8_sets)
+        if (f32_out) {
+            F32(y).v[row] = sum;
+        } else {
+            BF16(y).v[row] = bfloat16_t(sum);
+        }
+#elif defined(KERNEL_gemv_q8_bf16_f32out)
+        F32(y).v[row] = sum;
 #else
-        BF16(arg(4)).v[row] = bfloat16_t(sum);
+        BF16(y).v[row] = bfloat16_t(sum);
 #endif
     }
 }
 #endif
 
 // Materializes weights, one thread per code word: dequant_* row by row,
-// gather_rows_* the embedding rows of `ids`.
+// gather_rows_* the embedding rows of `ids`. The word's quant group is a
+// shift (GS is a power of two; Metal divides, which costs a thread about
+// twenty instructions on this compiler).
 #if defined(KERNEL_dequant_q4_bf16) || defined(KERNEL_dequant_q8_bf16) || defined(KERNEL_gather_rows_q4_bf16) || defined(KERNEL_gather_rows_q8_bf16)
 #if defined(KERNEL_dequant_q8_bf16) || defined(KERNEL_gather_rows_q8_bf16)
 #define WORD_CODES 4
@@ -126,8 +140,9 @@ void main() {
     if (w >= words) return;
     uint row = thread_position_in_grid.y;
 #endif
-    uint groups = K / GS;
-    uint g = w / (GS / WORD_CODES);
+    uint gs_log2 = uint(findLSB(GS));
+    uint groups = K >> gs_log2;
+    uint g = w >> (gs_log2 - (WORD_CODES == 8 ? 3 : 2));
     float s = float(scales.v[row * groups + g]);
     float b = float(biases.v[row * groups + g]);
     uint word = U32(arg(0) + uint64_t(row) * (4 * words)).v[w];

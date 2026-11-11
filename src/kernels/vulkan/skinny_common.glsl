@@ -4,10 +4,14 @@
 //
 //     SKINNY_STAGED 4 or 8   staged-A body at that code width, with SKINNY_MB
 //                            rows and K chunks of SKINNY_KC (default 256)
-//     SKINNY_REG_Q8 m        8-bit register-A body at m rows
 //     SKINNY_REG_Q4 m        4-bit register-A body at m rows
 //
 // (none: the helpers alone), and SKINNY_F32 for f32 output instead of bf16.
+// The 8-bit register-A body is quant_rows.glsl.
+//
+// The group size GS is a power of two here (skinny.rs checks it): a block's
+// quant group is a shift. Metal divides by GS per block, which this compiler
+// turns into about twenty instructions each time.
 
 // c[row, col] of the [M, N] output, in its element type.
 #ifdef SKINNY_F32
@@ -16,14 +20,17 @@
 #define SKINNY_STORE(c, row, N, col, value) BF16((c) + uint64_t(row) * (2 * (N))).v[col] = bfloat16_t(value)
 #endif
 
-// raw[i], i in 0..MB: eight activations of row i at element `at` of the row,
-// as their bits. One branch on the alignment for all the rows.
+// raw[i], i in 0..MB: eight activations of row i at element `at` of the row
+// (a multiple of 8), as their bits: one 16-byte load each. Metal takes that
+// load only where A is 16-byte aligned and eight 2-byte loads elsewhere,
+// choosing per code word; a uvec4 here is read through a 4-byte aligned
+// reference, which is all a tensor's offset is held to, so the one load
+// serves both and the loops carry no branch on the alignment. With the group
+// shift above, measured 2026-11-10 in chains of barriered levels at m = 3
+// (`dense_chain_timing`): the 4-bit GDN projections 81.1 to 69.1 us per
+// level (in, 24 MB) and 33.6 to 27.7 (out, 9 MB), the same bits.
 #define SKINNY_LOAD_ROWS(raw, at)                                                             \
-    if (a_vec) {                                                                              \
-        [[unroll]] for (uint i = 0; i < MB; ++i) raw[i] = load_raw8(a, i * K + (at), true);   \
-    } else {                                                                                  \
-        [[unroll]] for (uint i = 0; i < MB; ++i) raw[i] = load_raw8(a, i * K + (at), false);  \
-    }
+    [[unroll]] for (uint i = 0; i < MB; ++i) raw[i] = U32x4(a).v[(i * K + (at)) / 8];
 
 #ifdef SKINNY_STAGED
 #ifndef SKINNY_KC
@@ -45,7 +52,7 @@ void main() {
     uint row = threadgroup_position_in_grid.x * SKINNY_SG + simdgroup_index_in_threadgroup;
     uint m0 = threadgroup_position_in_grid.y * SKINNY_MB;
     uint m_rem = min(M - m0, uint(SKINNY_MB));
-    uint words = K / (32 / SKINNY_STAGED), groups = K / GS;
+    uint words = K / (32 / SKINNY_STAGED), gs_log2 = uint(findLSB(GS)), groups = K >> gs_log2;
     bool a_vec = (a & 15) == 0;
     U32 wrow = U32(arg(0) + uint64_t(row) * (4 * words));
     a += uint64_t(m0) * (2 * K);
@@ -66,7 +73,7 @@ void main() {
 
         if (row < N) {
             for (uint col = lane * 8; col < kc; col += 256) {
-                uint g = (k0 + col) / GS;
+                uint g = (k0 + col) >> gs_log2;
                 float s = float(scales.v[row * groups + g]);
                 float b = float(biases.v[row * groups + g]);
 #if SKINNY_STAGED == 4
@@ -93,75 +100,6 @@ void main() {
         [[unroll]] for (uint i = 0; i < SKINNY_MB; ++i) {
             float sum = subgroupAdd(acc[i]);
             if (lane == 0 && i < m_rem) SKINNY_STORE(c, m0 + i, N, row, sum);
-        }
-    }
-}
-#endif
-
-// 8-bit register-A body: two weight rows per subgroup, a uint4 block of 16
-// elements (four words of four) per lane and step; requires M == MB,
-// K % 16 == 0 and GS % 16 == 0.
-#ifdef SKINNY_REG_Q8
-#define MB SKINNY_REG_Q8
-void main() {
-    BF16 scales = BF16(arg(1)), biases = BF16(arg(2));
-    uint64_t a = arg(3), c = arg(4);
-    uint K = arg_u32(5), N = arg_u32(6), GS = arg_u32(7);
-    uint lane = thread_index_in_simdgroup;
-    uint row0 = (threadgroup_position_in_grid.x * (threads_per_threadgroup.x / 32) + simdgroup_index_in_threadgroup) * 2;
-    if (row0 >= N) return; // whole subgroup
-    bool has1 = row0 + 1 < N;
-    uint row1 = has1 ? row0 + 1 : row0;
-    uint words = K / 4, blocks = words / 4, bpg = GS / 16, groups = K / GS;
-    bool a_vec = (a & 15) == 0;
-    U32x4 w0 = U32x4(arg(0) + uint64_t(row0) * (4 * words));
-    U32x4 w1 = U32x4(arg(0) + uint64_t(row1) * (4 * words));
-
-    float acc0[MB], acc1[MB];
-    [[unroll]] for (uint i = 0; i < MB; ++i) {
-        acc0[i] = 0.0;
-        acc1[i] = 0.0;
-    }
-
-    for (uint blk = lane; blk < blocks; blk += 32) {
-        uint g = blk / bpg;
-        float s0 = float(scales.v[row0 * groups + g]);
-        float b0 = float(biases.v[row0 * groups + g]);
-        float s1 = float(scales.v[row1 * groups + g]);
-        float b1 = float(biases.v[row1 * groups + g]);
-        uvec4 v0 = w0.v[blk];
-        uvec4 v1 = w1.v[blk];
-        float qx0[MB], qx1[MB], xs[MB];
-        [[unroll]] for (uint i = 0; i < MB; ++i) {
-            qx0[i] = 0.0;
-            qx1[i] = 0.0;
-            xs[i] = 0.0;
-        }
-        // Two words (eight elements) per step: one 16-byte activation load.
-        [[unroll]] for (uint wp = 0; wp < 2; ++wp) {
-            vec4 q0lo = q8_codes(v0[2 * wp]), q0hi = q8_codes(v0[2 * wp + 1]);
-            vec4 q1lo = q8_codes(v1[2 * wp]), q1hi = q8_codes(v1[2 * wp + 1]);
-            uvec4 raw[MB];
-            SKINNY_LOAD_ROWS(raw, blk * 16 + wp * 8)
-            [[unroll]] for (uint i = 0; i < MB; ++i) {
-                vec4 xlo = bf4_bits(raw[i].xy), xhi = bf4_bits(raw[i].zw);
-                xs[i] += dot(xlo, vec4(1.0)) + dot(xhi, vec4(1.0));
-                qx0[i] += dot(q0lo, xlo) + dot(q0hi, xhi);
-                qx1[i] += dot(q1lo, xlo) + dot(q1hi, xhi);
-            }
-        }
-        [[unroll]] for (uint i = 0; i < MB; ++i) {
-            acc0[i] += s0 * qx0[i] + b0 * xs[i];
-            acc1[i] += s1 * qx1[i] + b1 * xs[i];
-        }
-    }
-
-    [[unroll]] for (uint i = 0; i < MB; ++i) {
-        float sum0 = subgroupAdd(acc0[i]);
-        float sum1 = subgroupAdd(acc1[i]);
-        if (lane == 0) {
-            SKINNY_STORE(c, i, N, row0, sum0);
-            if (has1) SKINNY_STORE(c, i, N, row1, sum1);
         }
     }
 }
@@ -262,8 +200,8 @@ void main() {
     uint lane = thread_index_in_simdgroup;
     uint row0 = (threadgroup_position_in_grid.x * (threads_per_threadgroup.x / 32) + simdgroup_index_in_threadgroup) * RR;
     if (row0 >= N) return; // whole subgroup
-    uint words = K / 8, blocks = words / 4, bpg = GS / 32, groups = K / GS;
-    bool a_vec = (a & 15) == 0;
+    uint words = K / 8, blocks = words / 4, gs_log2 = uint(findLSB(GS));
+    uint gshift = gs_log2 - 5, groups = K >> gs_log2;
     // Rows past N repeat the last row (the loads stay in bounds) and are not
     // stored.
     uint rows[RR], woff[RR];
@@ -281,7 +219,7 @@ void main() {
     bool split = rem != 0 && rem <= 16;
     uint full = split ? blocks - rem : blocks;
     for (uint blk = lane; blk < full; blk += 32) {
-        uint g = blk / bpg;
+        uint g = blk >> gshift;
         precise float qx[RR][MB];
         precise float xs[MB];
         SKINNY_Q4_BLOCK(RR, woff, blk)
@@ -300,7 +238,7 @@ void main() {
         uint hv = lane / 16;
         bool has_block = lane % 16 < rem;
         uint blk = has_block ? full + lane % 16 : full;
-        uint g = blk / bpg;
+        uint g = blk >> gshift;
         uint hrows[HR], hoff[HR];
         [[unroll]] for (uint r = 0; r < HR; ++r) {
             hrows[r] = hv == 0 ? rows[r] : rows[HR + r];

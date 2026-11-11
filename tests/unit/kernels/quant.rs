@@ -452,6 +452,219 @@ fn gemv_q4_matches_cpu_both_dtypes() {
     }
 }
 
+/// The GEMVs at larger sizes: the 4-bit ones where a lane takes two weight
+/// rows per block on Vulkan (`rows_layout`: from 3 MB of codes), with an odd
+/// row count (the last pair is half past the end) and, at K = 6144, 32 lanes
+/// per row set where K = 2560 has 16; an 8-bit one beside them.
+#[test]
+fn gemv_large_matches_cpu_both_dtypes() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(15);
+    for (bits, n, k) in [(4usize, 4097usize, 2560usize), (4, 1025, 6144), (8, 2049, 2560)]
+    {
+        let (w, dequant) = if bits == 4 {
+            random_quant(&ctx, &mut rng, n, k)
+        } else {
+            random_quant_q8(&ctx, &mut rng, n, k)
+        };
+        let x: Vec<f32> = (0..k).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+        let tx = Tensor::from_f32_as_bf16(&ctx, &x, &[k]).expect("x");
+        let expected = cpu_ref::gemm_nt(&cpu_ref::round_bf16(&x), &dequant, 1, k, n);
+        for dtype in [DType::BF16, DType::F32] {
+            let ty = Tensor::zeros(&ctx, &[n], dtype).expect("y");
+            let pass = ctx.begin().expect("pass");
+            gemv_quant(&ctx, &pass, &w, &tx, &ty).expect("gemv_quant");
+            pass.commit_wait().expect("commit");
+            cpu_ref::assert_close(&ty.to_f32().expect("read"), &expected, 2e-2, 2e-2);
+        }
+    }
+}
+
+/// The GEMV on the dense shapes of a Qwen3.8-Flash-Next decode step (4-bit
+/// GDN projections; 8-bit attention, shared expert, routers and LM head),
+/// with f32 output against an f64 dot product over sampled rows: within the
+/// error of an f32 accumulation (1e-5 of the sum of the terms' magnitudes;
+/// the tolerance of the other GEMV tests is the bf16 output's). Hashed
+/// weights, so the LM head's 0.6 GB needs no CPU image.
+#[test]
+fn gemv_model_shapes_match_f64_reference() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(16);
+    for (bits, n, k) in [
+        (4usize, 16480usize, 2560usize),
+        (4, 2560, 6144),
+        (8, 13312, 2560),
+        (8, 2560, 6144),
+        (8, 1280, 2560),
+        (8, 2560, 640),
+        (8, 512, 2560),
+        (8, 1, 2560),
+        (8, 248320, 2560),
+    ] {
+        let per_word = 32 / bits;
+        let words = k / per_word;
+        let groups = k / GROUP_SIZE;
+        let codes: Vec<u32> = (0..n * words)
+            .map(|i| (i as u32 ^ 0x5bd1_e995).wrapping_mul(2_654_435_761).rotate_left(7))
+            .collect();
+        let scales: Vec<bf16> = (0..n * groups)
+            .map(|i| bf16::from_f32(0.001 + (i % 97) as f32 * 0.0004))
+            .collect();
+        let biases: Vec<bf16> =
+            (0..n * groups).map(|i| bf16::from_f32(-1.0 + (i % 89) as f32 * 0.02)).collect();
+        let upload = |v: &[bf16]| {
+            Tensor::from_bytes(&ctx, bytemuck::cast_slice(v), &[n, groups], DType::BF16)
+                .expect("bf16")
+        };
+        let w = QuantWeights {
+            codes: Tensor::from_bytes(
+                &ctx,
+                bytemuck::cast_slice(&codes),
+                &[n, words],
+                DType::U32,
+            )
+            .expect("codes"),
+            scales: upload(&scales),
+            biases: upload(&biases),
+            group_size: GROUP_SIZE,
+            bits,
+        };
+        let x: Vec<f32> = cpu_ref::round_bf16(
+            &(0..k).map(|_| rng.gen_range(-1.0f32..1.0)).collect::<Vec<_>>(),
+        );
+        let tx = Tensor::from_f32_as_bf16(&ctx, &x, &[k]).expect("x");
+        let ty = Tensor::zeros(&ctx, &[n], DType::F32).expect("y");
+        let pass = ctx.begin().expect("pass");
+        gemv_quant(&ctx, &pass, &w, &tx, &ty).expect("gemv_quant");
+        pass.commit_wait().expect("commit");
+        let got = ty.to_f32().expect("read");
+        let mut rows: Vec<usize> = (0..n.min(40)).chain(n.saturating_sub(40)..n).collect();
+        rows.extend((0..n).step_by(997));
+        for row in rows {
+            let (mut sum, mut l1) = (0.0f64, 0.0f64);
+            for (e, &xe) in x.iter().enumerate() {
+                let word = codes[row * words + e / per_word];
+                let q = (word >> (bits * (e % per_word))) & ((1 << bits) - 1);
+                let g = row * groups + e / GROUP_SIZE;
+                let wv = scales[g].to_f64() * q as f64 + biases[g].to_f64();
+                sum += wv * xe as f64;
+                l1 += (wv * xe as f64).abs();
+            }
+            assert!(
+                (got[row] as f64 - sum).abs() <= 1e-5 * l1,
+                "q{bits} [{n}, {k}] row {row}: {} against {sum} (terms sum to {l1})",
+                got[row]
+            );
+        }
+    }
+}
+
+/// `gemv_quant_sets` gives each output the bits `gemv_quant` gives it: a
+/// level's GEMVs as one dispatch on Vulkan (two to four weights of one code
+/// width, in either output type, with row counts that leave partial
+/// subgroups and a one-row weight) and one by one elsewhere; a set of
+/// another width or alone goes out on its own.
+#[test]
+fn gemv_quant_sets_match_separate_bits() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(17);
+    // (bits, N, f32 output) per set; K per case.
+    let cases: [(usize, &[(usize, usize, bool)]); 4] = [
+        (2560, &[(8, 512, true), (8, 1280, false), (8, 1, true)]),
+        (2560, &[(8, 1283, false), (8, 2049, false), (8, 7, true), (8, 33, false)]),
+        (640, &[(8, 515, false), (4, 258, false), (8, 2, true), (4, 1, true), (4, 77, false)]),
+        (1024, &[(4, 5, false)]),
+    ];
+    for (k, sets) in cases {
+        let weights: Vec<QuantWeights> = sets
+            .iter()
+            .map(|&(bits, n, _)| {
+                if bits == 4 {
+                    random_quant(&ctx, &mut rng, n, k).0
+                } else {
+                    random_quant_q8(&ctx, &mut rng, n, k).0
+                }
+            })
+            .collect();
+        let x: Vec<f32> = (0..k).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+        let tx = Tensor::from_f32_as_bf16(&ctx, &x, &[k]).expect("x");
+        let outputs = || -> Vec<Tensor> {
+            sets.iter()
+                .map(|&(_, n, f32_out)| {
+                    let dtype = if f32_out { DType::F32 } else { DType::BF16 };
+                    Tensor::zeros(&ctx, &[n], dtype).expect("y")
+                })
+                .collect()
+        };
+        let (together, apart) = (outputs(), outputs());
+        let pass = ctx.begin().expect("pass");
+        let pairs: Vec<(&QuantWeights, &Tensor)> = weights.iter().zip(&together).collect();
+        gemv_quant_sets(&ctx, &pass, &tx, &pairs).expect("sets");
+        for (w, y) in weights.iter().zip(&apart) {
+            gemv_quant(&ctx, &pass, w, &tx, y).expect("gemv");
+        }
+        pass.commit_wait().expect("commit");
+        for (s, (got, want)) in together.iter().zip(&apart).enumerate() {
+            let (got, want) = (got.to_f32().expect("read"), want.to_f32().expect("read"));
+            for (row, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert_eq!(
+                    g.to_bits(),
+                    w.to_bits(),
+                    "K={k} set {s} {:?} row {row}: {g} against {w}",
+                    sets[s]
+                );
+            }
+        }
+    }
+}
+
+/// Times the dequant kernels on the GDN input projection's shape (4 bits)
+/// and the attention output's (8 bits), which prefill's dense GEMMs stage
+/// through them: eight dispatches per pass over distinct weights, a barrier
+/// after each, microseconds per dispatch, best of several passes after a
+/// warm-up. `cargo test --release -- --ignored --nocapture dequant_timing`.
+#[test]
+#[ignore = "timing only"]
+fn dequant_timing() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(18);
+    for (bits, n, k) in [(4usize, 16480usize, 2560usize), (8, 2560, 6144)] {
+        let weights: Vec<QuantWeights> = (0..8)
+            .map(|_| {
+                if bits == 4 {
+                    random_quant(&ctx, &mut rng, n, k).0
+                } else {
+                    random_quant_q8(&ctx, &mut rng, n, k).0
+                }
+            })
+            .collect();
+        let out = Tensor::zeros(&ctx, &[n, k], DType::BF16).expect("out");
+        let mut best = f64::MAX;
+        let start = std::time::Instant::now();
+        let mut measured = 0;
+        while measured < 8 {
+            let pass = ctx.begin_concurrent().expect("pass");
+            for _ in 0..4 {
+                for w in &weights {
+                    dequant_to_bf16(&ctx, &pass, w, &out).expect("dequant");
+                    pass.level_barrier(&[&out]).expect("barrier");
+                }
+            }
+            let done = pass.commit().expect("commit").wait_retain().expect("wait");
+            let t = done.timing().expect("timing");
+            if start.elapsed().as_millis() >= 300 {
+                best = best.min((t.gpu_end_secs - t.gpu_start_secs) / 32.0);
+                measured += 1;
+            }
+        }
+        eprintln!(
+            "dequant q{bits} [{n} x {k}]: {:.1} us per dispatch ({:.0} GB/s written)",
+            best * 1e6,
+            (n * k * 2) as f64 / best / 1e9
+        );
+    }
+}
+
 #[test]
 fn gemm_q4_matches_cpu() {
     let ctx = MetalContext::new().expect("metal context");

@@ -12,7 +12,56 @@ use crate::weights::QuantWeights;
 const SOURCE: &str = include_str!("metal/quant.metal");
 
 /// Rows each thread of the Q4 gather GEMV accumulates.
+#[cfg(not(target_os = "linux"))]
 const Q4_GEMV_ROWS: usize = 2;
+
+/// Code bytes from which a lane of the Vulkan raw-code projection body
+/// (`vulkan/quant_rows.glsl`: the Q4 GEMVs and the 8-bit register-A GEMMs)
+/// computes two weight rows per block, sharing the block's activation work.
+/// Measured 2026-11-10 on the M5 Max in chains of barriered levels
+/// (`quant_rows_layout_probe`, us per level at one row per lane against
+/// two): two rows win from the 6.5 MB projections up (the 21 MB Q4 GDN
+/// input GEMV 54.2 against 49.8, the 16 MB Q8 attention output at three
+/// activation rows 42.6 against 35.7), about tie at 3.3 MB (11.8 against
+/// 11.1 at three rows), and lose on the 1.3 to 1.6 MB ones, whose levels
+/// are bound by their ramp and want more, shorter subgroups (8.4 to 8.7
+/// against 9.6 to 9.9 at three rows).
+#[cfg(target_os = "linux")]
+const ROWS_PAIR_MIN_CODE_BYTES: usize = 3 << 20;
+
+/// The layout of the Vulkan raw-code projection body for a weight: log2 of
+/// the lanes that walk a row set, and the weight rows a lane computes per
+/// block. The lanes are the largest power of two up to a subgroup's 32 that
+/// divides the row's blocks (one `uint4` of codes each), so no lane idles
+/// through a step; they depend on the row length alone, which keeps a row's
+/// result the same bits in every dispatch of that length (a fused stack and
+/// its slices, a weight alone and among others in one dispatch).
+#[cfg(target_os = "linux")]
+pub(crate) fn rows_layout(w: &QuantWeights) -> (usize, usize) {
+    let (n, k) = (w.out_features(), w.in_features());
+    (rows_lanes_log2(k, w.bits), rows_per_lane(n * k * w.bits / 8))
+}
+
+#[cfg(target_os = "linux")]
+fn rows_lanes_log2(k: usize, bits: usize) -> usize {
+    let blocks = k * bits / 128;
+    (blocks.trailing_zeros() as usize).min(5)
+}
+
+#[cfg(target_os = "linux")]
+fn rows_per_lane(code_bytes: usize) -> usize {
+    if code_bytes >= ROWS_PAIR_MIN_CODE_BYTES { 2 } else { 1 }
+}
+
+/// The grid of the Vulkan raw-code projection body: one subgroup per
+/// `32 >> lanes_log2` row sets of `rows` weight rows.
+#[cfg(target_os = "linux")]
+pub(crate) fn rows_grid(n: usize, lanes_log2: usize, rows: usize) -> Grid {
+    Grid::Threadgroups {
+        groups: (n.div_ceil((32 >> lanes_log2) * rows), 1, 1),
+        threadgroup: (32, 1, 1),
+    }
+}
 
 /// Row-tile height and execution-simdgroup count of a grouped Q4 GEMM.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -122,6 +171,13 @@ pub(crate) fn check_quant(w: &QuantWeights) -> Result<(usize, usize)> {
         w.group_size,
         w.bits
     );
+    // The Vulkan kernels take a block's quant group by a shift.
+    #[cfg(target_os = "linux")]
+    ensure!(
+        w.group_size.is_power_of_two(),
+        "group size {} is not a power of two",
+        w.group_size
+    );
     ensure!(w.codes.dtype() == DType::U32, "codes must be U32");
     // uint4 code loads require 16-byte alignment.
     ensure!(
@@ -148,8 +204,19 @@ pub fn gemv_quant(
     let (n, k) = check_quant(w)?;
     ensure!(x.numel() == k, "x numel {} != K {k}", x.numel());
     ensure!(y.numel() == n, "y numel {} != N {n}", y.numel());
+    // Vulkan: the 4-bit GEMVs are the raw-code projection body at one
+    // activation row (`vulkan/quant_rows.glsl`), with its params and grid.
+    #[cfg(target_os = "linux")]
+    {
+        if w.bits == 4 {
+            return gemv_q4_rows(ctx, pass, w, x, y, n, k);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
     let requested_rows =
         if w.bits == 4 && y.dtype() == DType::BF16 { Q4_GEMV_ROWS } else { 1 };
+    #[cfg(target_os = "linux")]
+    let requested_rows = 1;
     let packed_rows = if n.is_multiple_of(requested_rows) { requested_rows } else { 1 };
     let fn_name = match (w.bits, y.dtype(), packed_rows) {
         (4, DType::BF16, 1) => "gemv_q4_bf16",
@@ -172,6 +239,195 @@ pub fn gemv_quant(
         &[&u32_bytes(k), &u32_bytes(w.group_size)],
         Grid::Threadgroups { groups: (n / packed_rows, 1, 1), threadgroup: (32, 1, 1) },
     )
+}
+
+/// Vulkan: a 4-bit GEMV through the raw-code projection body at one
+/// activation row (`vulkan/quant_rows.glsl`), with its params and grid.
+#[cfg(target_os = "linux")]
+fn gemv_q4_rows(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    w: &QuantWeights,
+    x: &Tensor,
+    y: &Tensor,
+    n: usize,
+    k: usize,
+) -> Result<()> {
+    let (lanes_log2, rows) = rows_layout(w);
+    let fn_name = match (y.dtype(), rows) {
+        (DType::BF16, 1) => "gemv_q4_bf16",
+        (DType::BF16, _) => "gemv_q4_bf16_2row",
+        (DType::F32, 1) => "gemv_q4_bf16_f32out",
+        (DType::F32, _) => "gemv_q4_bf16_f32out_2row",
+        _ => anyhow::bail!("gemv output must be BF16 or F32"),
+    };
+    let pipeline = ctx.pipeline(fn_name, SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[
+            w.codes.binding(),
+            w.scales.binding(),
+            w.biases.binding(),
+            x.binding(),
+            y.binding(),
+        ],
+        &[
+            &u32_bytes(k),
+            &u32_bytes(n),
+            &u32_bytes(w.group_size),
+            &u32_bytes(lanes_log2),
+        ],
+        rows_grid(n, lanes_log2, rows),
+    )
+}
+
+/// The GEMVs of one dependency level that read the same `x`: `y = W x` for
+/// each `(W, y)` of `sets`, every `y` BF16 or F32 on its own. On Metal the
+/// dispatches of a level overlap and this is a GEMV per set. On Vulkan they
+/// do not (measured 2026-11-10, `dense_shared_levels_timing`: a decode
+/// step's router level takes as three dispatches the sum of what each takes
+/// alone, 18.9 us, and 14.0 as one), so the sets of one code width, row
+/// length and group size go out as one dispatch, up to four at a time
+/// (`gemv_q8_sets`, `gemv_q4_sets`); each output is the bits `gemv_quant`
+/// gives it.
+pub fn gemv_quant_sets(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    x: &Tensor,
+    sets: &[(&QuantWeights, &Tensor)],
+) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    for bits in [4usize, 8] {
+        let same: Vec<(&QuantWeights, &Tensor)> =
+            sets.iter().copied().filter(|(w, _)| w.bits == bits).collect();
+        let fused = same.len() >= 2
+            && same.iter().all(|(w, _)| {
+                w.in_features() == same[0].0.in_features()
+                    && w.group_size == same[0].0.group_size
+            });
+        for group in same.chunks(if fused { SETS_MAX } else { 1 }) {
+            match group {
+                [(w, y)] => gemv_quant(ctx, pass, w, x, y)?,
+                _ => gemv_sets_dispatch(ctx, pass, x, group)?,
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    for (w, y) in sets {
+        gemv_quant(ctx, pass, w, x, y)?;
+    }
+    Ok(())
+}
+
+/// Weights one multi-weight dispatch of the Vulkan projection kernels takes;
+/// must match `QR_SETS` in `vulkan/quant_rows.glsl` and `gemv_q8_sets`.
+#[cfg(target_os = "linux")]
+pub(crate) const SETS_MAX: usize = 4;
+
+/// The buffers, params and grid of a multi-weight dispatch of the Vulkan
+/// projection kernels (`vulkan/quant_rows.glsl`, `QR_SETS`; `gemv_q8_sets`)
+/// over `a` `[m, K]` (or `[K]`), and the weight rows per lane. `layout` is
+/// the kernel's fixed lanes per row set (log2) and rows per lane; without
+/// one they are the raw-code body's choice for the sets' bytes together (a
+/// row's bits depend on neither). The sets share a code width, K and group
+/// size.
+#[cfg(target_os = "linux")]
+#[allow(clippy::type_complexity)]
+pub(crate) fn sets_dispatch_args<'a>(
+    a: &'a Tensor,
+    sets: &[(&'a QuantWeights, &'a Tensor)],
+    layout: Option<(usize, usize)>,
+) -> Result<(usize, Vec<(&'a crate::metal::GpuBuffer, usize)>, [u32; 8], Grid)> {
+    ensure!(
+        (1..=SETS_MAX).contains(&sets.len()),
+        "a multi-weight projection takes 1..={SETS_MAX} weights (got {})",
+        sets.len()
+    );
+    let first = sets[0].0;
+    let (k, bits) = (first.in_features(), first.bits);
+    let mut code_bytes = 0;
+    let mut ns = [0u32; SETS_MAX];
+    let mut f32_mask = 0u32;
+    for (s, (w, c)) in sets.iter().enumerate() {
+        let (n, wk) = check_quant(w)?;
+        ensure!(
+            wk == k && w.bits == bits && w.group_size == first.group_size,
+            "the weights of a multi-weight projection differ in K, bits or group size"
+        );
+        ensure!(
+            matches!(c.dtype(), DType::BF16 | DType::F32),
+            "projection output must be BF16 or F32"
+        );
+        code_bytes += n * k * bits / 8;
+        ns[s] = n as u32;
+        f32_mask |= u32::from(c.dtype() == DType::F32) << s;
+    }
+    let (lanes_log2, rows) =
+        layout.unwrap_or((rows_lanes_log2(k, bits), rows_per_lane(code_bytes)));
+    // Unused sets repeat the first one's buffers, with no rows.
+    let set = |s: usize| sets.get(s).unwrap_or(&sets[0]);
+    let mut buffers = vec![
+        first.codes.binding(),
+        first.scales.binding(),
+        first.biases.binding(),
+        a.binding(),
+        sets[0].1.binding(),
+    ];
+    for s in 1..SETS_MAX {
+        let (w, c) = *set(s);
+        buffers.extend([
+            w.codes.binding(),
+            w.scales.binding(),
+            w.biases.binding(),
+            c.binding(),
+        ]);
+    }
+    let params = [
+        k as u32,
+        ns[0],
+        first.group_size as u32,
+        lanes_log2 as u32,
+        ns[1],
+        ns[2],
+        ns[3],
+        f32_mask,
+    ];
+    let rows_per_sg = (32 >> lanes_log2) * rows;
+    let subgroups: usize =
+        sets.iter().map(|(w, _)| w.out_features().div_ceil(rows_per_sg)).sum();
+    let grid = Grid::Threadgroups { groups: (subgroups, 1, 1), threadgroup: (32, 1, 1) };
+    Ok((rows, buffers, params, grid))
+}
+
+#[cfg(target_os = "linux")]
+fn gemv_sets_dispatch(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    x: &Tensor,
+    sets: &[(&QuantWeights, &Tensor)],
+) -> Result<()> {
+    let (k, bits) = (sets[0].0.in_features(), sets[0].0.bits);
+    ensure!(x.numel() == k, "x numel {} != K {k}", x.numel());
+    for (w, y) in sets {
+        ensure!(
+            y.numel() == w.out_features(),
+            "y numel {} != N {}",
+            y.numel(),
+            w.out_features()
+        );
+    }
+    // The 8-bit GEMV is one subgroup per row, as on Metal.
+    let layout = (bits == 8).then_some((5, 1));
+    let (rows, buffers, params, grid) = sets_dispatch_args(x, sets, layout)?;
+    let fn_name = match (bits, rows) {
+        (4, 1) => "gemv_q4_sets",
+        (4, _) => "gemv_q4_sets_2row",
+        _ => "gemv_q8_sets",
+    };
+    let pipeline = ctx.pipeline(fn_name, SOURCE, MslVersion::V3_1)?;
+    let params = params.map(u32::to_ne_bytes);
+    let params: Vec<&[u8]> = params.iter().map(|p| &p[..]).collect();
+    pass.dispatch_at(&pipeline, &buffers, &params, grid)
 }
 
 /// Writes `out[N, K] = dequant(W)` in bf16.

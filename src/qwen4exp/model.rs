@@ -4259,8 +4259,12 @@ impl Qwen4ExpModel {
             NORM_WEIGHT_BIAS,
         )?;
         pass.level_barrier(&[&p.emb, &p.query_n])?;
-        quant::gemv_quant(ctx, pass, &w.key_proj, &p.emb, &p.key)?;
-        quant::gemv_quant(ctx, pass, &w.value_proj, &p.emb, &p.value)?;
+        quant::gemv_quant_sets(
+            ctx,
+            pass,
+            &p.emb,
+            &[(&w.key_proj, &p.key), (&w.value_proj, &p.value)],
+        )?;
         pass.level_barrier(&[&p.key, &p.value])?;
         rmsnorm_grouped_bf16(
             ctx,
@@ -4376,8 +4380,12 @@ impl Qwen4ExpModel {
         if crate::ablate::on(crate::ablate::Group::Attn) {
             return Ok(());
         }
-        quant::gemv_quant(ctx, pass, &w.qkv_proj, &s.hc.mixed, &s.attn_qkv)?;
-        quant::gemv_quant(ctx, pass, &w.indexer.qk_proj, &s.hc.mixed, &s.idx_qk)?;
+        quant::gemv_quant_sets(
+            ctx,
+            pass,
+            &s.hc.mixed,
+            &[(&w.qkv_proj, &s.attn_qkv), (&w.indexer.qk_proj, &s.idx_qk)],
+        )?;
         pass.level_barrier(&[&s.attn_qkv, &s.idx_qk])?;
         q_norm_rope_split_decode(
             ctx, pass, &s.qg, &w.q_norm, &s.q, &s.gate, rot, pos, theta, eps,

@@ -26,6 +26,7 @@ const REG_SMALL_M: usize = 8;
 const REG_SIMDGROUPS_PER_TG: usize = 2;
 /// Weight rows each Q8 register-A simdgroup computes; must match
 /// `SKINNY_REG_ROWS` in skinny.metal.
+#[cfg(not(target_os = "linux"))]
 const REG_ROWS_PER_SG: usize = 2;
 /// Weight rows each Q4 register-A simdgroup computes, by m (index m - 1);
 /// must match the `GEMM_SKINNY_Q4_REG` instantiations in skinny.metal. More
@@ -89,6 +90,43 @@ const Q8_REG_FNS: [&str; REG_MAX_M] = [
     "gemm_skinny_q8_bf16_reg_m6",
     "gemm_skinny_q8_bf16_reg_m7",
     "gemm_skinny_q8_bf16_reg_m8",
+];
+/// Vulkan: the same at one weight row per lane (`quant::rows_layout`).
+#[cfg(target_os = "linux")]
+const Q8_REG_FNS_R1: [&str; REG_MAX_M] = [
+    "gemm_skinny_q8_bf16_reg_m1_r1",
+    "gemm_skinny_q8_bf16_reg_m2_r1",
+    "gemm_skinny_q8_bf16_reg_m3_r1",
+    "gemm_skinny_q8_bf16_reg_m4_r1",
+    "gemm_skinny_q8_bf16_reg_m5_r1",
+    "gemm_skinny_q8_bf16_reg_m6_r1",
+    "gemm_skinny_q8_bf16_reg_m7_r1",
+    "gemm_skinny_q8_bf16_reg_m8_r1",
+];
+/// Vulkan: the register-A body over up to four weights in one dispatch, at
+/// two weight rows per lane and at one (`gemm_skinny_q8_nt_sets`).
+#[cfg(target_os = "linux")]
+const Q8_SETS_FNS: [[&str; REG_MAX_M]; 2] = [
+    [
+        "gemm_skinny_q8_sets_m1_r1",
+        "gemm_skinny_q8_sets_m2_r1",
+        "gemm_skinny_q8_sets_m3_r1",
+        "gemm_skinny_q8_sets_m4_r1",
+        "gemm_skinny_q8_sets_m5_r1",
+        "gemm_skinny_q8_sets_m6_r1",
+        "gemm_skinny_q8_sets_m7_r1",
+        "gemm_skinny_q8_sets_m8_r1",
+    ],
+    [
+        "gemm_skinny_q8_sets_m1",
+        "gemm_skinny_q8_sets_m2",
+        "gemm_skinny_q8_sets_m3",
+        "gemm_skinny_q8_sets_m4",
+        "gemm_skinny_q8_sets_m5",
+        "gemm_skinny_q8_sets_m6",
+        "gemm_skinny_q8_sets_m7",
+        "gemm_skinny_q8_sets_m8",
+    ],
 ];
 const Q8_REG_FNS_F32: [&str; REG_MAX_M] = [
     "gemm_skinny_q8_f32_reg_m1",
@@ -217,6 +255,67 @@ fn dispatch_q4_reg(
     )
 }
 
+/// Vulkan: the raw-code projection body (`vulkan/quant_rows.glsl`), with its
+/// params and grid. The f32 kernels (the LM head) exist at two rows per lane
+/// only.
+#[cfg(target_os = "linux")]
+fn dispatch_q8_reg(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    a: &Tensor,
+    w: &QuantWeights,
+    c: &Tensor,
+    names: &[&'static str; REG_MAX_M],
+    (m, k, n): (usize, usize, usize),
+) -> Result<()> {
+    let (lanes_log2, rows) = crate::kernels::quant::rows_layout(w);
+    let rows = if c.dtype() == DType::F32 { 2 } else { rows };
+    let name = if rows == 1 { Q8_REG_FNS_R1[m - 1] } else { names[m - 1] };
+    let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[
+            w.codes.binding(),
+            w.scales.binding(),
+            w.biases.binding(),
+            a.binding(),
+            c.binding(),
+        ],
+        &[
+            &u32_bytes(k),
+            &u32_bytes(n),
+            &u32_bytes(w.group_size),
+            &u32_bytes(lanes_log2),
+        ],
+        crate::kernels::quant::rows_grid(n, lanes_log2, rows),
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn dispatch_q8_reg(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    a: &Tensor,
+    w: &QuantWeights,
+    c: &Tensor,
+    names: &[&'static str; REG_MAX_M],
+    (m, k, n): (usize, usize, usize),
+) -> Result<()> {
+    let pipeline = ctx.pipeline(names[m - 1], SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[
+            w.codes.binding(),
+            w.scales.binding(),
+            w.biases.binding(),
+            a.binding(),
+            c.binding(),
+        ],
+        &[&u32_bytes(k), &u32_bytes(n), &u32_bytes(w.group_size)],
+        reg_grid(n, REG_SIMDGROUPS_PER_TG, REG_ROWS_PER_SG),
+    )
+}
+
 /// Small-M affine-Q8 GEMM (the 8-bit tensors are the narrow routers, gates
 /// and stream mixers, plus every dense projection and the LM head of a
 /// `--q8-dense` checkpoint). The staged kernels have the numerics of the
@@ -247,31 +346,18 @@ pub fn gemm_skinny_q8_nt(
     ensure!(a.shape() == [m, k], "A shape {:?} != [{m}, {k}]", a.shape());
     ensure!(c.numel() == m * n, "C numel {} != {m}x{n}", c.numel());
     ensure!(a.dtype() == DType::BF16, "skinny q8 GEMM input must be BF16");
+    // The Vulkan kernels take a block's quant group by a shift.
+    #[cfg(target_os = "linux")]
+    ensure!(
+        w.group_size.is_power_of_two(),
+        "group size {} is not a power of two",
+        w.group_size
+    );
     // Register-A for small m (no threadgroup staging or barriers: the
     // narrow, deep mixers and routers are latency-bound in the staged walk).
-    let reg_names = match c.dtype() {
-        DType::BF16 => Some(&Q8_REG_FNS),
-        DType::F32 if n >= WIDE_N_MIN => Some(&Q8_REG_FNS_F32),
-        _ => None,
-    };
-    if let Some(names) = reg_names
-        && m <= REG_MAX_M
-        && w.group_size.is_multiple_of(16)
-        && k.is_multiple_of(16)
-    {
-        let pipeline = ctx.pipeline(names[m - 1], SOURCE, MslVersion::V3_1)?;
-        return pass.dispatch_at(
-            &pipeline,
-            &[
-                w.codes.binding(),
-                w.scales.binding(),
-                w.biases.binding(),
-                a.binding(),
-                c.binding(),
-            ],
-            &[&u32_bytes(k), &u32_bytes(n), &u32_bytes(w.group_size)],
-            reg_grid(n, REG_SIMDGROUPS_PER_TG, REG_ROWS_PER_SG),
-        );
+    if q8_reg_routes(m, w, c) {
+        let names = if c.dtype() == DType::F32 { &Q8_REG_FNS_F32 } else { &Q8_REG_FNS };
+        return dispatch_q8_reg(ctx, pass, a, w, c, names, (m, k, n));
     }
     let fn_name = match (m <= REG_MAX_M, c.dtype()) {
         (true, DType::F32) => "gemm_skinny_q8_f32_m8",
@@ -293,6 +379,75 @@ pub fn gemm_skinny_q8_nt(
         &[&u32_bytes(k), &u32_bytes(n), &u32_bytes(w.group_size), &u32_bytes(m)],
         staged_grid(n),
     )
+}
+
+/// Whether `gemm_skinny_q8_nt` takes the register-A kernel for this weight
+/// and output at `m` rows (the kernel whose rows a multi-weight dispatch
+/// reproduces).
+fn q8_reg_routes(m: usize, w: &QuantWeights, c: &Tensor) -> bool {
+    let wide_enough = match c.dtype() {
+        DType::BF16 => true,
+        DType::F32 => w.out_features() >= WIDE_N_MIN,
+        _ => false,
+    };
+    w.bits == 8
+        && wide_enough
+        && (1..=REG_MAX_M).contains(&m)
+        && w.group_size.is_multiple_of(16)
+        && w.in_features().is_multiple_of(16)
+}
+
+/// The small-M 8-bit GEMMs of one dependency level that read the same `a`
+/// `[m, K]`: `C = A . W^T` for each `(W, C)` of `sets`. On Metal the
+/// dispatches of a level overlap and this is `gemm_skinny_q8_nt` per set. On
+/// Vulkan they do not (`quant::gemv_quant_sets`), so the sets that take the
+/// register-A kernel and share K and group size go out as one dispatch, up to
+/// four at a time; each output is the bits `gemm_skinny_q8_nt` gives it.
+pub fn gemm_skinny_q8_nt_sets(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    a: &Tensor,
+    sets: &[(&QuantWeights, &Tensor)],
+) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use crate::kernels::quant::{SETS_MAX, sets_dispatch_args};
+        let m = a.shape()[0];
+        let (reg, rest): (Vec<_>, Vec<_>) =
+            sets.iter().copied().partition(|(w, c)| q8_reg_routes(m, w, c));
+        let fused = reg.len() >= 2
+            && reg.iter().all(|(w, _)| {
+                w.in_features() == reg[0].0.in_features()
+                    && w.group_size == reg[0].0.group_size
+            });
+        for group in reg.chunks(if fused { SETS_MAX } else { 1 }) {
+            if let [(w, c)] = group {
+                gemm_skinny_q8_nt(ctx, pass, a, w, c)?;
+                continue;
+            }
+            let k = group[0].0.in_features();
+            ensure!(a.shape() == [m, k], "A shape {:?} != [{m}, {k}]", a.shape());
+            ensure!(a.dtype() == DType::BF16, "skinny q8 GEMM input must be BF16");
+            for (w, c) in group {
+                let n = w.out_features();
+                ensure!(c.numel() == m * n, "C numel {} != {m}x{n}", c.numel());
+            }
+            let (rows, buffers, params, grid) = sets_dispatch_args(a, group, None)?;
+            let pipeline =
+                ctx.pipeline(Q8_SETS_FNS[rows - 1][m - 1], SOURCE, MslVersion::V3_1)?;
+            let params = params.map(u32::to_ne_bytes);
+            let params: Vec<&[u8]> = params.iter().map(|p| &p[..]).collect();
+            pass.dispatch_at(&pipeline, &buffers, &params, grid)?;
+        }
+        for (w, c) in rest {
+            gemm_skinny_q8_nt(ctx, pass, a, w, c)?;
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    for (w, c) in sets {
+        gemm_skinny_q8_nt(ctx, pass, a, w, c)?;
+    }
+    Ok(())
 }
 
 /// Small-M affine-Q4 GEMM. Register-A (`m <= 8`, `group_size == 64`,
