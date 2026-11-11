@@ -265,11 +265,23 @@ void main() {
         }
     }
 
+    // The subgroup's RR x MB sums leave in one store, lane j carrying output
+    // j (activation row j / RR, weight row j % RR; RR x MB is at most a
+    // subgroup's 32 lanes). Metal's lane 0 stores each sum as it is reduced;
+    // here every such store is a branch of its own for the whole subgroup,
+    // and at m = 3 the twelve of them cost about a twentieth of a short
+    // subgroup's time. Measured 2026-11-11 in chains of barriered levels at
+    // m = 3 (`q4_reg_variants_probe`): the GDN input projection (4120
+    // subgroups of 2.5 blocks a lane) 65.6 to 63.6 us per level, the output
+    // projection (640 subgroups of 6) 27.4 to 27.2, the same bits.
+    float out_sum = 0.0;
     [[unroll]] for (uint i = 0; i < MB; ++i) {
         [[unroll]] for (uint r = 0; r < RR; ++r) {
             float sum = subgroupAdd(acc[r][i]);
-            if (lane == 0 && row0 + r < N) SKINNY_STORE(c, i, N, row0 + r, sum);
+            if (lane == i * RR + r) out_sum = sum;
         }
     }
+    uint out_row = row0 + lane % RR;
+    if (lane < RR * MB && out_row < N) SKINNY_STORE(c, lane / RR, N, out_row, out_sum);
 }
 #endif

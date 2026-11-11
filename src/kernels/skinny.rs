@@ -54,6 +54,48 @@ pub fn stack_route_uniform(
     slice_ns.iter().all(|&n| reg_routes(m, n, block_walk_ok) == stack_reg)
 }
 
+/// Vulkan: whether the dispatches of one dependency level run side by side,
+/// as they do on Metal. They do on the Mesa lily runs on (Honeykrisp with
+/// "hk: elide the barrier between application dispatches on M5"); on a
+/// driver that runs them one after another, `LILY_FUSE_LEVELS=1` brings back
+/// the encodings made for it: one multi-weight dispatch for the 8-bit
+/// projections of a level (`gemm_skinny_q8_nt_sets`) and one fused GEMM plus
+/// a split level for a stack (`stack_as_slices`). The outputs are the same
+/// bits either way, so the switch is also the A/B of the two encodings on
+/// one build.
+#[cfg(target_os = "linux")]
+fn level_dispatches_overlap() -> bool {
+    static OVERLAP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OVERLAP.get_or_init(|| std::env::var_os("LILY_FUSE_LEVELS").is_none())
+}
+
+/// Whether a stacked projection that could go out as one fused GEMM at `m`
+/// rows (`moe_ffn::stack_fused_view`) goes out as its slices instead, each a
+/// dispatch of the same level writing its own output. On Metal the fused
+/// GEMM is one cold start where the slices are several, and the level that
+/// splits its output is free. On Vulkan a level's dispatches overlap as well
+/// as one dispatch's threadgroups do, and the split level costs what any
+/// level does (a barrier and a launch, 2.5 to 3 us), so the slices win at
+/// every register-A row count. Measured 2026-11-11 in chains of levels at
+/// m = 1, 2, 3, 4 and 8 (`verify_levels_timing`; us per level, fused and
+/// split against the slices, smallest first): the 4-bit GDN input stack
+/// 53.8/66.8/68.6/82.0/154.3 against 51.7/61.5/65.9/79.6/148.4; the 8-bit
+/// attention stack with the indexer's projection on its level
+/// 71.6/72.9/75.3/81.5/136.2 against 68.9/69.9/71.2/82.2/130.7. Past the
+/// register-A rows (the staged kernels) nothing was measured and the stack
+/// stays fused.
+pub fn stack_as_slices(m: usize) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        level_dispatches_overlap() && m <= REG_MAX_M
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = m;
+        false
+    }
+}
+
 /// Largest row count routed to the staged small-M family.
 pub const DENSE_SMALLM_THRESHOLD: usize = 16;
 
@@ -398,11 +440,16 @@ fn q8_reg_routes(m: usize, w: &QuantWeights, c: &Tensor) -> bool {
 }
 
 /// The small-M 8-bit GEMMs of one dependency level that read the same `a`
-/// `[m, K]`: `C = A . W^T` for each `(W, C)` of `sets`. On Metal the
-/// dispatches of a level overlap and this is `gemm_skinny_q8_nt` per set. On
-/// Vulkan they do not (`quant::gemv_quant_sets`), so the sets that take the
-/// register-A kernel and share K and group size go out as one dispatch, up to
-/// four at a time; each output is the bits `gemm_skinny_q8_nt` gives it.
+/// `[m, K]`: `C = A . W^T` for each `(W, C)` of `sets`. The dispatches of a
+/// level overlap, on Metal and on the Vulkan driver lily runs on, and this is
+/// `gemm_skinny_q8_nt` per set. On a Vulkan driver where they do not
+/// (`level_dispatches_overlap`) it is `gemm_skinny_q8_nt_sets_fused`. Each
+/// output is the same bits either way. Measured 2026-11-11 on the batched
+/// router level (router, shared gate/up, shared gate; `verify_levels_timing`,
+/// us per level at m = 1, 2, 3, 4, 8): 13.8/14.1/14.6/15.5/24.9 as one
+/// multi-weight dispatch, 12.4/12.8/13.4/14.9/25.5 as three dispatches (the
+/// multi-weight kernel picks each subgroup's weight with a dozen loads and
+/// gives every weight the rows per lane of the largest).
 pub fn gemm_skinny_q8_nt_sets(
     ctx: &MetalContext,
     pass: &ComputePass<'_>,
@@ -410,41 +457,55 @@ pub fn gemm_skinny_q8_nt_sets(
     sets: &[(&QuantWeights, &Tensor)],
 ) -> Result<()> {
     #[cfg(target_os = "linux")]
-    {
-        use crate::kernels::quant::{SETS_MAX, sets_dispatch_args};
-        let m = a.shape()[0];
-        let (reg, rest): (Vec<_>, Vec<_>) =
-            sets.iter().copied().partition(|(w, c)| q8_reg_routes(m, w, c));
-        let fused = reg.len() >= 2
-            && reg.iter().all(|(w, _)| {
-                w.in_features() == reg[0].0.in_features()
-                    && w.group_size == reg[0].0.group_size
-            });
-        for group in reg.chunks(if fused { SETS_MAX } else { 1 }) {
-            if let [(w, c)] = group {
-                gemm_skinny_q8_nt(ctx, pass, a, w, c)?;
-                continue;
-            }
-            let k = group[0].0.in_features();
-            ensure!(a.shape() == [m, k], "A shape {:?} != [{m}, {k}]", a.shape());
-            ensure!(a.dtype() == DType::BF16, "skinny q8 GEMM input must be BF16");
-            for (w, c) in group {
-                let n = w.out_features();
-                ensure!(c.numel() == m * n, "C numel {} != {m}x{n}", c.numel());
-            }
-            let (rows, buffers, params, grid) = sets_dispatch_args(a, group, None)?;
-            let pipeline =
-                ctx.pipeline(Q8_SETS_FNS[rows - 1][m - 1], SOURCE, MslVersion::V3_1)?;
-            let params = params.map(u32::to_ne_bytes);
-            let params: Vec<&[u8]> = params.iter().map(|p| &p[..]).collect();
-            pass.dispatch_at(&pipeline, &buffers, &params, grid)?;
-        }
-        for (w, c) in rest {
-            gemm_skinny_q8_nt(ctx, pass, a, w, c)?;
-        }
+    if !level_dispatches_overlap() {
+        return gemm_skinny_q8_nt_sets_fused(ctx, pass, a, sets);
     }
-    #[cfg(not(target_os = "linux"))]
     for (w, c) in sets {
+        gemm_skinny_q8_nt(ctx, pass, a, w, c)?;
+    }
+    Ok(())
+}
+
+/// Vulkan: `gemm_skinny_q8_nt_sets` with the sets that take the register-A
+/// kernel and share K and group size as one dispatch, up to four at a time
+/// (`vulkan/quant_rows.glsl`, `QR_SETS`); each output is the bits
+/// `gemm_skinny_q8_nt` gives it.
+#[cfg(target_os = "linux")]
+pub fn gemm_skinny_q8_nt_sets_fused(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    a: &Tensor,
+    sets: &[(&QuantWeights, &Tensor)],
+) -> Result<()> {
+    use crate::kernels::quant::{SETS_MAX, sets_dispatch_args};
+    let m = a.shape()[0];
+    let (reg, rest): (Vec<_>, Vec<_>) =
+        sets.iter().copied().partition(|(w, c)| q8_reg_routes(m, w, c));
+    let fused = reg.len() >= 2
+        && reg.iter().all(|(w, _)| {
+            w.in_features() == reg[0].0.in_features()
+                && w.group_size == reg[0].0.group_size
+        });
+    for group in reg.chunks(if fused { SETS_MAX } else { 1 }) {
+        if let [(w, c)] = group {
+            gemm_skinny_q8_nt(ctx, pass, a, w, c)?;
+            continue;
+        }
+        let k = group[0].0.in_features();
+        ensure!(a.shape() == [m, k], "A shape {:?} != [{m}, {k}]", a.shape());
+        ensure!(a.dtype() == DType::BF16, "skinny q8 GEMM input must be BF16");
+        for (w, c) in group {
+            let n = w.out_features();
+            ensure!(c.numel() == m * n, "C numel {} != {m}x{n}", c.numel());
+        }
+        let (rows, buffers, params, grid) = sets_dispatch_args(a, group, None)?;
+        let pipeline =
+            ctx.pipeline(Q8_SETS_FNS[rows - 1][m - 1], SOURCE, MslVersion::V3_1)?;
+        let params = params.map(u32::to_ne_bytes);
+        let params: Vec<&[u8]> = params.iter().map(|p| &p[..]).collect();
+        pass.dispatch_at(&pipeline, &buffers, &params, grid)?;
+    }
+    for (w, c) in rest {
         gemm_skinny_q8_nt(ctx, pass, a, w, c)?;
     }
     Ok(())

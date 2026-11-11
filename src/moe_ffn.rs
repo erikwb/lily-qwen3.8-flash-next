@@ -90,6 +90,12 @@ pub(crate) fn stack_fused_view(
 /// and splits the result into the slice outputs; otherwise dispatches the
 /// corresponding per-slice projections. Keeping both arms here prevents the
 /// fused and fallback projection lists from drifting.
+///
+/// On Vulkan a stack that could go out fused at a register-A row count goes
+/// out as its slices instead (`skinny::stack_as_slices`): dispatches of one
+/// level, the smallest first, each writing its own output, so the level that
+/// splits the fused output is not encoded. The bits are the fused stack's
+/// (`stack_fused_view` admits a stack only where they are).
 pub(crate) fn project_stack_or_slices<const N: usize>(
     ctx: &MetalContext,
     pass: &ComputePass<'_>,
@@ -101,6 +107,17 @@ pub(crate) fn project_stack_or_slices<const N: usize>(
 ) -> Result<()> {
     let m = a.shape()[0];
     let widths: [usize; N] = std::array::from_fn(|i| projections[i].1.numel() / m);
+    if skinny::stack_as_slices(m)
+        && stack_fused_view(a, stack_w, stack_c, &widths)?.is_some()
+    {
+        let mut order: [usize; N] = std::array::from_fn(|i| i);
+        order.sort_by_key(|&i| widths[i]);
+        for i in order {
+            let (w, out) = projections[i];
+            project_mat(ctx, pass, a, w, out, scratch)?;
+        }
+        return Ok(());
+    }
     if let Some(c) = project_stack_fused(ctx, pass, a, stack_w, stack_c, &widths)? {
         pass.level_barrier(&[&c])?;
         let outs: [&Tensor; N] = std::array::from_fn(|i| projections[i].1);
