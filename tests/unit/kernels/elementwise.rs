@@ -471,3 +471,730 @@ fn level_size_bandwidth_probe() {
         eprintln!("level {mb:>3} MB x {levels:>3}: {}", results.join(" | "));
     }
 }
+
+/// What a tiny dependency level costs on this backend, by grid and
+/// threadgroup shape and by what its threads do (the probe kernels of
+/// `tests/vulkan/levels_test.comp`): chains of `LEVELS` dispatches in one
+/// concurrent pass, with a level barrier after each and with none, then the
+/// same tiny level between 4 MB streaming levels (what the decode step has:
+/// the cost that matters is what the tiny level adds to its neighbours).
+/// Prints microseconds per level, best of five passes. Run with `--ignored
+/// --nocapture`; `LILY_LEVEL_PROBE_LEVELS` sets the chain length.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "timing probe; run with --ignored --nocapture"]
+fn tiny_level_floor_probe() {
+    let ctx = MetalContext::new().expect("metal context");
+    let levels: usize = std::env::var("LILY_LEVEL_PROBE_LEVELS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(512);
+    let words = 1usize << 16;
+    let src = Tensor::zeros(&ctx, &[words], DType::U32).expect("src");
+    let dst = Tensor::zeros(&ctx, &[words], DType::U32).expect("dst");
+    let four = [u32_bytes(2560), u32_bytes(0), u32_bytes(0), u32_bytes(0)];
+    // (kernel, threads of the grid, threadgroup, params)
+    let cases: &[(&'static str, usize, usize, usize)] = &[
+        ("lv_nop", 1, 1, 0),
+        ("lv_nop", 32, 32, 0),
+        ("lv_nop", 256, 256, 0),
+        ("lv_nop", 1024, 1024, 0),
+        ("lv_nop", 2560, 256, 0),
+        ("lv_nop", 2560, 1024, 0),
+        ("lv_nop", 10240, 256, 0),
+        ("lv_nop", 10240, 1024, 0),
+        ("lv_guard", 2560, 256, 0),
+        ("lv_guard", 10240, 256, 0),
+        ("lv_copy1", 1, 1, 0),
+        ("lv_copy1", 256, 256, 0),
+        ("lv_copy1", 2560, 64, 0),
+        ("lv_copy1", 2560, 256, 0),
+        ("lv_copy1", 2560, 1024, 0),
+        ("lv_copy1", 10240, 256, 0),
+        ("lv_copy1", 10240, 1024, 0),
+        ("lv_copy4", 640, 32, 0),
+        ("lv_copy4", 640, 128, 0),
+        ("lv_copy4", 640, 256, 0),
+        ("lv_copy4", 640, 640, 0),
+        ("lv_copy4", 2560, 256, 0),
+        ("lv_copy4", 2560, 1024, 0),
+        ("lv_copy1_params", 2560, 256, 4),
+        ("lv_copy1_params", 10240, 256, 4),
+    ];
+    let dispatch = |pass: &ComputePass<'_>, &(name, threads, tg, params): &(&'static str, usize, usize, usize)| {
+        let kernel = ctx.pipeline(name, "", MslVersion::V3_1).expect("kernel");
+        let params: Vec<&[u8]> = four[..params].iter().map(|p| &p[..]).collect();
+        pass.dispatch_at(
+            &kernel,
+            &[src.binding(), dst.binding()],
+            &params,
+            Grid::Threads { grid: (threads, 1, 1), threadgroup: (tg, 1, 1) },
+        )
+        .expect("dispatch");
+    };
+    let span = |pass: ComputePass<'_>| {
+        let done = pass.commit().expect("commit").wait_retain().expect("wait");
+        let t = done.timing().expect("timing");
+        t.gpu_end_secs - t.gpu_start_secs
+    };
+    for case in cases {
+        let mut best = [f64::INFINITY; 2];
+        for round in 0..6 {
+            for (mode, barriers) in [true, false].into_iter().enumerate() {
+                let pass = ctx.begin_concurrent().expect("pass");
+                for _ in 0..levels {
+                    dispatch(&pass, case);
+                    if barriers {
+                        pass.level_barrier(&[&dst]).expect("barrier");
+                    }
+                }
+                let secs = span(pass);
+                if round > 0 {
+                    best[mode] = best[mode].min(secs / levels as f64);
+                }
+            }
+        }
+        let (name, threads, tg, _) = case;
+        eprintln!(
+            "{name:<16} {threads:>6} threads in {:>3} x {tg:>4}: {:>6.2} us per level barriered, {:>6.2} with no barriers",
+            threads.div_ceil(*tg),
+            best[0] * 1e6,
+            best[1] * 1e6
+        );
+    }
+
+    // The tiny level between streaming levels.
+    let bytes = 1usize << 30;
+    let big = Tensor::zeros(&ctx, &[bytes / 4], DType::U32).expect("big");
+    let out = Tensor::zeros(&ctx, &[1024], DType::U32).expect("out");
+    let read = ctx.pipeline("bw_read_u4", TEST_SOURCE, MslVersion::V3_1).expect("read");
+    let per = u32_bytes(8);
+    let (size, stream_levels) = (4usize << 20, 64usize);
+    let stream = |pass: &ComputePass<'_>, i: usize| {
+        let view = big.view(i * (bytes / stream_levels) / 4, &[size / 4]).expect("view");
+        pass.dispatch_at(
+            &read,
+            &[view.binding(), out.binding()],
+            &[&per[..]],
+            Grid::Threads { grid: (size / 16 / 8, 1, 1), threadgroup: (256, 1, 1) },
+        )
+        .expect("dispatch");
+        pass.level_barrier(&[&out]).expect("barrier");
+    };
+    let between: &[Option<(&'static str, usize, usize, usize)>] = &[
+        None,
+        Some(("lv_nop", 1, 1, 0)),
+        Some(("lv_copy1", 2560, 256, 0)),
+        Some(("lv_copy1", 2560, 1024, 0)),
+        Some(("lv_copy1", 10240, 256, 0)),
+        Some(("lv_copy1", 10240, 1024, 0)),
+        Some(("lv_copy4", 640, 128, 0)),
+        Some(("lv_copy4", 2560, 256, 0)),
+        Some(("lv_copy1_params", 10240, 256, 4)),
+    ];
+    let mut best = vec![f64::INFINITY; between.len()];
+    for round in 0..7 {
+        for k in 0..between.len() {
+            let which = (round + k) % between.len();
+            let pass = ctx.begin_concurrent().expect("pass");
+            for i in 0..stream_levels {
+                stream(&pass, i);
+                if let Some(case) = &between[which] {
+                    dispatch(&pass, case);
+                    pass.level_barrier(&[&dst]).expect("barrier");
+                }
+            }
+            let secs = span(pass);
+            if round > 0 {
+                best[which] = best[which].min(secs / stream_levels as f64);
+            }
+        }
+    }
+    for (case, secs) in between.iter().zip(&best) {
+        let what = match case {
+            None => "nothing".to_string(),
+            Some((name, threads, tg, _)) => format!("{name} {threads} threads / {tg}"),
+        };
+        eprintln!(
+            "4 MB stream level + {what}: {:.2} us per pair ({:+.2} us)",
+            secs * 1e6,
+            (secs - best[0]) * 1e6
+        );
+    }
+}
+
+/// What bounds a streaming level on this backend: the ALU rate (`lv_alu`,
+/// multiply-adds only), then 4 MB levels read by `lv_read_w<W>` in every
+/// shape of threads x rounds x W loads issued together, with and without
+/// ALU work after each round. Chains of 64 levels over distinct regions, a
+/// barrier between; microseconds per level, best of five.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "timing probe; run with --ignored --nocapture"]
+fn level_shape_probe() {
+    let ctx = MetalContext::new().expect("metal context");
+    let bytes = 1usize << 30;
+    let big = Tensor::zeros(&ctx, &[bytes / 4], DType::U32).expect("big");
+    let out = Tensor::zeros(&ctx, &[1024], DType::U32).expect("out");
+    let levels = 64usize;
+    let span = |pass: ComputePass<'_>| {
+        let done = pass.commit().expect("commit").wait_retain().expect("wait");
+        let t = done.timing().expect("timing");
+        t.gpu_end_secs - t.gpu_start_secs
+    };
+    let alu = ctx.pipeline("lv_alu", "", MslVersion::V3_1).expect("alu");
+    for threads in [256usize, 10240, 324 * 128, 2560 * 32] {
+        for n in [0usize, 16, 64, 256] {
+            let mut best = f64::INFINITY;
+            for _ in 0..5 {
+                let pass = ctx.begin_concurrent().expect("pass");
+                for _ in 0..levels {
+                    pass.dispatch_at(
+                        &alu,
+                        &[big.binding(), out.binding()],
+                        &[&u32_bytes(n)],
+                        Grid::Threads { grid: (threads, 1, 1), threadgroup: (256, 1, 1) },
+                    )
+                    .expect("dispatch");
+                    pass.level_barrier(&[&out]).expect("barrier");
+                }
+                best = best.min(span(pass) / levels as f64);
+            }
+            eprintln!(
+                "lv_alu {threads} threads x {n:>3} rounds of 8 fma: {:.2} us per level",
+                best * 1e6
+            );
+        }
+    }
+    if std::env::var_os("LILY_LEVEL_SHAPE_ALU_ONLY").is_some() {
+        return;
+    }
+    let size = 4usize << 20;
+    // (W, rounds, alu rounds after each round's loads, alu rounds between
+    // their issue and their use, 64 more live registers)
+    let shapes: &[(usize, usize, usize, usize, usize)] = &[
+        (1, 1, 0, 0, 0),
+        (1, 8, 0, 0, 0),
+        (4, 1, 0, 0, 0),
+        (4, 4, 0, 0, 0),
+        (8, 2, 0, 0, 0),
+        (4, 1, 0, 0, 1),
+        (4, 4, 0, 0, 1),
+        (4, 1, 16, 0, 0),
+        (4, 1, 0, 16, 0),
+        (4, 1, 64, 0, 0),
+        (4, 1, 0, 64, 0),
+        (4, 4, 16, 0, 0),
+        (4, 4, 0, 16, 0),
+        (4, 4, 16, 0, 1),
+        (8, 2, 32, 0, 0),
+        (8, 2, 0, 32, 0),
+        (1, 4, 16, 0, 0),
+        (1, 4, 0, 16, 0),
+    ];
+    let mut best = vec![f64::INFINITY; shapes.len()];
+    for round in 0..6 {
+        for k in 0..shapes.len() {
+            let which = (round + k) % shapes.len();
+            let (w, rounds, alu, pre, fat) = shapes[which];
+            let name: &'static str = match w {
+                1 => "lv_read_w1",
+                2 => "lv_read_w2",
+                4 => "lv_read_w4",
+                _ => "lv_read_w8",
+            };
+            let kernel = ctx.pipeline(name, "", MslVersion::V3_1).expect("read");
+            let threads = size / 16 / w / rounds;
+            let pass = ctx.begin_concurrent().expect("pass");
+            for i in 0..levels {
+                let view =
+                    big.view(i * (bytes / levels) / 4, &[size / 4]).expect("view");
+                pass.dispatch_at(
+                    &kernel,
+                    &[view.binding(), out.binding()],
+                    &[&u32_bytes(rounds), &u32_bytes(alu), &u32_bytes(pre), &u32_bytes(fat)],
+                    Grid::Threads { grid: (threads, 1, 1), threadgroup: (256, 1, 1) },
+                )
+                .expect("dispatch");
+                pass.level_barrier(&[&out]).expect("barrier");
+            }
+            let secs = span(pass);
+            if round > 0 {
+                best[which] = best[which].min(secs / levels as f64);
+            }
+        }
+    }
+    for ((w, rounds, alu, pre, fat), secs) in shapes.iter().zip(&best) {
+        let threads = size / 16 / w / rounds;
+        eprintln!(
+            "4 MB level, {threads:>6} threads x {rounds} rounds x {w} loads, alu {alu:>2} after / {pre:>2} before use, fat {fat}: {:>6.2} us ({:.0} GB/s; {:.2} M multiply-adds)",
+            secs * 1e6,
+            size as f64 / secs / 1e9,
+            (threads * rounds * (alu + pre) * 8) as f64 / 1e6
+        );
+    }
+}
+
+/// The decode step's small kernels at the model's shapes (H 2560, 4 streams,
+/// 48 GDN heads, conv over 10240 channels), each as decode runs it: alone in
+/// a chain of barriered levels, and between 4 MB streaming levels (what it
+/// adds to its neighbours is its cost in a step). Microseconds per level,
+/// best of several passes. Run with `--ignored --nocapture`.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "timing probe; run with --ignored --nocapture"]
+fn small_kernels_chain_timing() {
+    use crate::kernels::gdn::{conv_window_rollback, conv1d_step};
+    use crate::kernels::hc::{hc_inject_bf16, rmsnorm_grouped_bf16};
+    use crate::kernels::norm::rmsnorm_bf16;
+    use crate::kernels::spec::copy_row;
+    let ctx = MetalContext::new().expect("metal context");
+    let (h, g, c, heads) = (2560usize, 4usize, 10240usize, 48usize);
+    let bf = |shape: &[usize]| Tensor::zeros(&ctx, shape, DType::BF16).expect("bf16");
+    let per_state = heads * 128 * 128;
+    let mid = Tensor::zeros(&ctx, &[2, per_state], DType::F32).expect("mid");
+    let st = Tensor::zeros(&ctx, &[per_state], DType::F32).expect("state");
+    let (hyper1, branch1, inj1) = (bf(&[1, g * h]), bf(&[1, h]), bf(&[1, g]));
+    let (hyper3, branch3, inj3) = (bf(&[3, g * h]), bf(&[3, h]), bf(&[3, g]));
+    let (win, win2, x1, x3) = (bf(&[c, 3]), bf(&[c, 3]), bf(&[c]), bf(&[3, c]));
+    let (conv_w, conv_out) = (bf(&[4, c]), bf(&[c]));
+    let (hidden, hidden2) = (bf(&[g * h]), bf(&[g * h]));
+    let (gu, act) = (bf(&[3, 2 * 1024]), bf(&[3, 1024]));
+    let (split_src, s0, s1, s2) =
+        (bf(&[3, c]), bf(&[3, 4096]), bf(&[3, 4096]), bf(&[3, 2048]));
+    let (norm_x, norm_w, norm_out) = (bf(&[3, h]), bf(&[h]), bf(&[3, h]));
+    let (gn_w, gn_out) = (bf(&[g * h]), bf(&[3, g * h]));
+    type Run<'a> = Box<dyn Fn(&ComputePass<'_>) + 'a>;
+    let cases: Vec<(&str, Run<'_>)> = vec![
+        (
+            "hc_inject_bf16 m=1",
+            Box::new(|p| hc_inject_bf16(&ctx, p, &hyper1, &branch1, &inj1, h, g).unwrap()),
+        ),
+        (
+            "hc_inject_bf16 m=3",
+            Box::new(|p| hc_inject_bf16(&ctx, p, &hyper3, &branch3, &inj3, h, g).unwrap()),
+        ),
+        (
+            "conv1d_step_bf16",
+            Box::new(|p| conv1d_step(&ctx, p, &win, &x1, &conv_w, &conv_out).unwrap()),
+        ),
+        (
+            "conv_window_rollback_bf16",
+            Box::new(|p| conv_window_rollback(&ctx, p, &win, &x3, &win2, 2).unwrap()),
+        ),
+        (
+            "copy_row_u32 3.1 MB state",
+            Box::new(|p| copy_row(&ctx, p, &mid, crate::kernels::Arg::Const(1), &st).unwrap()),
+        ),
+        (
+            "copy_u32 hyper row",
+            Box::new(|p| copy_words(&ctx, p, &hidden, &hidden2).unwrap()),
+        ),
+        (
+            "silu_mul_gu_rows_bf16 m=3",
+            Box::new(|p| silu_mul_rows_bf16(&ctx, p, &gu, &act).unwrap()),
+        ),
+        (
+            "split_cols_bf16 m=3",
+            Box::new(|p| split_cols_bf16(&ctx, p, &split_src, &[&s0, &s1, &s2]).unwrap()),
+        ),
+        (
+            "rmsnorm_bf16 m=3",
+            Box::new(|p| rmsnorm_bf16(&ctx, p, &norm_x, &norm_w, &norm_out, 1e-6, 1.0).unwrap()),
+        ),
+        (
+            "rmsnorm_grouped_bf16 m=3",
+            Box::new(|p| {
+                rmsnorm_grouped_bf16(&ctx, p, &hyper3, &gn_w, &gn_out, h, g, 1e-6, 1.0).unwrap()
+            }),
+        ),
+    ];
+    let span = |pass: ComputePass<'_>| {
+        let done = pass.commit().expect("commit").wait_retain().expect("wait");
+        let t = done.timing().expect("timing");
+        t.gpu_end_secs - t.gpu_start_secs
+    };
+    let bytes = 1usize << 30;
+    let big = Tensor::zeros(&ctx, &[bytes / 4], DType::U32).expect("big");
+    let out = Tensor::zeros(&ctx, &[1024], DType::U32).expect("out");
+    let read = ctx.pipeline("bw_read_u4", TEST_SOURCE, MslVersion::V3_1).expect("read");
+    let per = u32_bytes(8);
+    let (size, levels) = (4usize << 20, 64usize);
+    let stream = |pass: &ComputePass<'_>, i: usize| {
+        let view = big.view(i * (bytes / levels) / 4, &[size / 4]).expect("view");
+        pass.dispatch_at(
+            &read,
+            &[view.binding(), out.binding()],
+            &[&per[..]],
+            Grid::Threads { grid: (size / 16 / 8, 1, 1), threadgroup: (256, 1, 1) },
+        )
+        .expect("dispatch");
+        pass.level_barrier(&[&out]).expect("barrier");
+    };
+    let mut alone = vec![f64::INFINITY; cases.len()];
+    let mut between = vec![f64::INFINITY; cases.len()];
+    let mut base = f64::INFINITY;
+    for round in 0..6 {
+        let pass = ctx.begin_concurrent().expect("pass");
+        for i in 0..levels {
+            stream(&pass, i);
+        }
+        let secs = span(pass);
+        if round > 0 {
+            base = base.min(secs / levels as f64);
+        }
+        for k in 0..cases.len() {
+            let which = (round + k) % cases.len();
+            let pass = ctx.begin_concurrent().expect("pass");
+            for _ in 0..4 * levels {
+                (cases[which].1)(&pass);
+                pass.level_barrier(&[]).expect("barrier");
+            }
+            let a = span(pass) / (4 * levels) as f64;
+            let pass = ctx.begin_concurrent().expect("pass");
+            for i in 0..levels {
+                stream(&pass, i);
+                (cases[which].1)(&pass);
+                pass.level_barrier(&[]).expect("barrier");
+            }
+            let b = span(pass) / levels as f64;
+            if round > 0 {
+                alone[which] = alone[which].min(a);
+                between[which] = between[which].min(b);
+            }
+        }
+    }
+    eprintln!("4 MB stream level alone: {:.2} us", base * 1e6);
+    for ((name, _), (a, b)) in cases.iter().zip(alone.iter().zip(&between)) {
+        eprintln!(
+            "{name:<28} {:>6.2} us per level alone, {:>+6.2} us between stream levels",
+            a * 1e6,
+            (b - base) * 1e6
+        );
+    }
+}
+
+/// What a thread's dependent load rounds and a threadgroup's barriers cost
+/// (`lv_rounds`): chains of barriered levels of 48 threadgroups of 128
+/// threads (the GDN step's shape) and of 3 of 256 (a three-row norm's), over
+/// a cache-resident region and a DRAM-sized one. Microseconds per level.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "timing probe; run with --ignored --nocapture"]
+fn load_round_and_barrier_probe() {
+    let ctx = MetalContext::new().expect("metal context");
+    let big = Tensor::zeros(&ctx, &[1usize << 28], DType::F32).expect("big");
+    let out = Tensor::zeros(&ctx, &[1024], DType::U32).expect("out");
+    let kernel = ctx.pipeline("lv_rounds", "", MslVersion::V3_1).expect("kernel");
+    let levels = 128usize;
+    // (threadgroups, threadgroup, rounds, words of the region, barrier pairs, wide)
+    let mut cases: Vec<(usize, usize, usize, usize, usize, usize)> = Vec::new();
+    for (tgs, tg) in [(48usize, 128usize), (3, 256), (1, 128)] {
+        for (rounds, words, pairs, wide) in [
+            (0usize, 1usize << 12, 0usize, 0usize),
+            (8, 1 << 12, 0, 0),
+            (32, 1 << 12, 0, 0),
+            (32, 1 << 12, 0, 1),
+            (8, 1 << 26, 0, 0),
+            (32, 1 << 26, 0, 0),
+            (32, 1 << 26, 0, 1),
+            (0, 1 << 12, 1, 0),
+            (0, 1 << 12, 3, 0),
+            (0, 1 << 12, 8, 0),
+        ] {
+            cases.push((tgs, tg, rounds, words, pairs, wide));
+        }
+    }
+    let mut best = vec![f64::INFINITY; cases.len()];
+    for round in 0..5 {
+        for k in 0..cases.len() {
+            let which = (round + k) % cases.len();
+            let (tgs, tg, rounds, words, pairs, wide) = cases[which];
+            let pass = ctx.begin_concurrent().expect("pass");
+            for i in 0..levels {
+                // A different part of the large region per level.
+                let at = if words > (1 << 20) { (i * 1_000_003) % (1 << 26) } else { 0 };
+                let view = big.view(at, &[words]).expect("view");
+                pass.dispatch_at(
+                    &kernel,
+                    &[view.binding(), out.binding()],
+                    &[
+                        &u32_bytes(rounds),
+                        &u32_bytes(words - 1),
+                        &u32_bytes(pairs),
+                        &u32_bytes(wide),
+                    ],
+                    Grid::Threadgroups { groups: (tgs, 1, 1), threadgroup: (tg, 1, 1) },
+                )
+                .expect("dispatch");
+                pass.level_barrier(&[&out]).expect("barrier");
+            }
+            let done = pass.commit().expect("commit").wait_retain().expect("wait");
+            let t = done.timing().expect("timing");
+            if round > 0 {
+                best[which] =
+                    best[which].min((t.gpu_end_secs - t.gpu_start_secs) / levels as f64);
+            }
+        }
+    }
+    for ((tgs, tg, rounds, words, pairs, wide), secs) in cases.iter().zip(&best) {
+        eprintln!(
+            "{tgs:>2} x {tg:>3} threads, {rounds:>2} load rounds{} over {:>6} KB, {pairs} barrier pairs: {:>6.2} us",
+            if *wide != 0 { " (8 per round)" } else { "" },
+            words * 4 / 1024,
+            secs * 1e6
+        );
+    }
+}
+
+/// Which association order the hardware's subgroup sum and its 4-lane
+/// clustered sum use, by comparing them bit for bit with candidate orders
+/// on random values of mixed magnitude (`lv_reduce`). Run with `--ignored
+/// --nocapture`.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "probe; run with --ignored --nocapture"]
+fn subgroup_sum_order_probe() {
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(77);
+    let rows = 256usize;
+    let x: Vec<f32> = (0..rows * 32)
+        .map(|i| {
+            // Some rows leave their last lanes zero, as a short GEMV row does.
+            if (i / 32) % 2 == 1 && i % 32 >= 20 {
+                0.0
+            } else {
+                rng.gen_range(-1.0f32..1.0) * 2f32.powi(rng.gen_range(-12..12))
+            }
+        })
+        .collect();
+    let t_x = Tensor::from_f32(&ctx, &x, &[rows * 32]).expect("x");
+    let out = Tensor::zeros(&ctx, &[rows * 16], DType::F32).expect("out");
+    let kernel = ctx.pipeline("lv_reduce", "", MslVersion::V3_1).expect("kernel");
+    let pass = ctx.begin().expect("pass");
+    pass.dispatch_at(
+        &kernel,
+        &[t_x.binding(), out.binding()],
+        &[],
+        Grid::Threadgroups { groups: (rows, 1, 1), threadgroup: (32, 1, 1) },
+    )
+    .expect("dispatch");
+    pass.commit_wait().expect("commit");
+    let got = out.to_f32().expect("read");
+    fn tree(v: &[f32]) -> f32 {
+        if v.len() == 1 { v[0] } else { tree(&v[..v.len() / 2]) + tree(&v[v.len() / 2..]) }
+    }
+    // Lanes i and i + n/2 first (a butterfly), then recursively.
+    fn butterfly(v: &[f32]) -> f32 {
+        if v.len() == 1 {
+            return v[0];
+        }
+        let h = v.len() / 2;
+        let folded: Vec<f32> = (0..h).map(|i| v[i] + v[i + h]).collect();
+        butterfly(&folded)
+    }
+    let candidates: [(&str, fn(&[f32]) -> f32); 4] = [
+        ("ascending", |v| v.iter().fold(0.0, |a, b| a + b)),
+        ("descending", |v| v.iter().rev().fold(0.0, |a, b| a + b)),
+        ("adjacent pairs tree", tree),
+        ("butterfly (i, i + n/2)", butterfly),
+    ];
+    for (name, f) in candidates {
+        let full = (0..rows)
+            .filter(|&r| f(&x[r * 32..r * 32 + 32]).to_bits() == got[r * 16].to_bits())
+            .count();
+        let quad = (0..rows * 8)
+            .filter(|&q| {
+                f(&x[q * 4..q * 4 + 4]).to_bits() == got[q / 8 * 16 + 1 + q % 8].to_bits()
+            })
+            .count();
+        eprintln!(
+            "{name}: subgroup sum equal in {full} of {rows} rows, quad sum in {quad} of {}",
+            rows * 8
+        );
+    }
+    // The subgroup sum from the quad sums, as an adjacent-pairs tree.
+    let from_quads = (0..rows)
+        .filter(|&r| tree(&got[r * 16 + 1..r * 16 + 9]).to_bits() == got[r * 16].to_bits())
+        .count();
+    eprintln!("tree of the eight quad sums equals the subgroup sum in {from_quads} of {rows} rows");
+}
+
+/// What an instruction costs a thread (`lv_op_*`, eight dependent operations
+/// of a kind per round): nanoseconds per operation over the loop alone, with
+/// 320 subgroups (eight a core) and with 1 280. Run with `--ignored
+/// --nocapture`.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "timing probe; run with --ignored --nocapture"]
+fn instruction_cost_probe() {
+    let ctx = MetalContext::new().expect("metal context");
+    let src = Tensor::zeros(&ctx, &[1024], DType::F32).expect("src");
+    let out = Tensor::zeros(&ctx, &[1024], DType::U32).expect("out");
+    let kinds: [&'static str; 28] = [
+        "lv_op_loop",
+        "lv_op_xor2",
+        "lv_op_andx",
+        "lv_op_shrx",
+        "lv_op_bfex",
+        "lv_op_orx",
+        "lv_op_addx",
+        "lv_op_cvt",
+        "lv_op_mul",
+        "lv_op_unpack",
+        "lv_op_unpackm",
+        "lv_op_fma",
+        "lv_op_add",
+        "lv_op_u2f",
+        "lv_op_f2u",
+        "lv_op_bfe",
+        "lv_op_imul",
+        "lv_op_sel",
+        "lv_op_exp",
+        "lv_op_rcp",
+        "lv_op_rne",
+        "lv_op_bcast",
+        "lv_op_quad",
+        "lv_op_red",
+        "lv_op_lload",
+        "lv_op_lstore",
+        "lv_op_dload",
+        "lv_op_branch",
+    ];
+    let levels = 64usize;
+    for subgroups in [320usize, 1280] {
+        let mut per_round = Vec::new();
+        for name in kinds {
+            let kernel = ctx.pipeline(name, "", MslVersion::V3_1).expect("kernel");
+            let mut t = [f64::INFINITY; 2];
+            for _ in 0..4 {
+                for (k, rounds) in [32usize, 160].into_iter().enumerate() {
+                    let pass = ctx.begin_concurrent().expect("pass");
+                    for _ in 0..levels {
+                        pass.dispatch_at(
+                            &kernel,
+                            &[src.binding(), out.binding()],
+                            &[&u32_bytes(rounds)],
+                            Grid::Threadgroups {
+                                groups: (subgroups / 8, 1, 1),
+                                threadgroup: (256, 1, 1),
+                            },
+                        )
+                        .expect("dispatch");
+                        pass.level_barrier(&[&out]).expect("barrier");
+                    }
+                    let done =
+                        pass.commit().expect("commit").wait_retain().expect("wait");
+                    let timing = done.timing().expect("timing");
+                    t[k] = t[k]
+                        .min((timing.gpu_end_secs - timing.gpu_start_secs) / levels as f64);
+                }
+            }
+            per_round.push((t[1] - t[0]) / 128.0 * 1e9);
+        }
+        for (name, ns) in kinds.iter().zip(&per_round) {
+            eprintln!(
+                "{subgroups:>4} subgroups, {name:<14} {ns:>7.1} ns per round, {:>6.2} ns per operation over the loop",
+                (ns - per_round[0]) / 8.0
+            );
+        }
+    }
+}
+
+/// Whether what a thread holds in registers changes what its instructions
+/// cost (`lv_fat<N>`: the Q8 unpack-and-dot loop with N more registers live
+/// across it), by threadgroup size: nanoseconds per unpacked word.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "timing probe; run with --ignored --nocapture"]
+fn register_footprint_probe() {
+    let ctx = MetalContext::new().expect("metal context");
+    let src = Tensor::zeros(&ctx, &[1024], DType::F32).expect("src");
+    let out = Tensor::zeros(&ctx, &[1024], DType::U32).expect("out");
+    let levels = 64usize;
+    for (tgs, tg) in [(40usize, 256usize), (160, 256), (40, 640), (80, 640), (640, 32), (2560, 32)] {
+        for name in ["lv_fat0", "lv_fat32", "lv_fat64", "lv_fat96"] {
+            let kernel = ctx.pipeline(name, "", MslVersion::V3_1).expect("kernel");
+            let mut t = [f64::INFINITY; 2];
+            for _ in 0..4 {
+                for (k, rounds) in [8usize, 40].into_iter().enumerate() {
+                    let pass = ctx.begin_concurrent().expect("pass");
+                    for _ in 0..levels {
+                        pass.dispatch_at(
+                            &kernel,
+                            &[src.binding(), out.binding()],
+                            &[&u32_bytes(rounds)],
+                            Grid::Threadgroups { groups: (tgs, 1, 1), threadgroup: (tg, 1, 1) },
+                        )
+                        .expect("dispatch");
+                        pass.level_barrier(&[&out]).expect("barrier");
+                    }
+                    let done =
+                        pass.commit().expect("commit").wait_retain().expect("wait");
+                    let timing = done.timing().expect("timing");
+                    t[k] = t[k]
+                        .min((timing.gpu_end_secs - timing.gpu_start_secs) / levels as f64);
+                }
+            }
+            eprintln!(
+                "{tgs:>4} x {tg:>3} threads ({:>4} subgroups), {name:<8}: {:>6.1} ns per word, {:>5.2} us at 8 rounds",
+                tgs * tg / 32,
+                (t[1] - t[0]) / 32.0 / 8.0 * 1e9,
+                t[0] * 1e6
+            );
+        }
+    }
+}
+
+/// Whether a shader's threadgroup memory or barrier changes how fast its
+/// subgroups run (`lv_tg_*`), by threadgroup size at 320 subgroups:
+/// nanoseconds per unpacked word of the loop that follows.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "timing probe; run with --ignored --nocapture"]
+fn threadgroup_mode_probe() {
+    let ctx = MetalContext::new().expect("metal context");
+    let src = Tensor::zeros(&ctx, &[1024], DType::F32).expect("src");
+    let out = Tensor::zeros(&ctx, &[1024], DType::U32).expect("out");
+    let levels = 64usize;
+    for total in [320usize, 1280] {
+        for tg in [32usize, 128, 256, 640] {
+            for name in ["lv_tg_plain", "lv_tg_shared", "lv_tg_barrier"] {
+                let kernel = ctx.pipeline(name, "", MslVersion::V3_1).expect("kernel");
+                let tgs = total * 32 / tg;
+                let mut t = [f64::INFINITY; 2];
+                for _ in 0..4 {
+                    for (k, rounds) in [8usize, 40].into_iter().enumerate() {
+                        let pass = ctx.begin_concurrent().expect("pass");
+                        for _ in 0..levels {
+                            pass.dispatch_at(
+                                &kernel,
+                                &[src.binding(), out.binding()],
+                                &[&u32_bytes(rounds)],
+                                Grid::Threadgroups {
+                                    groups: (tgs, 1, 1),
+                                    threadgroup: (tg, 1, 1),
+                                },
+                            )
+                            .expect("dispatch");
+                            pass.level_barrier(&[&out]).expect("barrier");
+                        }
+                        let done =
+                            pass.commit().expect("commit").wait_retain().expect("wait");
+                        let timing = done.timing().expect("timing");
+                        t[k] = t[k].min(
+                            (timing.gpu_end_secs - timing.gpu_start_secs) / levels as f64,
+                        );
+                    }
+                }
+                eprintln!(
+                    "{tgs:>4} x {tg:>3} threads, {name:<14}: {:>6.1} ns per word, {:>5.2} us at 8 rounds",
+                    (t[1] - t[0]) / 32.0 / 8.0 * 1e9,
+                    t[0] * 1e6
+                );
+            }
+        }
+    }
+}

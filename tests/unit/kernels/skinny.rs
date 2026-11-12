@@ -1094,6 +1094,124 @@ fn gemm_skinny_reg_m1_matches_decode_gemv() {
     }
 }
 
+/// On Vulkan a row of the 8-bit register-A GEMM (`vulkan/quant_rows.glsl`)
+/// depends on nothing but the row: each activation row's output at m = 2..8
+/// is the bits the one-row GEMM gives it, a row range dispatched alone gives
+/// the bits it has in the whole matrix, and so do one and two weight rows
+/// per lane (the small and the large shapes here take one and the other).
+/// K = 640 walks a row with 8 lanes per set and K = 2560 with 32.
+#[cfg(target_os = "linux")]
+#[test]
+fn gemm_skinny_q8_reg_rows_do_not_depend_on_the_dispatch() {
+    use crate::kernels::quant::rows_layout;
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(81);
+    for (n, k, rows) in [(515usize, 2560usize, 1usize), (2562, 640, 1), (1283, 2560, 2)] {
+        let w = random_quant_bits(&ctx, &mut rng, n, k, GROUP_SIZE, 8);
+        assert_eq!(rows_layout(&w).1, rows, "rows per lane at [{n}, {k}]");
+        // Slices at an odd and an even row, one small enough to take one
+        // row per lane where the whole matrix takes two.
+        let slices = [(0usize, n), (3, 100), (n - 258, 258)];
+        for m in 1..=REG_MAX_M {
+            let a = random_vec(&mut rng, m * k);
+            let ta = Tensor::from_f32_as_bf16(&ctx, &a, &[m, k]).expect("a");
+            let run = |ta: &Tensor, m: usize, wq: &QuantWeights, rows: usize| -> Vec<f32> {
+                let c = Tensor::zeros(&ctx, &[m, rows], DType::BF16).expect("c");
+                let pass = ctx.begin().expect("pass");
+                gemm_skinny_q8_nt(&ctx, &pass, ta, wq, &c).expect("skinny q8");
+                pass.commit_wait().expect("commit");
+                c.to_f32().expect("read")
+            };
+            let whole = run(&ta, m, &w, n);
+            for i in 0..m {
+                let one = run(&ta.view(i * k, &[1, k]).expect("row"), 1, &w, n);
+                assert_bits_eq(
+                    &whole[i * n..(i + 1) * n],
+                    &one,
+                    &format!("[{n}, {k}] m={m} row {i} against the one-row GEMM"),
+                );
+            }
+            for (start, len) in slices {
+                // A bf16 scale view must start 4-byte aligned.
+                if (start * (k / GROUP_SIZE)) % 2 != 0 {
+                    continue;
+                }
+                let got = run(&ta, m, &quant_view_rows(&w, start, len), len);
+                for i in 0..m {
+                    assert_bits_eq(
+                        &got[i * len..(i + 1) * len],
+                        &whole[i * n + start..i * n + start + len],
+                        &format!("[{n}, {k}] m={m} row {i} rows {start}..+{len}"),
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The 8-bit projections of a level as one multi-weight dispatch where the
+/// backend has one (Vulkan: `gemm_skinny_q8_nt_sets_fused`, whatever
+/// `gemm_skinny_q8_nt_sets` picks for the driver), else as
+/// `gemm_skinny_q8_nt_sets` runs them.
+fn q8_sets_one_dispatch(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    a: &Tensor,
+    sets: &[(&QuantWeights, &Tensor)],
+) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    return gemm_skinny_q8_nt_sets_fused(ctx, pass, a, sets);
+    #[cfg(not(target_os = "linux"))]
+    gemm_skinny_q8_nt_sets(ctx, pass, a, sets)
+}
+
+/// The multi-weight dispatch of `gemm_skinny_q8_nt_sets` gives each output
+/// the bits `gemm_skinny_q8_nt` gives it, for the batched router level's
+/// shapes (a 512-row router, the shared expert's 1280-row gate|up stack, its
+/// one-row gate) at every row count, with a set that stays out of the
+/// register-A dispatch (a narrow f32 output takes the staged kernel) and,
+/// past eight rows, all of them.
+#[test]
+fn gemm_skinny_q8_sets_match_separate_bits() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(83);
+    let k = 2560usize;
+    // (N, f32 output)
+    let shapes = [(512usize, false), (1280, false), (1, false), (33, true), (515, false)];
+    let weights: Vec<QuantWeights> = shapes
+        .iter()
+        .map(|&(n, _)| random_quant_bits(&ctx, &mut rng, n, k, GROUP_SIZE, 8))
+        .collect();
+    for m in [1usize, 2, 3, 5, 8, 9] {
+        let a = random_vec(&mut rng, m * k);
+        let ta = Tensor::from_f32_as_bf16(&ctx, &a, &[m, k]).expect("a");
+        let outputs = || -> Vec<Tensor> {
+            shapes
+                .iter()
+                .map(|&(n, f32_out)| {
+                    let dtype = if f32_out { DType::F32 } else { DType::BF16 };
+                    Tensor::zeros(&ctx, &[m, n], dtype).expect("c")
+                })
+                .collect()
+        };
+        let (together, apart) = (outputs(), outputs());
+        let pass = ctx.begin().expect("pass");
+        let pairs: Vec<(&QuantWeights, &Tensor)> = weights.iter().zip(&together).collect();
+        q8_sets_one_dispatch(&ctx, &pass, &ta, &pairs).expect("sets");
+        for (w, c) in weights.iter().zip(&apart) {
+            gemm_skinny_q8_nt(&ctx, &pass, &ta, w, c).expect("skinny q8");
+        }
+        pass.commit_wait().expect("commit");
+        for (s, (got, want)) in together.iter().zip(&apart).enumerate() {
+            assert_bits_eq(
+                &got.to_f32().expect("read"),
+                &want.to_f32().expect("read"),
+                &format!("m={m} set {s} {:?}", shapes[s]),
+            );
+        }
+    }
+}
+
 /// Q4 weights for timing only: cheap hashed codes, plausible scales and
 /// biases, no CPU image.
 fn timing_quant(ctx: &MetalContext, n: usize, k: usize, salt: u32) -> QuantWeights {
@@ -1253,6 +1371,1023 @@ fn skinny_rows_scaling_probe() {
                     Ok(())
                 });
                 report("staged (bf16 weights)", m, staged);
+            }
+        }
+    }
+}
+
+/// Hashed affine weights at `bits` for timing only (no CPU image).
+fn timing_quant_bits(
+    ctx: &MetalContext,
+    n: usize,
+    k: usize,
+    bits: usize,
+    salt: u32,
+) -> QuantWeights {
+    let words = k * bits / 32;
+    let groups = k / GROUP_SIZE;
+    let codes: Vec<u32> = (0..n * words)
+        .map(|i| (i as u32 ^ salt).wrapping_mul(2_654_435_761).rotate_left(7))
+        .collect();
+    let scales: Vec<f32> =
+        (0..n * groups).map(|i| 0.001 + (i % 97) as f32 * 0.0004).collect();
+    let biases: Vec<f32> =
+        (0..n * groups).map(|i| -2.0 + (i % 89) as f32 * 0.02).collect();
+    let bf = |v: &[f32]| -> Vec<bf16> { v.iter().map(|&x| bf16::from_f32(x)).collect() };
+    let upload = |v: &[f32]| {
+        Tensor::from_bytes(ctx, bytemuck::cast_slice(&bf(v)), &[n, groups], DType::BF16)
+            .expect("bf16")
+    };
+    QuantWeights {
+        codes: Tensor::from_bytes(
+            ctx,
+            bytemuck::cast_slice(&codes),
+            &[n, words],
+            DType::U32,
+        )
+        .expect("codes"),
+        scales: upload(&scales),
+        biases: upload(&biases),
+        group_size: GROUP_SIZE,
+        bits,
+    }
+}
+
+/// The dense projections as the model's passes run them: for every dense
+/// shape of the q4-xl checkpoint (8-bit attention, shared expert, routers,
+/// PLE and LM head; 4-bit GDN), a chain of dispatches over distinct weight
+/// sets with a barrier after each, through the decode GEMV (m = 1) and the
+/// skinny GEMM at the rows of `LILY_DENSE_ROWS` (default "3", the verify
+/// pass of two drafts). Prints microseconds per level and the weight
+/// bandwidth, best of several passes after a warm-up pass.
+/// `LILY_DENSE_SHAPES` filters shapes by substring.
+/// `cargo test --release -- --ignored --nocapture dense_chain_timing`.
+#[test]
+#[ignore = "timing only"]
+fn dense_chain_timing() {
+    use crate::kernels::quant::gemv_quant;
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(71);
+    let rows: Vec<usize> = std::env::var("LILY_DENSE_ROWS")
+        .unwrap_or_else(|_| "3".into())
+        .split(',')
+        .map(|v| v.parse().expect("rows"))
+        .collect();
+    let filter = std::env::var("LILY_DENSE_SHAPES").ok();
+    let mut total_gemv = 0.0;
+    let mut total_rows = vec![0.0; rows.len()];
+    // (name, bits, N, K, f32 out, dispatches per decode step)
+    for (what, bits, n, k, f32_out, per_step) in [
+        ("attn qkv", 8usize, 13312usize, 2560usize, false, 12usize),
+        ("attn o", 8, 2560, 6144, false, 12),
+        ("indexer qk", 8, 640, 2560, false, 12),
+        ("shared gate_up", 8, 1280, 2560, false, 48),
+        ("shared down", 8, 2560, 640, false, 48),
+        ("moe gate", 8, 512, 2560, true, 48),
+        ("ple key", 8, 10240, 2560, false, 1),
+        ("ple value", 8, 2560, 2560, false, 1),
+        ("gdn in", 4, 16480, 2560, false, 36),
+        ("gdn out", 4, 2560, 6144, false, 36),
+        ("lm head", 8, 248320, 2560, true, 1),
+    ] {
+        if filter.as_ref().is_some_and(|f| !f.split(',').any(|p| what.contains(p))) {
+            continue;
+        }
+        let bytes = n * k * bits / 8 + 2 * n * (k / GROUP_SIZE) * 2;
+        let sets = (768usize << 20).div_ceil(bytes).clamp(3, 48);
+        let weights: Vec<QuantWeights> = (0..sets)
+            .map(|s| timing_quant_bits(&ctx, n, k, bits, s as u32 + 1))
+            .collect();
+        let out = if f32_out { DType::F32 } else { DType::BF16 };
+        let x =
+            Tensor::from_f32_as_bf16(&ctx, &random_vec(&mut rng, k), &[k]).expect("x");
+        let y = Tensor::zeros(&ctx, &[n], out).expect("y");
+        // A pass as long as a decode step (the sets repeated to
+        // `LILY_DENSE_LEVELS` levels, default 512): short passes with the
+        // host between them do not hold the GPU's clock.
+        let levels: usize = std::env::var("LILY_DENSE_LEVELS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(512);
+        let repeats = levels.div_ceil(sets).max(1);
+        let time = |f: &dyn Fn(&ComputePass<'_>, &QuantWeights)| -> f64 {
+            // The GPU's clock ramps: 300 ms of the same work first.
+            let mut best = f64::MAX;
+            let start = std::time::Instant::now();
+            let mut measured = 0;
+            while measured < 8 {
+                let pass = ctx.begin_concurrent().expect("pass");
+                for _ in 0..repeats {
+                    for w in &weights {
+                        f(&pass, w);
+                        pass.level_barrier(&[]).expect("barrier");
+                    }
+                }
+                let done = pass.commit().expect("commit").wait_retain().expect("wait");
+                let t = done.timing().expect("timing");
+                if start.elapsed().as_millis() >= 300 {
+                    best = best.min(
+                        (t.gpu_end_secs - t.gpu_start_secs) / (repeats * sets) as f64,
+                    );
+                    measured += 1;
+                }
+            }
+            best
+        };
+        let gemv = time(&|pass, w| gemv_quant(&ctx, pass, w, &x, &y).unwrap());
+        total_gemv += gemv * per_step as f64;
+        let mut line = format!(
+            "{what:<14} q{bits} [{n} x {k}] {:5.1} MB: gemv {:6.1} us ({:3.0} GB/s)",
+            bytes as f64 / 1e6,
+            gemv * 1e6,
+            bytes as f64 / gemv / 1e9
+        );
+        for (ri, &m) in rows.iter().enumerate() {
+            // The narrow f32 outputs of a batched pass are bf16 (the routers'
+            // logits are read by the batched top-k as bf16).
+            let c_dtype = if f32_out && n >= WIDE_N_MIN { DType::F32 } else { DType::BF16 };
+            let a =
+                Tensor::from_f32_as_bf16(&ctx, &random_vec(&mut rng, m * k), &[m, k])
+                    .expect("a");
+            let c = Tensor::zeros(&ctx, &[m, n], c_dtype).expect("c");
+            let t = time(&|pass, w| {
+                if bits == 4 {
+                    gemm_skinny_q4_nt(&ctx, pass, &a, w, &c).unwrap()
+                } else {
+                    gemm_skinny_q8_nt(&ctx, pass, &a, w, &c).unwrap()
+                }
+            });
+            total_rows[ri] += t * per_step as f64;
+            line += &format!(
+                " | m={m} {:6.1} us ({:3.0} GB/s)",
+                t * 1e6,
+                bytes as f64 / t / 1e9
+            );
+        }
+        eprintln!("{line}");
+    }
+    let mut line = format!("per step: gemv {:.2} ms", total_gemv * 1e3);
+    for (&m, t) in rows.iter().zip(&total_rows) {
+        line += &format!(" | m={m} {:.2} ms", t * 1e3);
+    }
+    eprintln!("{line}");
+}
+
+/// The dense projections on the levels they share in a decode or verify
+/// pass (`moe_ffn.rs`, `model.rs`): the router with the shared expert's
+/// gate/up projection and gate; the shared expert's down projection beside
+/// the expert gather (stood in for by an 18 MB 4-bit projection through the
+/// `*_previous` test kernel, alone on its level as the reference); the
+/// attention qkv projection with the indexer's; and, for what the separate
+/// dispatches of a level cost, one GEMV over as many rows as the level's
+/// matrices have together. Chains of barriered levels
+/// over distinct weights in passes as long as a decode step; microseconds
+/// per level at one row (the decode GEMVs) and at `LILY_DENSE_ROWS` rows
+/// (the skinny GEMMs), best of eight passes after a warm-up.
+#[test]
+#[ignore = "timing only"]
+fn dense_shared_levels_timing() {
+    use crate::kernels::quant::gemv_quant;
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(75);
+    let rows: Vec<usize> = std::env::var("LILY_DENSE_ROWS")
+        .unwrap_or_else(|_| "3".into())
+        .split(',')
+        .map(|v| v.parse().expect("rows"))
+        .collect();
+    let sets = 24usize;
+    let make = |bits: usize, n: usize, k: usize, salt: u32| -> Vec<QuantWeights> {
+        (0..sets)
+            .map(|s| timing_quant_bits(&ctx, n, k, bits, salt * 1000 + s as u32))
+            .collect()
+    };
+    let gate = make(8, 512, 2560, 1);
+    let gate_up = make(8, 1280, 2560, 2);
+    let shared_gate = make(8, 1, 2560, 3);
+    let down = make(8, 2560, 640, 4);
+    let partner = make(4, 14336, 2560, 5);
+    let qkv = make(8, 13312, 2560, 6);
+    let idx = make(8, 640, 2560, 7);
+    let m_max = *rows.iter().max().expect("rows").max(&1);
+    let a = Tensor::from_f32_as_bf16(&ctx, &random_vec(&mut rng, m_max * 2560), &[m_max * 2560])
+        .expect("a");
+    let a_down =
+        Tensor::from_f32_as_bf16(&ctx, &random_vec(&mut rng, m_max * 640), &[m_max * 640])
+            .expect("a");
+    let out = |n: usize, dtype: DType| Tensor::zeros(&ctx, &[m_max * n], dtype).expect("c");
+    let (c_gate_f32, c_gate) = (out(512, DType::F32), out(512, DType::BF16));
+    let c_gate_up = out(1280, DType::BF16);
+    let (c_sg_f32, c_sg) = (out(1, DType::F32), out(1, DType::BF16));
+    let c_down = out(2560, DType::BF16);
+    let c_partner = out(14336, DType::BF16);
+    let c_qkv = out(13312, DType::BF16);
+    let c_idx = out(640, DType::BF16);
+    // One projection at m rows: the decode GEMV at m = 0, else the skinny
+    // GEMM (bf16 out).
+    let project = |pass: &ComputePass<'_>,
+                   w: &QuantWeights,
+                   a: &Tensor,
+                   c_f32: Option<&Tensor>,
+                   c: &Tensor,
+                   m: usize| {
+        let (n, k) = (w.out_features(), w.in_features());
+        if m == 0 {
+            let y = c_f32.unwrap_or(c).view(0, &[n]).expect("y");
+            gemv_quant(&ctx, pass, w, &a.view(0, &[k]).expect("x"), &y).unwrap();
+        } else {
+            let am = a.view(0, &[m, k]).expect("a");
+            let cm = c.view(0, &[m, n]).expect("c");
+            gemm_skinny_q8_nt(&ctx, pass, &am, w, &cm).unwrap();
+        }
+    };
+    let partner_dispatch = |pass: &ComputePass<'_>, w: &QuantWeights| {
+        let am = a.view(0, &[1, 2560]).expect("a");
+        let cm = c_partner.view(0, &[1, 14336]).expect("c");
+        gemm_skinny_q4_nt_previous(&ctx, pass, &am, w, &cm).unwrap();
+    };
+    let time = |f: &dyn Fn(&ComputePass<'_>, usize)| -> f64 {
+        let repeats = 512usize.div_ceil(sets);
+        let mut best = f64::MAX;
+        let start = std::time::Instant::now();
+        let mut measured = 0;
+        while measured < 8 {
+            let pass = ctx.begin_concurrent().expect("pass");
+            for _ in 0..repeats {
+                for s in 0..sets {
+                    f(&pass, s);
+                    pass.level_barrier(&[]).expect("barrier");
+                }
+            }
+            let done = pass.commit().expect("commit").wait_retain().expect("wait");
+            let t = done.timing().expect("timing");
+            if start.elapsed().as_millis() >= 300 {
+                best =
+                    best.min((t.gpu_end_secs - t.gpu_start_secs) / (repeats * sets) as f64);
+                measured += 1;
+            }
+        }
+        best * 1e6
+    };
+    let alone = time(&|pass, s| partner_dispatch(pass, &partner[s]));
+    eprintln!("the 18 MB partner alone: {alone:.1} us per level");
+    // What the levels' dispatches would take as one: the router level's
+    // three matrices as one of their rows together, and the attention
+    // level's two.
+    let router_rows = make(8, 512 + 1280 + 1, 2560, 8);
+    let attn_rows = make(8, 13312 + 640, 2560, 9);
+    let c_rows = out(13312 + 640, DType::BF16);
+    let router_one = time(&|pass, s| project(pass, &router_rows[s], &a, None, &c_rows, 0));
+    let attn_one = time(&|pass, s| project(pass, &attn_rows[s], &a, None, &c_rows, 0));
+    eprintln!(
+        "as one decode GEMV of the same rows: router level {router_one:.1} us | attn level {attn_one:.1} us"
+    );
+    // The levels through `gemv_quant_sets` (one dispatch on Vulkan).
+    let y = |c: &Tensor, n: usize| c.view(0, &[n]).expect("y");
+    let x = a.view(0, &[2560]).expect("x");
+    let router_sets = time(&|pass, s| {
+        crate::kernels::quant::gemv_quant_sets(
+            &ctx,
+            pass,
+            &x,
+            &[
+                (&gate[s], &y(&c_gate_f32, 512)),
+                (&gate_up[s], &y(&c_gate_up, 1280)),
+                (&shared_gate[s], &y(&c_sg_f32, 1)),
+            ],
+        )
+        .unwrap()
+    });
+    let attn_sets = time(&|pass, s| {
+        crate::kernels::quant::gemv_quant_sets(
+            &ctx,
+            pass,
+            &x,
+            &[(&qkv[s], &y(&c_qkv, 13312)), (&idx[s], &y(&c_idx, 640))],
+        )
+        .unwrap()
+    });
+    eprintln!(
+        "through gemv_quant_sets: router level {router_sets:.1} us | attn level {attn_sets:.1} us"
+    );
+    for m in std::iter::once(0).chain(rows.iter().copied()) {
+        let router = time(&|pass, s| {
+            project(pass, &gate[s], &a, Some(&c_gate_f32), &c_gate, m);
+            project(pass, &gate_up[s], &a, None, &c_gate_up, m);
+            project(pass, &shared_gate[s], &a, Some(&c_sg_f32), &c_sg, m);
+        });
+        let gather = time(&|pass, s| {
+            partner_dispatch(pass, &partner[s]);
+            project(pass, &down[s], &a_down, None, &c_down, m);
+        });
+        let attn = time(&|pass, s| {
+            project(pass, &qkv[s], &a, None, &c_qkv, m);
+            project(pass, &idx[s], &a, None, &c_idx, m);
+        });
+        if m > 0 {
+            // The router level as one multi-weight dispatch (Vulkan).
+            let router_sets = time(&|pass, s| {
+                let am = a.view(0, &[m, 2560]).expect("a");
+                let c = |c: &Tensor, n: usize| c.view(0, &[m, n]).expect("c");
+                q8_sets_one_dispatch(
+                    &ctx,
+                    pass,
+                    &am,
+                    &[
+                        (&gate[s], &c(&c_gate, 512)),
+                        (&gate_up[s], &c(&c_gate_up, 1280)),
+                        (&shared_gate[s], &c(&c_sg, 1)),
+                    ],
+                )
+                .unwrap()
+            });
+            eprintln!(
+                "skinny m={m} as one multi-weight dispatch: router level {router_sets:.1} us"
+            );
+        }
+        let label = if m == 0 { "decode GEMVs".to_string() } else { format!("skinny m={m}") };
+        eprintln!(
+            "{label}: router + shared gate/up + shared gate {router:.1} us | partner + shared down {gather:.1} us (+{:.1}) | attn qkv + indexer {attn:.1} us",
+            gather - alone
+        );
+    }
+}
+
+/// One or two weight rows per lane in the Vulkan raw-code projection body
+/// (`vulkan/quant_rows.glsl`), the choice `quant::rows_layout` makes by the
+/// weight's size: every dense shape of the q4-xl checkpoint at one
+/// activation row (the 4-bit GEMV kernels; for the 8-bit shapes the one-row
+/// register-A GEMM, since their GEMV is another kernel) and, for the 8-bit
+/// ones, at three, as chains of barriered levels over distinct weights in
+/// passes as long as a decode step. Prints microseconds per level, best of
+/// eight passes after a warm-up.
+/// `LILY_DENSE_SHAPES` filters shapes by substring.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "timing probe; run with --ignored --nocapture"]
+fn quant_rows_layout_probe() {
+    use crate::kernels::quant::{rows_grid, rows_layout};
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(73);
+    let filter = std::env::var("LILY_DENSE_SHAPES").ok();
+    for (what, bits, n, k) in [
+        ("attn qkv", 8usize, 13312usize, 2560usize),
+        ("attn o", 8, 2560, 6144),
+        ("indexer qk", 8, 640, 2560),
+        ("shared gate_up", 8, 1280, 2560),
+        ("shared down", 8, 2560, 640),
+        ("moe gate", 8, 512, 2560),
+        ("ple key", 8, 10240, 2560),
+        ("ple value", 8, 2560, 2560),
+        ("gdn in", 4, 16480, 2560),
+        ("gdn out", 4, 2560, 6144),
+        ("lm head", 8, 248320, 2560),
+    ] {
+        if filter.as_ref().is_some_and(|f| !f.split(',').any(|p| what.contains(p))) {
+            continue;
+        }
+        let bytes = n * k * bits / 8 + 2 * n * (k / GROUP_SIZE) * 2;
+        let sets = (768usize << 20).div_ceil(bytes).clamp(3, 48);
+        let weights: Vec<QuantWeights> = (0..sets)
+            .map(|s| timing_quant_bits(&ctx, n, k, bits, s as u32 + 1))
+            .collect();
+        let (lanes_log2, shipped_rows) = rows_layout(&weights[0]);
+        // Passes as long as a decode step, as in `dense_chain_timing`.
+        let repeats = 512usize.div_ceil(sets);
+        let a3 = Tensor::from_f32_as_bf16(&ctx, &random_vec(&mut rng, 3 * k), &[3, k])
+            .expect("a");
+        let c3 = Tensor::zeros(&ctx, &[3, n], DType::BF16).expect("c");
+        let mut line = format!(
+            "{what:<14} q{bits} [{n} x {k}] {:5.1} MB, {} lanes per set, ships {shipped_rows}:",
+            bytes as f64 / 1e6,
+            1 << lanes_log2
+        );
+        for m in [1usize, 3] {
+            if m == 3 && bits == 4 {
+                continue;
+            }
+            for rows in [1usize, 2] {
+                let name: &'static str = match (m, bits, rows) {
+                    (1, 4, 1) => "gemv_q4_bf16",
+                    (1, 4, _) => "gemv_q4_bf16_2row",
+                    (1, _, 1) => "gemm_skinny_q8_bf16_reg_m1_r1",
+                    (1, _, _) => "gemm_skinny_q8_bf16_reg_m1",
+                    (_, _, 1) => "gemm_skinny_q8_bf16_reg_m3_r1",
+                    _ => "gemm_skinny_q8_bf16_reg_m3",
+                };
+                let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1).expect("pipeline");
+                let mut best = f64::MAX;
+                let start = std::time::Instant::now();
+                let mut measured = 0;
+                while measured < 8 {
+                    let pass = ctx.begin_concurrent().expect("pass");
+                    for w in weights.iter().cycle().take(repeats * sets) {
+                        pass.dispatch_at(
+                            &pipeline,
+                            &[
+                                w.codes.binding(),
+                                w.scales.binding(),
+                                w.biases.binding(),
+                                a3.binding(),
+                                c3.binding(),
+                            ],
+                            &[
+                                &u32_bytes(k),
+                                &u32_bytes(n),
+                                &u32_bytes(w.group_size),
+                                &u32_bytes(lanes_log2),
+                            ],
+                            rows_grid(n, lanes_log2, rows),
+                        )
+                        .expect("dispatch");
+                        pass.level_barrier(&[]).expect("barrier");
+                    }
+                    let done = pass.commit().expect("commit").wait_retain().expect("wait");
+                    let t = done.timing().expect("timing");
+                    if start.elapsed().as_millis() >= 300 {
+                        best = best
+                            .min((t.gpu_end_secs - t.gpu_start_secs) / (repeats * sets) as f64);
+                        measured += 1;
+                    }
+                }
+                line += &format!(" m={m} x{rows} {:.1} us", best * 1e6);
+            }
+        }
+        eprintln!("{line}");
+    }
+}
+
+/// A 4-bit register-A kernel by name with an explicit layout: `rr` weight
+/// rows per simdgroup, `sg` simdgroups per threadgroup. For the probe below;
+/// the name may be a shader that exists only in `LILY_VK_SHADER_DIR`.
+#[cfg(target_os = "linux")]
+fn dispatch_q4_reg_named(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    name: &'static str,
+    a: &Tensor,
+    w: &QuantWeights,
+    c: &Tensor,
+    (rr, sg): (usize, usize),
+) -> Result<()> {
+    let (_, k, n) = validate_q4(a, w, c)?;
+    let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[
+            w.codes.binding(),
+            w.scales.binding(),
+            w.biases.binding(),
+            a.binding(),
+            c.binding(),
+        ],
+        &[&u32_bytes(k), &u32_bytes(n), &u32_bytes(w.group_size)],
+        reg_grid(n, sg, rr),
+    )
+}
+
+/// The 4-bit register-A GEMM of the verify pass (the GDN projections at
+/// three rows) against variants of itself, as the model's passes run them:
+/// chains of barriered levels over distinct weights in passes as long as a
+/// decode step, microseconds per level, best of eight passes after a warm-up.
+/// Lines: the decode GEMV at one row (the bandwidth reference), the two-row
+/// kernel the shipped one is pinned to (`*_previous`), the shipped route,
+/// and each entry of `LILY_Q4X`, a comma-separated list of
+/// `kernel:rows per simdgroup:simdgroups per threadgroup[:m]` (the kernel's
+/// shader may exist only in `LILY_VK_SHADER_DIR`: a variant under work, no
+/// rebuild). Each entry is first compared with the shipped route bit for bit
+/// on hashed weights and wide-exponent activations (the count of differing
+/// outputs is printed, not asserted: a stripped variant differs on purpose).
+/// `LILY_DENSE_SHAPES` filters shapes by substring (`gdn in`, `gdn out`,
+/// `draft head`); `LILY_DENSE_ROWS` is the row count of the shipped and
+/// previous lines (default 3); `LILY_Q4X_PER_LEVEL` puts that many dispatches
+/// on a level (default 1).
+///
+/// What it showed on 2026-11-11 (M5 Max, us per level at m = 3, the GDN
+/// input [16480 x 2560] and output [2560 x 6144] projections; the decode
+/// GEMV at one row 49.2 and 21.7): the shipped kernel 65.7 and 27.6 before
+/// the one-store epilogue, 63.6 and 27.1 with it. With the products left out
+/// 52.2 and 22.7, with constant codes in place of the weight loads 51.9 and
+/// 23.8, with constant activations 59.3 and 25.1: the kernel is bound by its
+/// instruction count (about 1080 per lane and block of four weight rows,
+/// 480 of them the pinned products and sums, 256 the code conversions) and
+/// by the loads in between, which a thread waits out one after another,
+/// not by the weights' bandwidth. Two, four or eight weight rows per
+/// simdgroup 64.3/27.9, 65.5/27.7, 76.5/39.2; one, two or four simdgroups
+/// per threadgroup the same within 0.3; the code words as 16-byte loads in
+/// an unrolled block 75.2/26.8 (the body outgrows what K = 2560's split
+/// pass leaves of the instruction cache), as 8-byte loads in a half-rolled
+/// one 67.1/27.3, loaded a word ahead of their use 72.3/33.0; 16 and 32
+/// more live registers 68.2 and 72.6 on the input projection (residency),
+/// nothing on the output's single generation of 640 subgroups. Four
+/// dispatches on a level run at 55.4 and 23.7 each: what a level of its own
+/// loses to its ramp and tail.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "timing probe; run with --ignored --nocapture"]
+fn q4_reg_variants_probe() {
+    use crate::kernels::quant::gemv_quant;
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(79);
+    let filter = std::env::var("LILY_DENSE_SHAPES").ok();
+    let m_ref: usize = std::env::var("LILY_DENSE_ROWS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
+    // (kernel, rows per simdgroup, simdgroups per threadgroup, m)
+    let variants: Vec<(&'static str, usize, usize, usize)> = std::env::var("LILY_Q4X")
+        .unwrap_or_default()
+        .split(',')
+        .filter(|e| !e.is_empty())
+        .map(|e| {
+            let p: Vec<&str> = e.split(':').collect();
+            let name: &'static str = Box::leak(p[0].to_string().into_boxed_str());
+            let num = |i: usize, d: usize| p.get(i).map_or(d, |v| v.parse().expect("number"));
+            (name, num(1, 4), num(2, 2), num(3, m_ref))
+        })
+        .collect();
+    for (what, n, k, f32_out) in [
+        ("gdn in", 16480usize, 2560usize, false),
+        ("gdn out", 2560, 6144, false),
+        ("draft head", 248320, 2560, true),
+    ] {
+        if filter.as_ref().is_some_and(|f| !f.split(',').any(|p| what.contains(p))) {
+            continue;
+        }
+        let dtype = if f32_out { DType::F32 } else { DType::BF16 };
+        // Bits against the shipped route.
+        let wb = bits_quant(&ctx, n, k, 7);
+        for &(name, rr, sg, m) in &variants {
+            let a = bits_activations(&mut rng, m * k, k, true, false);
+            let ta = Tensor::from_f32_as_bf16(&ctx, &a, &[m, k]).expect("a");
+            let got = Tensor::zeros(&ctx, &[m, n], dtype).expect("c");
+            let want = Tensor::zeros(&ctx, &[m, n], dtype).expect("c");
+            let pass = ctx.begin().expect("pass");
+            gemm_skinny_q4_nt(&ctx, &pass, &ta, &wb, &want).expect("shipped");
+            dispatch_q4_reg_named(&ctx, &pass, name, &ta, &wb, &got, (rr, sg))
+                .expect("variant");
+            pass.commit_wait().expect("commit");
+            let (got, want) = (got.to_f32().expect("read"), want.to_f32().expect("read"));
+            let differ =
+                got.iter().zip(&want).filter(|(g, w)| g.to_bits() != w.to_bits()).count();
+            eprintln!("{what} {name} rr={rr} sg={sg} m={m}: {differ} of {} outputs differ from the shipped route", got.len());
+        }
+        drop(wb);
+        let bytes = n * k / 2 + 2 * n * (k / GROUP_SIZE) * 2;
+        let sets = (768usize << 20).div_ceil(bytes).clamp(3, 48);
+        let weights: Vec<QuantWeights> =
+            (0..sets).map(|s| timing_quant(&ctx, n, k, s as u32 + 1)).collect();
+        // Dispatches per level (`LILY_Q4X_PER_LEVEL`, default 1): more than
+        // one shows what the kernel costs beside a copy of itself.
+        let per_level: usize = std::env::var("LILY_Q4X_PER_LEVEL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        let levels: usize = if f32_out { 32 } else { 512 };
+        let repeats = levels.div_ceil(sets).max(1);
+        let time = |f: &dyn Fn(&ComputePass<'_>, &QuantWeights)| -> f64 {
+            let mut best = f64::MAX;
+            let start = std::time::Instant::now();
+            let mut measured = 0;
+            while measured < 8 {
+                let pass = ctx.begin_concurrent().expect("pass");
+                for _ in 0..repeats {
+                    for (i, w) in weights.iter().enumerate() {
+                        f(&pass, w);
+                        if (i + 1) % per_level == 0 {
+                            pass.level_barrier(&[]).expect("barrier");
+                        }
+                    }
+                }
+                let done = pass.commit().expect("commit").wait_retain().expect("wait");
+                let t = done.timing().expect("timing");
+                if start.elapsed().as_millis() >= 300 {
+                    best = best
+                        .min((t.gpu_end_secs - t.gpu_start_secs) / (repeats * sets) as f64);
+                    measured += 1;
+                }
+            }
+            best * 1e6
+        };
+        let report = |label: &str, us: f64| {
+            eprintln!(
+                "{what} [{n} x {k}] {:5.1} MB {label}: {us:6.1} us ({:3.0} GB/s)",
+                bytes as f64 / 1e6,
+                bytes as f64 / us / 1e3
+            );
+        };
+        let x = Tensor::from_f32_as_bf16(&ctx, &random_vec(&mut rng, k), &[k]).expect("x");
+        let y = Tensor::zeros(&ctx, &[n], dtype).expect("y");
+        report("decode gemv m=1", time(&|pass, w| gemv_quant(&ctx, pass, w, &x, &y).unwrap()));
+        let rows_of = |m: usize| {
+            let a = Tensor::from_f32_as_bf16(&ctx, &random_vec(&mut StdRng::seed_from_u64(5), m * k), &[m, k])
+                .expect("a");
+            let c = Tensor::zeros(&ctx, &[m, n], dtype).expect("c");
+            (a, c)
+        };
+        let (a, c) = rows_of(m_ref);
+        report(
+            &format!("previous m={m_ref}"),
+            time(&|pass, w| gemm_skinny_q4_nt_previous(&ctx, pass, &a, w, &c).unwrap()),
+        );
+        report(
+            &format!("shipped m={m_ref}"),
+            time(&|pass, w| gemm_skinny_q4_nt(&ctx, pass, &a, w, &c).unwrap()),
+        );
+        for &(name, rr, sg, m) in &variants {
+            let (a, c) = rows_of(m);
+            report(
+                &format!("{name} rr={rr} sg={sg} m={m}"),
+                time(&|pass, w| {
+                    dispatch_q4_reg_named(&ctx, pass, name, &a, w, &c, (rr, sg)).unwrap()
+                }),
+            );
+        }
+    }
+}
+
+/// The dense levels of a verify pass in the encodings they can take
+/// (`gdn_batched`, `attn_batched_theta`, `prefill_moe`'s router and gather
+/// levels; `LILY_DENSE_ROWS` rows, default 3; `LILY_DENSE_SHAPES` filters by
+/// `gdn`, `attn`, `down`, `router`): chains of levels over distinct weights
+/// in passes as long as a decode step, microseconds per level, best of eight
+/// passes after a warm-up. What `skinny::stack_as_slices` and
+/// `gemm_skinny_q8_nt_sets` choose on Vulkan was measured here.
+///
+/// - The GDN input stack (4-bit, 16480 rows: qkv, z, a, b): one fused GEMM
+///   and a level that splits its output (Metal's encoding); the fused GEMM
+///   alone (what the split level costs); the four slices as dispatches of
+///   one level, in stack order and smallest first (Vulkan's).
+/// - The attention input (8-bit: the q, k, v stack of 13312 rows and the
+///   indexer's 640): the fused stack beside the indexer's GEMM and a split
+///   level; the four projections as one multi-weight dispatch into their
+///   own outputs; as four dispatches, the indexer's first or last.
+/// - The shared expert's down projection beside a stand-in for the expert
+///   gate/up kernel, at one weight row per lane and at two, dispatched
+///   before the partner and after it.
+/// - The router level (8-bit: router, shared gate/up, shared gate): one
+///   multi-weight dispatch; three dispatches.
+///
+/// Every encoding of a level writes the same bits (a fused stack and its
+/// slices, a weight alone and among others in one dispatch:
+/// `gemm_skinny_fused_stack_matches_per_slice_bits`,
+/// `stack_slices_match_the_fused_stack_bits`,
+/// `gemm_skinny_q8_sets_match_separate_bits`,
+/// `gemm_skinny_q8_reg_rows_do_not_depend_on_the_dispatch`).
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "timing only"]
+fn verify_levels_timing() {
+    use crate::kernels::elementwise::split_cols_bf16;
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(85);
+    let m: usize = std::env::var("LILY_DENSE_ROWS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
+    let sets = 24usize;
+    let k = 2560usize;
+    let a = Tensor::from_f32_as_bf16(&ctx, &random_vec(&mut rng, m * k), &[m, k]).expect("a");
+    let out = |n: usize| Tensor::zeros(&ctx, &[m, n], DType::BF16).expect("c");
+    let time = |f: &dyn Fn(&ComputePass<'_>, usize)| -> f64 {
+        let repeats = 512usize.div_ceil(sets);
+        let mut best = f64::MAX;
+        let start = std::time::Instant::now();
+        let mut measured = 0;
+        while measured < 8 {
+            let pass = ctx.begin_concurrent().expect("pass");
+            for _ in 0..repeats {
+                for s in 0..sets {
+                    f(&pass, s);
+                }
+            }
+            let done = pass.commit().expect("commit").wait_retain().expect("wait");
+            let t = done.timing().expect("timing");
+            if start.elapsed().as_millis() >= 300 {
+                best =
+                    best.min((t.gpu_end_secs - t.gpu_start_secs) / (repeats * sets) as f64);
+                measured += 1;
+            }
+        }
+        best * 1e6
+    };
+    let barrier = |pass: &ComputePass<'_>| pass.level_barrier(&[]).expect("barrier");
+    let filter = std::env::var("LILY_DENSE_SHAPES").ok();
+    let wanted = |what: &str| filter.as_ref().is_none_or(|f| f.split(',').any(|p| what.contains(p)));
+
+    if wanted("gdn") {
+        let widths = [10240usize, 6144, 48, 48];
+        let n: usize = widths.iter().sum();
+        let stacks: Vec<QuantWeights> =
+            (0..sets).map(|s| timing_quant(&ctx, n, k, s as u32 + 1)).collect();
+        let slices: Vec<Vec<QuantWeights>> = stacks
+            .iter()
+            .map(|w| {
+                let mut start = 0;
+                widths
+                    .iter()
+                    .map(|&rows| {
+                        let v = quant_view_rows(w, start, rows);
+                        start += rows;
+                        v
+                    })
+                    .collect()
+            })
+            .collect();
+        let c_stack = out(n);
+        let outs: Vec<Tensor> = widths.iter().map(|&w| out(w)).collect();
+        let out_refs: Vec<&Tensor> = outs.iter().collect();
+        let fused_split = time(&|pass, s| {
+            gemm_skinny_q4_nt(&ctx, pass, &a, &stacks[s], &c_stack).unwrap();
+            barrier(pass);
+            split_cols_bf16(&ctx, pass, &c_stack, &out_refs).unwrap();
+            barrier(pass);
+        });
+        let fused = time(&|pass, s| {
+            gemm_skinny_q4_nt(&ctx, pass, &a, &stacks[s], &c_stack).unwrap();
+            barrier(pass);
+        });
+        let in_order = time(&|pass, s| {
+            for (w, c) in slices[s].iter().zip(&outs) {
+                gemm_skinny_q4_nt(&ctx, pass, &a, w, c).unwrap();
+            }
+            barrier(pass);
+        });
+        let small_first = time(&|pass, s| {
+            for (w, c) in slices[s].iter().zip(&outs).rev() {
+                gemm_skinny_q4_nt(&ctx, pass, &a, w, c).unwrap();
+            }
+            barrier(pass);
+        });
+        eprintln!(
+            "gdn in m={m}: fused + split level {fused_split:.1} us | fused alone {fused:.1} | slices in stack order {in_order:.1} | slices smallest first {small_first:.1}"
+        );
+    }
+
+    if wanted("attn") {
+        let widths = [12288usize, 512, 512];
+        let n: usize = widths.iter().sum();
+        let stacks: Vec<QuantWeights> =
+            (0..sets).map(|s| timing_quant_bits(&ctx, n, k, 8, s as u32 + 1)).collect();
+        let idx: Vec<QuantWeights> =
+            (0..sets).map(|s| timing_quant_bits(&ctx, 640, k, 8, s as u32 + 101)).collect();
+        let slices: Vec<Vec<QuantWeights>> = stacks
+            .iter()
+            .map(|w| {
+                let mut start = 0;
+                widths
+                    .iter()
+                    .map(|&rows| {
+                        let v = quant_view_rows(w, start, rows);
+                        start += rows;
+                        v
+                    })
+                    .collect()
+            })
+            .collect();
+        let c_stack = out(n);
+        let c_idx = out(640);
+        let outs: Vec<Tensor> = widths.iter().map(|&w| out(w)).collect();
+        let out_refs: Vec<&Tensor> = outs.iter().collect();
+        let current = time(&|pass, s| {
+            gemm_skinny_q8_nt(&ctx, pass, &a, &stacks[s], &c_stack).unwrap();
+            gemm_skinny_q8_nt(&ctx, pass, &a, &idx[s], &c_idx).unwrap();
+            barrier(pass);
+            split_cols_bf16(&ctx, pass, &c_stack, &out_refs).unwrap();
+            barrier(pass);
+        });
+        let stack_alone = time(&|pass, s| {
+            gemm_skinny_q8_nt(&ctx, pass, &a, &stacks[s], &c_stack).unwrap();
+            barrier(pass);
+        });
+        let one = time(&|pass, s| {
+            let sl = &slices[s];
+            gemm_skinny_q8_nt_sets_fused(
+                &ctx,
+                pass,
+                &a,
+                &[(&sl[0], &outs[0]), (&sl[1], &outs[1]), (&sl[2], &outs[2]), (&idx[s], &c_idx)],
+            )
+            .unwrap();
+            barrier(pass);
+        });
+        let one_small_first = time(&|pass, s| {
+            let sl = &slices[s];
+            gemm_skinny_q8_nt_sets_fused(
+                &ctx,
+                pass,
+                &a,
+                &[(&idx[s], &c_idx), (&sl[2], &outs[2]), (&sl[1], &outs[1]), (&sl[0], &outs[0])],
+            )
+            .unwrap();
+            barrier(pass);
+        });
+        let four = time(&|pass, s| {
+            let sl = &slices[s];
+            gemm_skinny_q8_nt(&ctx, pass, &a, &idx[s], &c_idx).unwrap();
+            for i in (0..3).rev() {
+                gemm_skinny_q8_nt(&ctx, pass, &a, &sl[i], &outs[i]).unwrap();
+            }
+            barrier(pass);
+        });
+        let four_idx_last = time(&|pass, s| {
+            let sl = &slices[s];
+            for i in (0..3).rev() {
+                gemm_skinny_q8_nt(&ctx, pass, &a, &sl[i], &outs[i]).unwrap();
+            }
+            gemm_skinny_q8_nt(&ctx, pass, &a, &idx[s], &c_idx).unwrap();
+            barrier(pass);
+        });
+        eprintln!(
+            "attn in m={m}: fused stack + indexer + split level {current:.1} us | the stack alone {stack_alone:.1} | one multi-weight dispatch {one:.1} (smallest first {one_small_first:.1}) | four dispatches, smallest first {four:.1}, the indexer last {four_idx_last:.1}"
+        );
+    }
+
+    if wanted("down") {
+        // The shared expert's down projection (8-bit, 2560 x 640) on the
+        // level of the expert gate/up kernel, which a 4-bit GEMM of 18 MB
+        // stands in for: at one weight row per lane (the route) and at two.
+        use crate::kernels::quant::{rows_grid, rows_layout};
+        let kd = 640usize;
+        let down: Vec<QuantWeights> =
+            (0..sets).map(|s| timing_quant_bits(&ctx, 2560, kd, 8, s as u32 + 201)).collect();
+        let partner: Vec<QuantWeights> =
+            (0..sets).map(|s| timing_quant(&ctx, 14336, k, s as u32 + 301)).collect();
+        let a_down =
+            Tensor::from_f32_as_bf16(&ctx, &random_vec(&mut rng, m * kd), &[m, kd]).expect("a");
+        let (c_down, c_partner) = (out(2560), out(14336));
+        let (lanes_log2, _) = rows_layout(&down[0]);
+        let by_rows = |pass: &ComputePass<'_>, w: &QuantWeights, rows: usize| {
+            let name = if rows == 1 { Q8_REG_FNS_R1[m - 1] } else { Q8_REG_FNS[m - 1] };
+            let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1).expect("pipeline");
+            pass.dispatch_at(
+                &pipeline,
+                &[
+                    w.codes.binding(),
+                    w.scales.binding(),
+                    w.biases.binding(),
+                    a_down.binding(),
+                    c_down.binding(),
+                ],
+                &[
+                    &u32_bytes(kd),
+                    &u32_bytes(2560),
+                    &u32_bytes(w.group_size),
+                    &u32_bytes(lanes_log2),
+                ],
+                rows_grid(2560, lanes_log2, rows),
+            )
+            .expect("dispatch");
+        };
+        let alone = time(&|pass, s| {
+            gemm_skinny_q4_nt(&ctx, pass, &a, &partner[s], &c_partner).unwrap();
+            barrier(pass);
+        });
+        let mut line = format!("gather level m={m}: the partner alone {alone:.1} us");
+        for rows in [1usize, 2] {
+            let first = time(&|pass, s| {
+                by_rows(pass, &down[s], rows);
+                gemm_skinny_q4_nt(&ctx, pass, &a, &partner[s], &c_partner).unwrap();
+                barrier(pass);
+            });
+            let last = time(&|pass, s| {
+                gemm_skinny_q4_nt(&ctx, pass, &a, &partner[s], &c_partner).unwrap();
+                by_rows(pass, &down[s], rows);
+                barrier(pass);
+            });
+            let lone = time(&|pass, s| {
+                by_rows(pass, &down[s], rows);
+                barrier(pass);
+            });
+            line += &format!(
+                " | down at {rows} per lane: before it {first:.1}, after it {last:.1}, alone {lone:.1}"
+            );
+        }
+        eprintln!("{line}");
+    }
+
+    if wanted("router") {
+        let make = |n: usize, salt: u32| -> Vec<QuantWeights> {
+            (0..sets)
+                .map(|s| timing_quant_bits(&ctx, n, k, 8, salt * 1000 + s as u32))
+                .collect()
+        };
+        let (gate, gate_up, shared_gate) = (make(512, 1), make(1280, 2), make(1, 3));
+        let (c_gate, c_gate_up, c_sg) = (out(512), out(1280), out(1));
+        let one = time(&|pass, s| {
+            gemm_skinny_q8_nt_sets_fused(
+                &ctx,
+                pass,
+                &a,
+                &[(&gate[s], &c_gate), (&gate_up[s], &c_gate_up), (&shared_gate[s], &c_sg)],
+            )
+            .unwrap();
+            barrier(pass);
+        });
+        let three = time(&|pass, s| {
+            gemm_skinny_q8_nt(&ctx, pass, &a, &gate[s], &c_gate).unwrap();
+            gemm_skinny_q8_nt(&ctx, pass, &a, &gate_up[s], &c_gate_up).unwrap();
+            gemm_skinny_q8_nt(&ctx, pass, &a, &shared_gate[s], &c_sg).unwrap();
+            barrier(pass);
+        });
+        let three_small_first = time(&|pass, s| {
+            gemm_skinny_q8_nt(&ctx, pass, &a, &shared_gate[s], &c_sg).unwrap();
+            gemm_skinny_q8_nt(&ctx, pass, &a, &gate[s], &c_gate).unwrap();
+            gemm_skinny_q8_nt(&ctx, pass, &a, &gate_up[s], &c_gate_up).unwrap();
+            barrier(pass);
+        });
+        eprintln!(
+            "router level m={m}: one multi-weight dispatch {one:.1} us | three dispatches {three:.1} (smallest first {three_small_first:.1})"
+        );
+    }
+}
+
+/// A stack projected as `moe_ffn::project_stack_or_slices` encodes it (on
+/// Vulkan the slices, each into its own output: `stack_as_slices`) is, bit
+/// for bit, the fused GEMM split into those outputs, at the model's stack
+/// shapes: the 4-bit GDN input (qkv, z, a, b) and the 8-bit attention input
+/// (q, k, v), at the row counts of a draft pass, a verify pass and the widest
+/// register-A batch, with activations of wide exponents.
+#[test]
+fn stack_slices_match_the_fused_stack_bits() {
+    use crate::kernels::elementwise::split_cols_bf16;
+    use crate::moe_ffn::{project_stack_fused, project_stack_or_slices};
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(87);
+    let k = 2560usize;
+    let dequant = Tensor::zeros(&ctx, &[1], DType::BF16).expect("scratch");
+    for (bits, widths) in
+        [(4usize, vec![10240usize, 6144, 48, 48]), (8, vec![12288, 512, 512])]
+    {
+        let n: usize = widths.iter().sum();
+        let stack = if bits == 4 {
+            bits_quant(&ctx, n, k, 11)
+        } else {
+            timing_quant_bits(&ctx, n, k, 8, 11)
+        };
+        let mut start = 0;
+        let slices: Vec<QuantWeights> = widths
+            .iter()
+            .map(|&rows| {
+                let v = quant_view_rows(&stack, start, rows);
+                start += rows;
+                v
+            })
+            .collect();
+        for m in [1usize, 3, 8] {
+            let a = bits_activations(&mut rng, m * k, k, true, false);
+            let ta = Tensor::from_f32_as_bf16(&ctx, &a, &[m, k]).expect("a");
+            let outputs = || -> Vec<Tensor> {
+                widths
+                    .iter()
+                    .map(|&w| Tensor::zeros(&ctx, &[m, w], DType::BF16).expect("c"))
+                    .collect()
+            };
+            let (got, want) = (outputs(), outputs());
+            let stack_c = Tensor::zeros(&ctx, &[m, n], DType::BF16).expect("stack c");
+            let pass = ctx.begin().expect("pass");
+            // The fused GEMM and the split, spelled out.
+            let fused = project_stack_fused(&ctx, &pass, &ta, &stack, &stack_c, &widths)
+                .expect("fused")
+                .expect("the stack fuses at this shape");
+            split_cols_bf16(&ctx, &pass, &fused, &want.iter().collect::<Vec<_>>())
+                .expect("split");
+            // The model's encoding.
+            let stack_c2 = Tensor::zeros(&ctx, &[m, n], DType::BF16).expect("stack c");
+            if bits == 4 {
+                project_stack_or_slices(
+                    &ctx,
+                    &pass,
+                    &ta,
+                    &stack,
+                    &stack_c2,
+                    [
+                        (&slices[0], &got[0]),
+                        (&slices[1], &got[1]),
+                        (&slices[2], &got[2]),
+                        (&slices[3], &got[3]),
+                    ],
+                    &dequant,
+                )
+                .expect("stack or slices");
+            } else {
+                project_stack_or_slices(
+                    &ctx,
+                    &pass,
+                    &ta,
+                    &stack,
+                    &stack_c2,
+                    [(&slices[0], &got[0]), (&slices[1], &got[1]), (&slices[2], &got[2])],
+                    &dequant,
+                )
+                .expect("stack or slices");
+            }
+            pass.commit_wait().expect("commit");
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert_bits_eq(
+                    &g.to_f32().expect("read"),
+                    &w.to_f32().expect("read"),
+                    &format!("q{bits} stack m={m} slice {i}"),
+                );
             }
         }
     }

@@ -25,6 +25,10 @@ use crate::kernels::attention::{
     q_norm_rope_split_decode, rope_neox, scatter_kv, sdpa_decode, sdpa_prefill,
     sdpa_split_scratch_splits, split_q_gate,
 };
+#[cfg(target_os = "linux")]
+use crate::kernels::attention::{
+    SDPA_ROWS_SPLIT_MAX_ROWS, sdpa_rows_split, sdpa_rows_split_scratch_numel,
+};
 use crate::kernels::elementwise::{
     add_bf16, copy_words, gather_row_bf16, sigmoid_mul_bf16,
 };
@@ -424,6 +428,9 @@ pub struct DecodeState {
     pub(super) ple: Option<PleState>,
     pub(super) mtp: Option<MtpState>,
     pub(super) spec: Option<SpecPending>,
+    /// The next verify pass encoded ahead and what it needs (`spec.rs`).
+    #[cfg(target_os = "linux")]
+    pub(super) ahead: super::spec::SpecAhead,
     kv_format: KvFormat,
     kv_heads: usize,
     head_dim: usize,
@@ -1346,6 +1353,11 @@ pub(super) struct PrefillScratch {
     /// (`[KVH, dense_limit, D]` each), which the dense tensor-op prefill
     /// kernel reads; rows past the indexer's dense limit never go dense.
     kv_staging: Option<[Tensor; 2]>,
+    /// F32: the split few-row attention's tiles (`sdpa_rows_split`), for
+    /// chunks of at most `SDPA_ROWS_SPLIT_MAX_ROWS` rows over the dense
+    /// window. Vulkan only.
+    #[cfg(target_os = "linux")]
+    attn_rows_split: Tensor,
 }
 
 struct GdnStageScratch {
@@ -1471,6 +1483,17 @@ impl PrefillScratch {
                 &[m + cfg.indexer.compress_ratio, 3],
                 DType::U32,
             )?,
+            #[cfg(target_os = "linux")]
+            attn_rows_split: Tensor::zeros(
+                ctx,
+                &[sdpa_rows_split_scratch_numel(
+                    m.min(SDPA_ROWS_SPLIT_MAX_ROWS),
+                    nq,
+                    hd,
+                    cfg.indexer.dense_limit() + SDPA_ROWS_SPLIT_MAX_ROWS,
+                )],
+                DType::F32,
+            )?,
             kv_staging: match kv_format {
                 KvFormat::Bf16 => None,
                 KvFormat::Q8 => {
@@ -1549,6 +1572,10 @@ impl PrefillScratch {
                 .transpose()?,
             // Full extent: the chunk's slice is viewed at upload.
             positions: self.positions.view(0, self.positions.shape())?,
+            #[cfg(target_os = "linux")]
+            attn_rows_split: self
+                .attn_rows_split
+                .view(0, self.attn_rows_split.shape())?,
             kv_staging: self
                 .kv_staging
                 .as_ref()
@@ -1849,6 +1876,8 @@ impl Qwen4ExpModel {
             ple,
             mtp,
             spec: None,
+            #[cfg(target_os = "linux")]
+            ahead: Default::default(),
             kv_format: self.kv_format,
             kv_heads: cfg.num_key_value_heads,
             head_dim: cfg.head_dim,
@@ -2832,6 +2861,8 @@ impl Qwen4ExpModel {
                 "verify batch of {m} rows exceeds {}",
                 MAX_DRAFTS + 1
             );
+            #[cfg(target_os = "linux")]
+            pass.set_short();
         }
         let spec = if verify { s.spec.as_ref() } else { None };
         let vision = match mode {
@@ -3566,21 +3597,40 @@ impl Qwen4ExpModel {
                 }
             }
         };
+        // Dense attention over that window: a few rows (the verify pass)
+        // split the keys across threadgroups, a chunk walks them in the
+        // prefill kernel.
+        let dense_attn = |q: &Tensor, k: &Tensor, v: &Tensor, out: &Tensor| -> Result<()> {
+            #[cfg(target_os = "linux")]
+            if q.shape()[0] <= SDPA_ROWS_SPLIT_MAX_ROWS
+                && ps.attn_rows_split.numel()
+                    >= sdpa_rows_split_scratch_numel(
+                        q.shape()[0],
+                        nq,
+                        hd,
+                        pos.max + q.shape()[0],
+                    )
+            {
+                return sdpa_rows_split(
+                    ctx,
+                    pass,
+                    q,
+                    k,
+                    v,
+                    out,
+                    pos,
+                    self.attn_scale,
+                    &ps.attn_rows_split,
+                );
+            }
+            sdpa_prefill(ctx, pass, q, k, v, out, pos, self.attn_scale)
+        };
 
         if pos.max + m <= idx.dense_limit() {
             // Every query sees at most the budget: the selection is the whole
             // causal window, so the dense kernel is exact.
             let (k_dense, v_dense) = dense_kv(pos.max + m)?;
-            sdpa_prefill(
-                ctx,
-                pass,
-                &ps.q,
-                k_dense,
-                v_dense,
-                &ps.attn_o,
-                pos,
-                self.attn_scale,
-            )?;
+            dense_attn(&ps.q, k_dense, v_dense, &ps.attn_o)?;
         } else {
             // Rows whose causal window still fits the budget select every
             // visible block, so the dense kernel is exact for them: the
@@ -3591,16 +3641,7 @@ impl Qwen4ExpModel {
                 let q = ps.q.view(0, &[dense_rows, nq, hd])?;
                 let out = ps.attn_o.view(0, &[dense_rows, nq, hd])?;
                 let (k_dense, v_dense) = dense_kv(pos.max + dense_rows)?;
-                sdpa_prefill(
-                    ctx,
-                    pass,
-                    &q,
-                    k_dense,
-                    v_dense,
-                    &out,
-                    pos,
-                    self.attn_scale,
-                )?;
+                dense_attn(&q, k_dense, v_dense, &out)?;
             }
             let qb_cap = ps.qsa.n_sel.numel();
             for q0 in (dense_rows..m).step_by(qb_cap) {
@@ -4259,8 +4300,12 @@ impl Qwen4ExpModel {
             NORM_WEIGHT_BIAS,
         )?;
         pass.level_barrier(&[&p.emb, &p.query_n])?;
-        quant::gemv_quant(ctx, pass, &w.key_proj, &p.emb, &p.key)?;
-        quant::gemv_quant(ctx, pass, &w.value_proj, &p.emb, &p.value)?;
+        quant::gemv_quant_sets(
+            ctx,
+            pass,
+            &p.emb,
+            &[(&w.key_proj, &p.key), (&w.value_proj, &p.value)],
+        )?;
         pass.level_barrier(&[&p.key, &p.value])?;
         rmsnorm_grouped_bf16(
             ctx,
@@ -4376,8 +4421,12 @@ impl Qwen4ExpModel {
         if crate::ablate::on(crate::ablate::Group::Attn) {
             return Ok(());
         }
-        quant::gemv_quant(ctx, pass, &w.qkv_proj, &s.hc.mixed, &s.attn_qkv)?;
-        quant::gemv_quant(ctx, pass, &w.indexer.qk_proj, &s.hc.mixed, &s.idx_qk)?;
+        quant::gemv_quant_sets(
+            ctx,
+            pass,
+            &s.hc.mixed,
+            &[(&w.qkv_proj, &s.attn_qkv), (&w.indexer.qk_proj, &s.idx_qk)],
+        )?;
         pass.level_barrier(&[&s.attn_qkv, &s.idx_qk])?;
         q_norm_rope_split_decode(
             ctx, pass, &s.qg, &w.q_norm, &s.q, &s.gate, rot, pos, theta, eps,

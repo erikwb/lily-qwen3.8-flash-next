@@ -554,7 +554,33 @@ pub fn sdpa_prefill<'t>(
     base_len: impl Into<Pos<'t>>,
     scale: f32,
 ) -> Result<()> {
-    let base_len = base_len.into();
+    sdpa_prefill_with(
+        ctx,
+        pass,
+        sdpa_prefill_kernel(ctx),
+        q,
+        k_cache,
+        v_cache,
+        out,
+        base_len.into(),
+        scale,
+    )
+}
+
+/// [`sdpa_prefill`] with the kernel named (the tests' reference kernel takes
+/// the shipped one's arguments).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sdpa_prefill_with(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    kernel: &'static str,
+    q: &Tensor,
+    k_cache: &Tensor,
+    v_cache: &Tensor,
+    out: &Tensor,
+    base_len: Pos<'_>,
+    scale: f32,
+) -> Result<()> {
     ensure!(
         Kv::pair_format(&k_cache.into(), &v_cache.into())? == KvFormat::Bf16,
         "the dense prefill kernel reads bf16 caches (stage a q8 one with kv_dequant_q8)"
@@ -576,7 +602,7 @@ pub fn sdpa_prefill<'t>(
         d == FA_D,
         "head dim {d} is not the compiled flash-attention head dim {FA_D}"
     );
-    let pipeline = ctx.pipeline(SDPA_PREFILL_KERNEL, SOURCE, MslVersion::V4_0)?;
+    let pipeline = ctx.pipeline(kernel, SOURCE, MslVersion::V4_0)?;
     pass.dispatch_with(
         &pipeline,
         &[q.binding(), k_cache.binding(), v_cache.binding(), out.binding()],
@@ -599,8 +625,133 @@ pub fn sdpa_prefill<'t>(
 }
 
 const SDPA_PREFILL_KERNEL: &str = "sdpa_prefill_nax_qdev128";
+/// The same tile with the scores in registers (attention_cm2.comp), on
+/// VK_NV_cooperative_matrix2's conversions, reductions and per-element
+/// operations; same arguments and geometry.
+#[cfg(target_os = "linux")]
+const SDPA_PREFILL_CM2_KERNEL: &str = "sdpa_prefill_cm2";
+
+/// The kernel [`sdpa_prefill`] dispatches: the hand-built
+/// [`SDPA_PREFILL_KERNEL`], or with `LILY_VK_PREFILL_CM2=1`
+/// [`SDPA_PREFILL_CM2_KERNEL`] where the device has the operations it needs
+/// (and the build compiled it). The latter is 1 to 4% faster per dispatch
+/// but no faster end to end (lily-bench, 4096-token prompt: 1993 tok/s
+/// either way, 2026-11-11), and its rounding changes the output, so it is
+/// off by default.
+pub(crate) fn sdpa_prefill_kernel(ctx: &MetalContext) -> &'static str {
+    #[cfg(target_os = "linux")]
+    {
+        static ALLOWED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let allowed = *ALLOWED
+            .get_or_init(|| std::env::var("LILY_VK_PREFILL_CM2").is_ok_and(|v| v == "1"));
+        if allowed
+            && ctx.cooperative_matrix_register_ops()
+            && ctx.has_kernel(SDPA_PREFILL_CM2_KERNEL)
+        {
+            return SDPA_PREFILL_CM2_KERNEL;
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = ctx;
+    SDPA_PREFILL_KERNEL
+}
 const SDPA_PREFILL_BQ: usize = 16;
 const SDPA_PREFILL_THREADS: usize = 128;
+
+/// Keys per split of [`sdpa_rows_split`] (`FA_BK` in attention.comp).
+const SDPA_ROWS_SPLIT_KEYS: usize = 128;
+/// Rows [`sdpa_rows_split`] takes: one query tile.
+pub const SDPA_ROWS_SPLIT_MAX_ROWS: usize = SDPA_PREFILL_BQ;
+
+/// F32 elements of the scratch [`sdpa_rows_split`] needs for `m` rows of
+/// `nq` heads of dim `d` at most `max_len` positions after the chunk.
+pub fn sdpa_rows_split_scratch_numel(m: usize, nq: usize, d: usize, max_len: usize) -> usize {
+    m * nq * max_len.div_ceil(SDPA_ROWS_SPLIT_KEYS) * (d + 2)
+}
+
+/// [`sdpa_prefill`] for a chunk of at most [`SDPA_ROWS_SPLIT_MAX_ROWS`] rows
+/// (the verify pass of speculative decode) with the keys split across
+/// threadgroups, 128 to each, and a combine level: the prefill kernel walks
+/// a head's key tiles one after another in one threadgroup, which at a few
+/// rows is its whole time. `scratch` is F32 of at least
+/// [`sdpa_rows_split_scratch_numel`] for `base_len.max + m`. Equal to the
+/// prefill kernel's result up to rounding (each tile's probabilities are
+/// rounded against its own maxima), not bit for bit. Vulkan only.
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+pub fn sdpa_rows_split<'t>(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    q: &Tensor,
+    k_cache: &Tensor,
+    v_cache: &Tensor,
+    out: &Tensor,
+    base_len: impl Into<Pos<'t>>,
+    scale: f32,
+    scratch: &Tensor,
+) -> Result<()> {
+    let base_len = base_len.into();
+    ensure!(
+        Kv::pair_format(&k_cache.into(), &v_cache.into())? == KvFormat::Bf16,
+        "the split rows kernel reads bf16 caches (stage a q8 one with kv_dequant_q8)"
+    );
+    let (kvh, max_seq, d) = (k_cache.shape()[0], k_cache.shape()[1], k_cache.shape()[2]);
+    ensure!(q.shape().len() == 3 && q.shape()[2] == d, "q must be [M, NQ, D]");
+    let (m, nq) = (q.shape()[0], q.shape()[1]);
+    ensure!(
+        (1..=SDPA_ROWS_SPLIT_MAX_ROWS).contains(&m),
+        "rows {m} outside 1..={SDPA_ROWS_SPLIT_MAX_ROWS}"
+    );
+    ensure!(out.numel() == q.numel() && out.dtype() == DType::BF16, "out shape mismatch");
+    ensure!(out.binding().1 % 4 == 0, "out must be 4-byte aligned");
+    ensure!(nq.is_multiple_of(kvh), "NQ {nq} not a multiple of KVH {kvh}");
+    ensure!(d == FA_D, "head dim {d} is not the compiled flash-attention head dim {FA_D}");
+    ensure!(
+        base_len.max + m <= max_seq && max_seq <= MAX_SEQ,
+        "chunk exceeds kernel MAX_SEQ"
+    );
+    ensure!(v_cache.shape() == k_cache.shape(), "k/v cache shape mismatch");
+    let max_len = base_len.max + m;
+    let splits = max_len.div_ceil(SDPA_ROWS_SPLIT_KEYS);
+    ensure!(
+        scratch.dtype() == DType::F32
+            && scratch.numel() >= sdpa_rows_split_scratch_numel(m, nq, d, max_len),
+        "split rows scratch too small"
+    );
+    let tiles = ctx.pipeline("sdpa_rows_split_nax", SOURCE, MslVersion::V4_0)?;
+    pass.dispatch_with(
+        &tiles,
+        &[q.binding(), k_cache.binding(), v_cache.binding(), scratch.binding()],
+        &[
+            Param::U32(max_seq as u32),
+            base_len.param(),
+            Param::U32(m as u32),
+            Param::U32(nq as u32),
+            Param::U32((nq / kvh) as u32),
+            Param::F32(scale),
+            Param::U32(splits as u32),
+            Param::U32(0),
+        ],
+        Grid::Threadgroups {
+            // A tile's rows are a key head's query heads' rows.
+            groups: (splits, kvh, (m * (nq / kvh)).div_ceil(SDPA_PREFILL_BQ)),
+            threadgroup: (SDPA_PREFILL_THREADS, 1, 1),
+        },
+    )?;
+    pass.level_barrier(&[scratch])?;
+    let combine = ctx.pipeline("sdpa_rows_split_combine", SOURCE, MslVersion::V4_0)?;
+    pass.dispatch_with(
+        &combine,
+        &[scratch.binding(), out.binding()],
+        &[
+            base_len.param(),
+            Param::U32(m as u32),
+            Param::U32(nq as u32),
+            Param::U32(splits as u32),
+        ],
+        Grid::Threadgroups { groups: (nq, m, 1), threadgroup: (d / 4, 1, 1) },
+    )
+}
 
 /// Single-token SDPA over `len` cached positions with GQA head mapping. A
 /// q8 cache always takes the split kernel (one split at most 256 positions)

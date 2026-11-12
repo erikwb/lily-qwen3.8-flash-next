@@ -10,6 +10,15 @@ use crate::tensor::Tensor;
 
 const SOURCE: &str = include_str!("metal/gemm.metal");
 
+/// Threads of a threadgroup, which computes a 64x64 tile of C. Metal's
+/// kernel runs one `matmul2d` on four simdgroups. The Vulkan kernel's
+/// subgroups each hold a 32x64 tile of their own (`vulkan/gemm.comp`): two
+/// cover the tile, and share nothing.
+#[cfg(not(target_os = "linux"))]
+const TILE_THREADS: usize = 128;
+#[cfg(target_os = "linux")]
+const TILE_THREADS: usize = 64;
+
 fn nax_version(ctx: &MetalContext) -> Result<MslVersion> {
     static VERSION: OnceLock<Result<Option<MslVersion>, String>> = OnceLock::new();
     let resolved = VERSION.get_or_init(|| {
@@ -40,7 +49,7 @@ pub fn gemm_bf16_nt(
         &[&u32_bytes(k), &u32_bytes(n), &u32_bytes(m)],
         Grid::Threadgroups {
             groups: (n.div_ceil(64), m.div_ceil(64), 1),
-            threadgroup: (128, 1, 1),
+            threadgroup: (TILE_THREADS, 1, 1),
         },
     )
 }
@@ -67,7 +76,7 @@ pub fn gemm_bf16_nt_bias(
         &[&u32_bytes(k), &u32_bytes(n), &u32_bytes(m)],
         Grid::Threadgroups {
             groups: (n.div_ceil(64), m.div_ceil(64), 1),
-            threadgroup: (128, 1, 1),
+            threadgroup: (TILE_THREADS, 1, 1),
         },
     )
 }

@@ -263,6 +263,7 @@ impl Drop for Mapping {
 
 /// The handful of libSystem calls the mapping needs, declared here to avoid a
 /// dependency on the `libc` crate.
+#[cfg(target_os = "macos")]
 mod sys {
     use std::ffi::{c_int, c_void};
 
@@ -309,6 +310,35 @@ mod sys {
     pub fn page_size() -> usize {
         // SAFETY: no preconditions.
         (unsafe { getpagesize() }) as usize
+    }
+}
+
+/// The same calls on Linux, from the `libc` crate: the constants' values are
+/// Linux's own (`MAP_SHARED`, `MADV_WILLNEED` and the rest happen to match
+/// macOS's on arm64, but nothing promises it), and `mmap`'s offset is the
+/// platform's `off_t`.
+#[cfg(target_os = "linux")]
+mod sys {
+    pub use libc::{
+        MADV_WILLNEED, MAP_FAILED, MAP_SHARED, PROT_READ, madvise, mincore, mlock,
+        mmap, munmap,
+    };
+
+    /// Lowers the calling thread to the background class: nice 19 and the
+    /// idle I/O class (`crate::priority`), the nearest Linux has to macOS's
+    /// background QoS with throttled I/O. Best effort; returns whether both
+    /// took.
+    pub fn lower_thread_priority() -> bool {
+        crate::priority::lower_current_thread(crate::priority::Class::Background)
+    }
+
+    /// The kernel's page size (16 KB on the Apple Silicon kernels, 4 KB on
+    /// most others): the unit of `mincore`'s answer and of the alignment
+    /// `madvise` and `mincore` require. `sysconf` reads it from the auxiliary
+    /// vector and cannot fail for `_SC_PAGESIZE`.
+    pub fn page_size() -> usize {
+        // SAFETY: sysconf has no preconditions.
+        (unsafe { libc::sysconf(libc::_SC_PAGESIZE) }) as usize
     }
 }
 

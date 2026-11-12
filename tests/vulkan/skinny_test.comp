@@ -1,0 +1,125 @@
+#version 460
+// The kernels of tests/metal/skinny_test.metal: staged-A variants with
+// explicit K-chunk sizes, and the register-A Q4 kernels as shipped before the
+// explicit-order rewrite, the bit-identity reference of the shipped ones.
+#include "common.glsl"
+#include "quant_common.glsl"
+
+#ifdef KERNEL_gemm_skinny_q4_bf16_m8_kc512
+#define SKINNY_STAGED 4
+#define SKINNY_MB 8
+#define SKINNY_KC 512
+#endif
+#ifdef KERNEL_gemm_skinny_q4_bf16_m8_kc1024
+#define SKINNY_STAGED 4
+#define SKINNY_MB 8
+#define SKINNY_KC 1024
+#endif
+
+#if defined(KERNEL_gemm_skinny_q4_bf16_reg_m1_previous) || defined(KERNEL_gemm_skinny_q4_f32_reg_m1_previous)
+#define PREVIOUS_MB 1
+#endif
+#if defined(KERNEL_gemm_skinny_q4_bf16_reg_m2_previous) || defined(KERNEL_gemm_skinny_q4_f32_reg_m2_previous)
+#define PREVIOUS_MB 2
+#endif
+#if defined(KERNEL_gemm_skinny_q4_bf16_reg_m3_previous) || defined(KERNEL_gemm_skinny_q4_f32_reg_m3_previous)
+#define PREVIOUS_MB 3
+#endif
+#if defined(KERNEL_gemm_skinny_q4_bf16_reg_m4_previous) || defined(KERNEL_gemm_skinny_q4_f32_reg_m4_previous)
+#define PREVIOUS_MB 4
+#endif
+#if defined(KERNEL_gemm_skinny_q4_bf16_reg_m5_previous) || defined(KERNEL_gemm_skinny_q4_f32_reg_m5_previous)
+#define PREVIOUS_MB 5
+#endif
+#if defined(KERNEL_gemm_skinny_q4_bf16_reg_m6_previous) || defined(KERNEL_gemm_skinny_q4_f32_reg_m6_previous)
+#define PREVIOUS_MB 6
+#endif
+#if defined(KERNEL_gemm_skinny_q4_bf16_reg_m7_previous) || defined(KERNEL_gemm_skinny_q4_f32_reg_m7_previous)
+#define PREVIOUS_MB 7
+#endif
+#if defined(KERNEL_gemm_skinny_q4_bf16_reg_m8_previous) || defined(KERNEL_gemm_skinny_q4_f32_reg_m8_previous)
+#define PREVIOUS_MB 8
+#endif
+#if defined(KERNEL_gemm_skinny_q4_f32_reg_m1_previous) || \
+    defined(KERNEL_gemm_skinny_q4_f32_reg_m2_previous) || \
+    defined(KERNEL_gemm_skinny_q4_f32_reg_m3_previous) || \
+    defined(KERNEL_gemm_skinny_q4_f32_reg_m4_previous) || \
+    defined(KERNEL_gemm_skinny_q4_f32_reg_m5_previous) || \
+    defined(KERNEL_gemm_skinny_q4_f32_reg_m6_previous) || \
+    defined(KERNEL_gemm_skinny_q4_f32_reg_m7_previous) || \
+    defined(KERNEL_gemm_skinny_q4_f32_reg_m8_previous)
+#define SKINNY_F32
+#endif
+
+#include "skinny_common.glsl"
+
+// Two weight rows per subgroup, every lane walking all of its blocks. On
+// Metal this kernel's numerics are what the fast-math compiler made of its
+// source, which skinny.metal records operation by operation; they are written
+// out here (per code word qx = (qx + dot_lo) + dot_hi and xs likewise, each
+// in fours left to right; per block fma(b, xs, fma(s, qx, acc)) on the even
+// row and fma(s, qx, fma(b, xs, acc)) on the odd row, the latter on both at
+// m = 1).
+#ifdef PREVIOUS_MB
+#define MB PREVIOUS_MB
+void main() {
+    BF16 scales = BF16(arg(1)), biases = BF16(arg(2));
+    uint64_t a = arg(3), c = arg(4);
+    uint K = arg_u32(5), N = arg_u32(6), GS = arg_u32(7);
+    uint lane = thread_index_in_simdgroup;
+    uint row0 = (threadgroup_position_in_grid.x * (threads_per_threadgroup.x / 32) + simdgroup_index_in_threadgroup) * 2;
+    if (row0 >= N) return; // whole subgroup
+    bool has1 = row0 + 1 < N;
+    uint row1 = has1 ? row0 + 1 : row0;
+    uint words = K / 8, blocks = words / 4, bpg = GS / 32, groups = K / GS;
+    bool a_vec = (a & 15) == 0;
+    U32x4 w0 = U32x4(arg(0) + uint64_t(row0) * (4 * words));
+    U32x4 w1 = U32x4(arg(0) + uint64_t(row1) * (4 * words));
+
+    precise float acc0[MB], acc1[MB];
+    [[unroll]] for (uint i = 0; i < MB; ++i) {
+        acc0[i] = 0.0;
+        acc1[i] = 0.0;
+    }
+
+    for (uint blk = lane; blk < blocks; blk += 32) {
+        uint g = blk / bpg;
+        float s0 = float(scales.v[row0 * groups + g]);
+        float b0 = float(biases.v[row0 * groups + g]);
+        float s1 = float(scales.v[row1 * groups + g]);
+        float b1 = float(biases.v[row1 * groups + g]);
+        uvec4 v0 = w0.v[blk];
+        uvec4 v1 = w1.v[blk];
+        precise float qx0[MB], qx1[MB], xs[MB];
+        [[unroll]] for (uint i = 0; i < MB; ++i) {
+            qx0[i] = 0.0;
+            qx1[i] = 0.0;
+            xs[i] = 0.0;
+        }
+        [[unroll]] for (uint wi = 0; wi < 4; ++wi) {
+            vec4 q0lo = q4_lo(v0[wi]), q0hi = q4_hi(v0[wi]);
+            vec4 q1lo = q4_lo(v1[wi]), q1hi = q4_hi(v1[wi]);
+            [[unroll]] for (uint i = 0; i < MB; ++i) {
+                uvec4 x = load_raw8(a, i * K + blk * 32 + wi * 8, a_vec);
+                vec4 xlo = bf4_bits(x.xy), xhi = bf4_bits(x.zw);
+                xs[i] = (xs[i] + skinny_sum4(xlo)) + skinny_sum4(xhi);
+                qx0[i] = (qx0[i] + skinny_dot4(q0lo, xlo)) + skinny_dot4(q0hi, xhi);
+                qx1[i] = (qx1[i] + skinny_dot4(q1lo, xlo)) + skinny_dot4(q1hi, xhi);
+            }
+        }
+        [[unroll]] for (uint i = 0; i < MB; ++i) {
+            acc0[i] = skinny_fold(MB == 1, s0, qx0[i], b0, xs[i], acc0[i]);
+            acc1[i] = skinny_fold(true, s1, qx1[i], b1, xs[i], acc1[i]);
+        }
+    }
+
+    [[unroll]] for (uint i = 0; i < MB; ++i) {
+        float sum0 = subgroupAdd(acc0[i]);
+        float sum1 = subgroupAdd(acc1[i]);
+        if (lane == 0) {
+            SKINNY_STORE(c, i, N, row0, sum0);
+            if (has1) SKINNY_STORE(c, i, N, row1, sum1);
+        }
+    }
+}
+#endif

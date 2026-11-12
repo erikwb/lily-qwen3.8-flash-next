@@ -88,6 +88,8 @@ fn a_second_process_is_refused_with_the_holders_pid_until_the_holder_is_killed()
     assert!(!holder.binary.is_empty());
     let message = refused.to_string();
     assert!(message.contains(&format!("pid {}", child.id())), "{message}");
+    // The launchd service and its script are macOS's.
+    #[cfg(target_os = "macos")]
     assert!(message.contains("tools/service/lily-service.sh stop"), "{message}");
     assert!(message.contains(&path.display().to_string()), "{message}");
 
@@ -174,7 +176,10 @@ fn the_lock_path_is_machine_wide_and_does_not_depend_on_home() {
     // Children forked now could inherit another test's lock descriptor.
     let _serial = serial();
     let here = default_path();
+    #[cfg(target_os = "macos")]
     assert_eq!(here, Path::new("/Users/Shared/lily-instance.lock"));
+    #[cfg(target_os = "linux")]
+    assert_eq!(here, Path::new("/tmp/lily-instance.lock"));
     let here = here.display().to_string();
     assert_eq!(child_lock_path(None), here, "HOME unset");
     assert_eq!(child_lock_path(Some(".")), here, "HOME relative");

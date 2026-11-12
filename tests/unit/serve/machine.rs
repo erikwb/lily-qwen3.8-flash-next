@@ -848,6 +848,7 @@ fn machine_stats_takes_on_or_off() {
 /// right per call; both would show here as a footprint that climbs with the
 /// calls. The bound is generous (8 MiB over 300 calls) so only a leak that
 /// matters fails; the growth is printed either way. Not vendored.
+#[cfg(target_os = "macos")]
 #[test]
 #[ignore = "needs IOReport and the SMC: run outside the sandbox on Apple Silicon"]
 fn real_macmon_reads_plausible_figures_and_does_not_leak() {
@@ -895,4 +896,17 @@ fn real_macmon_reads_plausible_figures_and_does_not_leak() {
     assert_eq!(machine.state(), State::Running);
     machine.finish(Duration::from_secs(5));
     assert!(machine.finished(), "the thread ends at the stop");
+}
+
+/// Linux has no source for the figures: the production sampler fails at its
+/// start, says why, and publishes nothing.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_linux_sampler_fails_at_its_start_with_the_reason() {
+    let machine = Machine::spawn(LinuxSensors::new, || false, Intervals::default());
+    assert!(eventually(|| machine.finished()));
+    assert_eq!(machine.state(), State::Failed);
+    let error = machine.error().expect("the reason");
+    assert!(error.contains("Linux exposes no"), "{error}");
+    assert!(machine.latest(Instant::now()).is_none());
 }

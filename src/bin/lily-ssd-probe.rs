@@ -88,6 +88,14 @@ struct Cli {
     sustain_secs: Option<f64>,
 }
 
+/// How the uncached reads are made, for the header line.
+#[cfg(target_os = "macos")]
+const NOCACHE: &str = "F_NOCACHE";
+/// Linux has no `F_NOCACHE`; `ExpertStore::set_nocache` turns read-ahead off
+/// and drops each read's pages after it.
+#[cfg(target_os = "linux")]
+const NOCACHE: &str = "uncached (no read-ahead, pages dropped after each read)";
+
 /// Experts per demand batch in phase 1.
 const DEMAND_KS: [usize; 6] = [1, 2, 4, 8, 16, 32];
 /// Background experts in flight in phase 2.
@@ -500,7 +508,7 @@ fn main() -> Result<()> {
         "lily-ssd-probe: {} ({layers} layers x {experts} experts, {:.2} MB per expert in {REGIONS} reads), {}, read pool {LOAD_THREADS} threads + caller",
         cli.model.display(),
         bytes as f64 / 1e6,
-        if cli.buffered { "buffered (page cache on)" } else { "F_NOCACHE" },
+        if cli.buffered { "buffered (page cache on)" } else { NOCACHE },
     );
     let resident_before = residency(&store, all())?;
     println!("page cache before: {}", resident_before.describe());
@@ -773,17 +781,36 @@ fn other_lily_running() -> Option<bool> {
         return Some(false);
     }
     // Alive (or not ours to signal): compare its binary when both are known.
+    let Some(running) = pid_path(pid) else { return Some(true) };
+    if holder.binary.is_empty() {
+        return Some(true);
+    }
+    let recorded = PathBuf::from(&holder.binary);
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
+    Some(real(&running) == real(&recorded))
+}
+
+/// The binary `pid` runs (`proc_pidpath`), `None` when it cannot be told.
+#[cfg(target_os = "macos")]
+fn pid_path(pid: libc::pid_t) -> Option<PathBuf> {
     let mut path = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
     // SAFETY: the buffer is `path.len()` bytes long.
     let n =
         unsafe { libc::proc_pidpath(pid, path.as_mut_ptr().cast(), path.len() as u32) };
-    if n <= 0 || holder.binary.is_empty() {
-        return Some(true);
+    if n <= 0 {
+        return None;
     }
-    let running = PathBuf::from(String::from_utf8_lossy(&path[..n as usize]).as_ref());
-    let recorded = PathBuf::from(&holder.binary);
-    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
-    Some(real(&running) == real(&recorded))
+    Some(PathBuf::from(String::from_utf8_lossy(&path[..n as usize]).as_ref()))
+}
+
+/// The binary `pid` runs (`/proc/<pid>/exe`), `None` when it cannot be told
+/// (another account's process: the link is readable only by its owner and
+/// root). A binary replaced since it started reads with ` (deleted)` after
+/// it and then does not match the record, which errs towards "not running";
+/// the refusal of a second lily is the lock's, not this probe's.
+#[cfg(target_os = "linux")]
+fn pid_path(pid: libc::pid_t) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/exe")).ok()
 }
 
 /// A summary's columns, `-` for none.

@@ -1,0 +1,597 @@
+#version 460
+// The kernels of src/kernels/metal/hc.metal: hyper-connection (gated
+// residual) kernels, the same arithmetic in the same order. The residual
+// stream is G copies of the hidden width H laid out [rows, G*H].
+#include "common.glsl"
+#include "hc_common.glsl"
+
+#define TG 256
+
+#ifdef KERNEL_rmsnorm_grouped_bf16
+shared float partial[TG / 32];
+shared float inv_rms;
+void main() {
+    uint H = arg_u32(3), G = arg_u32(4);
+    float eps = arg_f32(5), w_bias = arg_f32(6);
+    uint seg = threadgroup_position_in_grid.x, tid = thread_index_in_threadgroup;
+    uint sg = simdgroup_index_in_threadgroup, lane = thread_index_in_simdgroup;
+    BF16 x = BF16(arg(0) + 2 * uint64_t(seg) * H), out_ = BF16(arg(2) + 2 * uint64_t(seg) * H);
+    BF16 w = BF16(arg(1) + 2 * ((seg % G) * H));
+
+    float acc = 0.0;
+    for (uint i = tid; i < H; i += TG) {
+        float v = float(x.v[i]);
+        acc += v * v;
+    }
+    acc = subgroupAdd(acc);
+    if (lane == 0) partial[sg] = acc;
+    barrier();
+    if (tid == 0) {
+        float total = 0.0;
+        for (uint i = 0; i < TG / 32; ++i) total += partial[i];
+        inv_rms = inversesqrt(total / float(H) + eps);
+    }
+    barrier();
+    for (uint i = tid; i < H; i += TG) {
+        float gain = w_bias + float(w.v[i]);
+        out_.v[i] = bf16_rne(float(x.v[i]) * inv_rms * gain);
+    }
+}
+#endif
+
+#ifdef KERNEL_silu_scaled_bf16
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    uint gid = thread_position_in_grid.x;
+    float v = float(BF16(arg(0)).v[gid]) * arg_f32(2);
+    BF16(arg(1)).v[gid] = bf16_rne(v / (1.0 + exp(-v)));
+}
+#endif
+
+#ifdef KERNEL_hc_mix_bf16
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    uint H = arg_u32(3), G = arg_u32(4);
+    uint i = thread_position_in_grid.x, r = thread_position_in_grid.y;
+    BF16 up = BF16(arg(0) + 2 * uint64_t(r) * G * H), hn = BF16(arg(1) + 2 * uint64_t(r) * G * H);
+    float acc = 0.0;
+    for (uint g = 0; g < G; ++g) {
+        float logit = float(up.v[g * H + i]);
+        float gate = 1.0 / (1.0 + exp(-logit));
+        acc += gate * float(hn.v[g * H + i]);
+    }
+    BF16(arg(2) + 2 * uint64_t(r) * H).v[i] = bf16_rne(acc / float(G));
+}
+#endif
+
+#ifdef KERNEL_hc_inject_bf16
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    uint H = arg_u32(3), G = arg_u32(4);
+    float inv_g = arg_f32(5);
+    uint col = thread_position_in_grid.x, r = thread_position_in_grid.y;
+    uint g = col / H, i = col % H;
+    float logit = float(BF16(arg(2)).v[r * G + g]) * inv_g;
+    float weight = 2.0 / (1.0 + exp(-logit));
+    BF16 hyper = BF16(arg(0) + 2 * uint64_t(r) * G * H);
+    hyper.v[col] = bf16_rne(float(hyper.v[col]) + float(BF16(arg(1) + 2 * uint64_t(r) * H).v[i]) * weight);
+}
+#endif
+
+#ifdef KERNEL_hc_broadcast_bf16
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    uint H = arg_u32(2), G = arg_u32(3);
+    uint col = thread_position_in_grid.x, r = thread_position_in_grid.y;
+    BF16(arg(1) + 2 * uint64_t(r) * G * H).v[col] = BF16(arg(0) + 2 * uint64_t(r) * H).v[col % H];
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// The fused read gate (hc.metal says what the two kernels compute and why).
+// The down kernels are laid out as the Metal ones; the up kernels are not
+// (see there).
+
+#define HC_MAX_G 8
+
+// The four Q8 codes of a word as floats.
+vec4 hc_unpack_q8(uint word) {
+    return vec4(float(word & 0xFFu), float((word >> 8) & 0xFFu),
+                float((word >> 16) & 0xFFu), float((word >> 24) & 0xFFu));
+}
+
+// quant.metal's dot_word_q8 on unpacked codes and an activation in registers.
+float hc_dot_q8(vec4 q, float s, float b, vec4 x) {
+    return s * dot(q, x) + b * dot(x, vec4(1.0));
+}
+
+// The 16 bf16 values of a block whose words are a, b, widened: element 4j+c
+// is component c of v[j] (a bf16 is the high half of its float).
+void hc_widen_block(uvec4 a, uvec4 b, out vec4 v[4]) {
+    v[0] = uintBitsToFloat(uvec4(a.x << 16, a.x & 0xFFFF0000u, a.y << 16, a.y & 0xFFFF0000u));
+    v[1] = uintBitsToFloat(uvec4(a.z << 16, a.z & 0xFFFF0000u, a.w << 16, a.w & 0xFFFF0000u));
+    v[2] = uintBitsToFloat(uvec4(b.x << 16, b.x & 0xFFFF0000u, b.y << 16, b.y & 0xFFFF0000u));
+    v[3] = uintBitsToFloat(uvec4(b.z << 16, b.z & 0xFFFF0000u, b.w << 16, b.w & 0xFFFF0000u));
+}
+
+// Block i (elements 16i .. 16i+15) of the bf16 array at `p`, widened, loaded
+// as two 16-byte words (Metal's bfloat4 loads): a bf16vec4 buffer reference
+// load has 2-byte alignment and the driver splits it into 16-bit loads.
+// Needs `p` 4-byte aligned, which every caller's operand is (H and R are
+// multiples of 16).
+void hc_load_block(uint64_t p, uint i, out vec4 v[4]) {
+    U32x4 w = U32x4(p);
+    hc_widen_block(w.v[2 * i], w.v[2 * i + 1], v);
+}
+
+// bf16 number `at` (0 to 7) of the eight in four words, widened.
+float hc_half(uvec4 w, uint at) {
+    uint word = at < 4u ? (at < 2u ? w.x : w.y) : (at < 6u ? w.z : w.w);
+    return uintBitsToFloat((at & 1u) != 0u ? word & 0xFFFF0000u : word << 16);
+}
+
+// The quant group of the block a lane loads, i / bpg, for a loop over
+// i = i0, i0 + 32, ...: Metal divides on every iteration, the port steps
+// the quotient (exact for every bpg).
+#define HC_GROUP_INIT(i0, bpg) \
+    uint q = (i0) / (bpg), q_rem = (i0) - q * (bpg); \
+    uint q_step = 32 / (bpg), q_rem_step = 32 - q_step * (bpg);
+#define HC_GROUP_NEXT(bpg) \
+    q += q_step; q_rem += q_rem_step; \
+    if (q_rem >= (bpg)) { q_rem -= (bpg); ++q; }
+
+#ifdef KERNEL_hc_read_down_q8
+shared float part[HC_MAX_G];
+shared float rms[HC_MAX_G];
+void main() {
+    uint H = arg_u32(11), G = arg_u32(12), R = arg_u32(13), NI = arg_u32(14), GS = arg_u32(15);
+    float eps = arg_f32(16), w_bias = arg_f32(17);
+    uint row = threadgroup_position_in_grid.x, tid = thread_index_in_threadgroup;
+    uint g = simdgroup_index_in_threadgroup, lane = thread_index_in_simdgroup;
+    if (row >= R + NI) return;  // whole threadgroup
+    bool is_inj = row >= R;
+    uint r = is_inj ? row - R : row;
+    uint K = G * H;
+    uint words = K / 4;
+    uint bpg = GS / 16;
+    uint groups = K / GS;
+    uint stream_blocks = H / 16;
+    U32x4 wrow = U32x4(arg(is_inj ? 5 : 2) + 4 * uint64_t(r) * words);
+    BF16 scales = BF16(arg(is_inj ? 6 : 3) + 2 * (r * groups));
+    BF16 biases = BF16(arg(is_inj ? 7 : 4) + 2 * (r * groups));
+
+    float acc_w = 0.0;
+    float acc_x2 = 0.0;
+    uint i_end = (g + 1) * stream_blocks;
+    HC_GROUP_INIT(g * stream_blocks + lane, bpg)
+    for (uint i = g * stream_blocks + lane; i < i_end; i += 32) {
+        float s = float(scales.v[q]);
+        float b = float(biases.v[q]);
+        uvec4 w4 = wrow.v[i];
+        vec4 xb[4], nb[4];
+        hc_load_block(arg(0), i, xb);
+        hc_load_block(arg(1), i, nb);
+        [[unroll]] for (uint j = 0; j < 4; ++j) {
+            vec4 x = xb[j];
+            vec4 xn = x * (w_bias + nb[j]);
+            acc_w += hc_dot_q8(hc_unpack_q8(w4[j]), s, b, xn);
+            acc_x2 += dot(x, x);
+        }
+        HC_GROUP_NEXT(bpg)
+    }
+    acc_w = subgroupAdd(acc_w);
+    acc_x2 = subgroupAdd(acc_x2);
+    if (lane == 0) {
+        float inv = inversesqrt(acc_x2 / float(H) + eps);
+        part[g] = acc_w * inv;
+        rms[g] = inv;
+    }
+    barrier();
+    if (tid == 0) {
+        float total = 0.0;
+        for (uint s = 0; s < G; ++s) total += part[s];
+        BF16(arg(is_inj ? 9 : 8)).v[r] = bf16_rne(total);
+    }
+    if (row == 0 && tid < G) F32(arg(10)).v[tid] = rms[tid];
+}
+#endif
+
+// hc_read_down_q8 over MB rows (hc_read_down_q8_rows_body). Metal calls the
+// body in two branches (inject, down); here the branch only picks the
+// operands and one body is compiled.
+//
+// A threadgroup takes RPT consecutive weight rows (down rows, then inject
+// rows), where the Metal kernel takes one: each lane runs the Metal lane's
+// walk for every one of them, so a row's sums are added as there, but the
+// MB hyper blocks and the norm block a lane loads, the normalized x * gain
+// and the x . x sums are shared by the RPT rows instead of being loaded and
+// computed per row. Those are what grows with MB (a weight block is 1
+// load of 3 + 2 MB). `hc_read_rows_chain_timing`, H 2560, 4 streams, R 320,
+// three rows, us per down level (2026-11-11): one row a threadgroup 17.4,
+// two 15.5 to 15.8, four 17.9. One row (MB 1) keeps one: two were no
+// faster. Bit for bit the single-row kernel's per row (hc.rs tests).
+#if defined(KERNEL_hc_read_down_q8_m1)
+#define MB 1
+#elif defined(KERNEL_hc_read_down_q8_m2)
+#define MB 2
+#elif defined(KERNEL_hc_read_down_q8_m3)
+#define MB 3
+#elif defined(KERNEL_hc_read_down_q8_m4)
+#define MB 4
+#elif defined(KERNEL_hc_read_down_q8_m3_t1)
+// The Metal layout, one row a threadgroup, for `hc_read_rows_chain_timing`.
+#define MB 3
+#define RPT 1
+#endif
+#ifdef MB
+#define HC_READ_DOWN_ROWS
+#ifndef RPT
+#if MB == 1
+#define RPT 1
+#else
+#define RPT 2
+#endif
+#endif
+#endif
+
+#ifdef HC_READ_DOWN_ROWS
+shared float part[RPT * MB * HC_MAX_G];
+shared float rms[MB * HC_MAX_G];
+void main() {
+    uint H = arg_u32(12), G = arg_u32(13), R = arg_u32(14), NI = arg_u32(15), GS = arg_u32(16);
+    float eps = arg_f32(17), w_bias = arg_f32(18), inv_g = arg_f32(19);
+    uint tid = thread_index_in_threadgroup;
+    uint g = simdgroup_index_in_threadgroup, lane = thread_index_in_simdgroup;
+    uint row0 = threadgroup_position_in_grid.x * RPT;
+    if (row0 >= R + NI) return;  // whole threadgroup
+    uint K = G * H;
+    uint words = K / 4;
+    uint bpg = GS / 16;
+    uint groups = K / GS;
+    uint stream_blocks = H / 16;
+    // Row t of the threadgroup's (a row past the last runs on the last and
+    // stores nothing).
+    U32x4 wrow[RPT];
+    BF16 scales[RPT], biases[RPT];
+    [[unroll]] for (uint t = 0; t < RPT; ++t) {
+        uint row = min(row0 + t, R + NI - 1);
+        bool is_down = row < R;
+        uint r = is_down ? row : row - R;
+        wrow[t] = U32x4(arg(is_down ? 2 : 5) + 4 * uint64_t(r) * words);
+        scales[t] = BF16(arg(is_down ? 3 : 6) + 2 * (r * groups));
+        biases[t] = BF16(arg(is_down ? 4 : 7) + 2 * (r * groups));
+    }
+    float acc_w[RPT * MB];
+    float acc_x2[MB];
+    [[unroll]] for (uint m = 0; m < MB; ++m) {
+        acc_x2[m] = 0.0;
+        [[unroll]] for (uint t = 0; t < RPT; ++t) acc_w[t * MB + m] = 0.0;
+    }
+    uint i_end = (g + 1) * stream_blocks;
+    HC_GROUP_INIT(g * stream_blocks + lane, bpg)
+    for (uint i = g * stream_blocks + lane; i < i_end; i += 32) {
+        float s[RPT], b[RPT];
+        uvec4 w4[RPT];
+        [[unroll]] for (uint t = 0; t < RPT; ++t) {
+            s[t] = float(scales[t].v[q]);
+            b[t] = float(biases[t].v[q]);
+            w4[t] = wrow[t].v[i];
+        }
+        vec4 nb[4], xb[MB][4];
+        hc_load_block(arg(1), i, nb);
+        // Row m's block i is block m * K/16 + i of hyper (32-bit: the rows
+        // are [MB, G*H]).
+        [[unroll]] for (uint m = 0; m < MB; ++m) hc_load_block(arg(0), m * (K / 16) + i, xb[m]);
+        [[unroll]] for (uint j = 0; j < 4; ++j) {
+            vec4 gain = w_bias + nb[j];
+            vec4 qf[RPT];
+            [[unroll]] for (uint t = 0; t < RPT; ++t) qf[t] = hc_unpack_q8(w4[t][j]);
+            [[unroll]] for (uint m = 0; m < MB; ++m) {
+                vec4 x = xb[m][j];
+                vec4 xn = x * gain;
+                [[unroll]] for (uint t = 0; t < RPT; ++t)
+                    acc_w[t * MB + m] += hc_dot_q8(qf[t], s[t], b[t], xn);
+                acc_x2[m] += dot(x, x);
+            }
+        }
+        HC_GROUP_NEXT(bpg)
+    }
+    [[unroll]] for (uint m = 0; m < MB; ++m) {
+        acc_x2[m] = subgroupAdd(acc_x2[m]);
+        [[unroll]] for (uint t = 0; t < RPT; ++t) acc_w[t * MB + m] = subgroupAdd(acc_w[t * MB + m]);
+    }
+    if (lane == 0) {
+        [[unroll]] for (uint m = 0; m < MB; ++m) {
+            float inv = inversesqrt(acc_x2[m] / float(H) + eps);
+            rms[m * HC_MAX_G + g] = inv;
+            [[unroll]] for (uint t = 0; t < RPT; ++t) part[(t * MB + m) * HC_MAX_G + g] = acc_w[t * MB + m] * inv;
+        }
+    }
+    barrier();
+    // Thread t * MB + m stores row t's output of hyper row m.
+    if (tid < RPT * MB) {
+        uint t = tid / MB, m = tid - t * MB;
+        uint row = row0 + t;
+        if (row < R + NI) {
+            bool is_down = row < R;
+            uint r = is_down ? row : row - R;
+            uint N = is_down ? R : NI;
+            float total = 0.0;
+            for (uint s = 0; s < G; ++s) total += part[(t * MB + m) * HC_MAX_G + s];
+            bfloat16_t logit = bf16_rne(total);
+            BF16(arg(is_down ? 8 : 9)).v[m * N + r] = logit;
+            if (is_down) {
+                // silu_scaled_bf16 on the bf16 logit.
+                float v = float(logit) * inv_g;
+                BF16(arg(11)).v[m * N + r] = bf16_rne(v / (1.0 + exp(-v)));
+            }
+        }
+    }
+    // The threadgroup of down row 0 publishes the stream RMS for the up kernel.
+    if (row0 == 0 && R > 0 && tid < MB * G) F32(arg(10)).v[tid] = rms[(tid / G) * HC_MAX_G + tid % G];
+}
+#endif
+
+// hc_read_up_mix_q8_g<GG> (single row: the kernel applies the scaled SiLU to
+// `down` itself) and hc_read_up_mix_q8_g<GG>_m<MB> (MB rows on the
+// precomputed activation); GG and MB are compile-time constants per kernel.
+#if defined(KERNEL_hc_read_up_mix_q8_g1)
+#define GG 1
+#elif defined(KERNEL_hc_read_up_mix_q8_g2)
+#define GG 2
+#elif defined(KERNEL_hc_read_up_mix_q8_g3)
+#define GG 3
+#elif defined(KERNEL_hc_read_up_mix_q8_g4)
+#define GG 4
+#elif defined(KERNEL_hc_read_up_mix_q8_g5)
+#define GG 5
+#elif defined(KERNEL_hc_read_up_mix_q8_g6)
+#define GG 6
+#elif defined(KERNEL_hc_read_up_mix_q8_g7)
+#define GG 7
+#elif defined(KERNEL_hc_read_up_mix_q8_g8)
+#define GG 8
+#elif defined(KERNEL_hc_read_up_mix_q8_g1_m1)
+#define GG 1
+#define MB 1
+#elif defined(KERNEL_hc_read_up_mix_q8_g1_m2)
+#define GG 1
+#define MB 2
+#elif defined(KERNEL_hc_read_up_mix_q8_g1_m3)
+#define GG 1
+#define MB 3
+#elif defined(KERNEL_hc_read_up_mix_q8_g1_m4)
+#define GG 1
+#define MB 4
+#elif defined(KERNEL_hc_read_up_mix_q8_g2_m1)
+#define GG 2
+#define MB 1
+#elif defined(KERNEL_hc_read_up_mix_q8_g2_m2)
+#define GG 2
+#define MB 2
+#elif defined(KERNEL_hc_read_up_mix_q8_g2_m3)
+#define GG 2
+#define MB 3
+#elif defined(KERNEL_hc_read_up_mix_q8_g2_m4)
+#define GG 2
+#define MB 4
+#elif defined(KERNEL_hc_read_up_mix_q8_g3_m1)
+#define GG 3
+#define MB 1
+#elif defined(KERNEL_hc_read_up_mix_q8_g3_m2)
+#define GG 3
+#define MB 2
+#elif defined(KERNEL_hc_read_up_mix_q8_g3_m3)
+#define GG 3
+#define MB 3
+#elif defined(KERNEL_hc_read_up_mix_q8_g3_m4)
+#define GG 3
+#define MB 4
+#elif defined(KERNEL_hc_read_up_mix_q8_g4_m1)
+#define GG 4
+#define MB 1
+#elif defined(KERNEL_hc_read_up_mix_q8_g4_m2)
+#define GG 4
+#define MB 2
+#elif defined(KERNEL_hc_read_up_mix_q8_g4_m3)
+#define GG 4
+#define MB 3
+#elif defined(KERNEL_hc_read_up_mix_q8_g4_m4)
+#define GG 4
+#define MB 4
+#elif defined(KERNEL_hc_read_up_mix_q8_g5_m1)
+#define GG 5
+#define MB 1
+#elif defined(KERNEL_hc_read_up_mix_q8_g5_m2)
+#define GG 5
+#define MB 2
+#elif defined(KERNEL_hc_read_up_mix_q8_g5_m3)
+#define GG 5
+#define MB 3
+#elif defined(KERNEL_hc_read_up_mix_q8_g5_m4)
+#define GG 5
+#define MB 4
+#elif defined(KERNEL_hc_read_up_mix_q8_g6_m1)
+#define GG 6
+#define MB 1
+#elif defined(KERNEL_hc_read_up_mix_q8_g6_m2)
+#define GG 6
+#define MB 2
+#elif defined(KERNEL_hc_read_up_mix_q8_g6_m3)
+#define GG 6
+#define MB 3
+#elif defined(KERNEL_hc_read_up_mix_q8_g6_m4)
+#define GG 6
+#define MB 4
+#elif defined(KERNEL_hc_read_up_mix_q8_g7_m1)
+#define GG 7
+#define MB 1
+#elif defined(KERNEL_hc_read_up_mix_q8_g7_m2)
+#define GG 7
+#define MB 2
+#elif defined(KERNEL_hc_read_up_mix_q8_g7_m3)
+#define GG 7
+#define MB 3
+#elif defined(KERNEL_hc_read_up_mix_q8_g7_m4)
+#define GG 7
+#define MB 4
+#elif defined(KERNEL_hc_read_up_mix_q8_g8_m1)
+#define GG 8
+#define MB 1
+#elif defined(KERNEL_hc_read_up_mix_q8_g8_m2)
+#define GG 8
+#define MB 2
+#elif defined(KERNEL_hc_read_up_mix_q8_g8_m3)
+#define GG 8
+#define MB 3
+#elif defined(KERNEL_hc_read_up_mix_q8_g8_m4)
+#define GG 8
+#define MB 4
+#endif
+
+
+// The Metal kernels run a subgroup per output column, lane i on block i of
+// each stream's weight row: with R 320 that is 20 lanes of 32 at work, and
+// every column's subgroup computes the activation's SiLU again. Instructions
+// are what this kernel costs here (the direct port ran 2.2 M subgroup
+// instructions a read, where the cores do about 0.28 M a microsecond:
+// elementwise.rs, `level_shape_probe`, 2026-11-10), so the layout is one
+// where all lanes work and nothing is computed twice:
+// - A subgroup's eight quads are eight weight rows (the streams of 8 / GG
+//   columns), and a quad's four lanes take the four blocks of one of the
+//   row's quant-group-sized quarters of 64 codes a turn, R / 64 turns.
+// - What a row's reduction adds is what the Metal kernel's subgroup sum
+//   adds, in its order: the hardware sum is a tree over adjacent lanes
+//   (`subgroup_sum_order_probe`), so its lanes 4j .. 4j+3 are the 4-lane
+//   clustered sum of turn j, and the eight of those are added as the tree
+//   adds them.
+// - The activation is staged once per threadgroup (its first MB subgroups, a
+//   row each) in threadgroup memory, where every turn reads it.
+// - A row's scales and biases are 16 bytes each, loaded once.
+// - The gate epilogue runs once per quad, its streams' gates and normalized
+//   values brought to the column's lanes by broadcast.
+// Given the same inputs the result is the direct port's bit for bit, for the
+// single-row kernels; the MB-row kernels now equal the single-row kernel on
+// every row, where the direct port's differed from it in the last bit of a
+// few values in 100 000 (hc.rs tests, `up_layouts_agree_on_wide_data`).
+// Measured in the chain (`hc_read_chain_timing`, `fused_batched_read_gate_
+// timing`, us per read at H 2560, 4 streams, R 320, 2026-11-10): one row 17.5
+// to 13.2 (Metal 7.7), three rows 31.0 to 15.0, four rows 40.8 to 18.2. What
+// is left of the one-row kernel is its 3.3 MB of weights and a floor: with
+// no weight load it takes 9.8, with no load at all 7.7.
+#ifdef GG
+#extension GL_KHR_shader_subgroup_clustered : require
+#ifdef MB
+#define UP_MB MB
+#else
+#define UP_MB 1
+#define UP_SILU
+#endif
+#define UP_CPS (8 / GG)  // columns of a subgroup
+#define UP_ACT 1024      // vec4s of staged activation (hc.rs: `HC_UP_ACT_MAX`)
+shared vec4 up_act[UP_ACT];
+void main() {
+    // The params are one struct (hc.rs: `dispatch_read_up_mix`), two loads.
+    uvec4 p0 = U32x4(arg(8)).v[0], p1 = U32x4(arg(8)).v[1];
+    // bshift: log2 of the 16-code blocks per quant group; groups: per row.
+    uint H = p0.x, R = p0.y, bshift = p0.z, groups = p0.w;
+    float w_bias = uintBitsToFloat(p1.x);
+    uint sg = simdgroup_index_in_threadgroup, lane = thread_index_in_simdgroup;
+    uint quad = lane >> 2, p = lane & 3u;
+    uint c = quad / GG, g = quad - c * GG;
+    uint col = (threadgroup_position_in_grid.x * (threads_per_threadgroup.x / 32) + sg) * UP_CPS + c;
+    bool live = c < UP_CPS && col < H;
+    uint blocks = R >> 4, turns = R >> 6;
+    uint K = GG * H;
+    // A quad past the columns (or past 8 / GG whole columns) runs on row 0
+    // and stores nothing: no branch on it in what follows.
+    uint wrow = live ? g * H + col : 0u;
+
+    // Subgroup m stages row m of the activation.
+    if (sg < UP_MB) {
+        for (uint i = lane; i < blocks; i += 32) {
+            vec4 a[4];
+            hc_load_block(arg(3), sg * blocks + i, a);
+#ifdef UP_SILU
+            [[unroll]] for (uint j = 0; j < 4; ++j) {
+                vec4 v = a[j] * uintBitsToFloat(p1.y);
+                a[j] = vec4(bf16_rne(v / (1.0 + exp(-v))));
+            }
+#endif
+            [[unroll]] for (uint j = 0; j < 4; ++j) up_act[sg * (R >> 2) + 4 * i + j] = a[j];
+        }
+    }
+    // Meanwhile a quad's lanes load what is its row's alone: the scales and
+    // biases (up to seven groups fit a 16-byte window on a 4-byte boundary
+    // that stays inside the tensor; more are loaded per turn) and the
+    // normalized stream value of its column.
+    bool window = groups <= 7u;
+    uvec4 sw = uvec4(0), bw = uvec4(0);
+    uint sh = 0;
+    if (window) {
+        uint e = wrow * groups;
+        uint e0 = min(e & ~1u, K * groups - 8u);
+        sh = e - e0;
+        sw = U32x4(arg(1) + 2 * uint64_t(e0)).v[0];
+        bw = U32x4(arg(2) + 2 * uint64_t(e0)).v[0];
+    }
+    float hn[UP_MB];
+    float gain = w_bias + float(BF16(arg(5)).v[wrow]);
+    [[unroll]] for (uint m = 0; m < UP_MB; ++m)
+        hn[m] = float(bf16_rne(float(BF16(arg(4)).v[m * K + wrow]) * F32(arg(6)).v[m * GG + g] * gain));
+    barrier();
+
+    // Turn j: block 4j + p of the row (hc.rs keeps R to the eight turns of
+    // one subgroup sum).
+    U32x4 codes = U32x4(arg(0));
+    uint co = wrow * blocks;
+    float qs[8 * UP_MB];
+    [[unroll]] for (uint j = 0; j < 8; ++j) {
+        float a[UP_MB];
+        [[unroll]] for (uint m = 0; m < UP_MB; ++m) a[m] = 0.0;
+        if (j < turns) {
+            uint b = 4 * j + p;
+            uvec4 w4 = codes.v[co + b];
+            uint q = b >> bshift;
+            float s, bi;
+            if (window) {
+                s = hc_half(sw, sh + q);
+                bi = hc_half(bw, sh + q);
+            } else {
+                s = float(BF16(arg(1)).v[wrow * groups + q]);
+                bi = float(BF16(arg(2)).v[wrow * groups + q]);
+            }
+            vec4 q0 = hc_unpack_q8(w4.x);
+            vec4 q1 = hc_unpack_q8(w4.y);
+            vec4 q2 = hc_unpack_q8(w4.z);
+            vec4 q3 = hc_unpack_q8(w4.w);
+            [[unroll]] for (uint m = 0; m < UP_MB; ++m) {
+                uint at = m * (R >> 2) + 4 * b;
+                a[m] = hc_dot_q8(q0, s, bi, up_act[at])
+                    + hc_dot_q8(q1, s, bi, up_act[at + 1])
+                    + hc_dot_q8(q2, s, bi, up_act[at + 2])
+                    + hc_dot_q8(q3, s, bi, up_act[at + 3]);
+            }
+        }
+        [[unroll]] for (uint m = 0; m < UP_MB; ++m) qs[j * UP_MB + m] = subgroupClusteredAdd(a[m], 4);
+    }
+    [[unroll]] for (uint m = 0; m < UP_MB; ++m) {
+        float total = ((qs[m] + qs[UP_MB + m]) + (qs[2 * UP_MB + m] + qs[3 * UP_MB + m]))
+            + ((qs[4 * UP_MB + m] + qs[5 * UP_MB + m]) + (qs[6 * UP_MB + m] + qs[7 * UP_MB + m]));
+        float logit = float(bf16_rne(total));
+        float gate = 1.0 / (1.0 + exp(-logit));
+        // hc_mix_bf16 over the column's streams, whose quads' first lanes
+        // are 4 * (c * GG + s).
+        float acc = 0.0;
+        [[unroll]] for (uint s = 0; s < GG; ++s) {
+            float gv = 0.0, hv = 0.0;
+            [[unroll]] for (uint cc = 0; cc < UP_CPS; ++cc) {
+                gv = c == cc ? subgroupBroadcast(gate, 4 * (cc * GG + s)) : gv;
+                hv = c == cc ? subgroupBroadcast(hn[m], 4 * (cc * GG + s)) : hv;
+            }
+            acc += gv * hv;
+        }
+        if (live && p == 0u && g == 0u) BF16(arg(7)).v[m * H + col] = bf16_rne(acc / float(GG));
+    }
+}
+#endif

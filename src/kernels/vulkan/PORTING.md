@@ -1,0 +1,260 @@
+# Porting a Metal kernel file to Vulkan
+
+On Linux the engine runs on Vulkan (Honeykrisp on an Apple M5): `src/vulkan.rs`
+is `crate::metal` there, with the Metal backend's API, so the Rust dispatch
+code in `src/kernels/*.rs` is used unchanged. What is ported is the shader
+source: each `src/kernels/metal/<file>.metal` becomes
+`src/kernels/vulkan/<file>.comp`, GLSL, holding the same kernels under the
+same names, doing the same arithmetic in the same order.
+
+`norm.comp`, `elementwise.comp` and `gemm.comp` are finished examples: read
+one beside its `.metal` before starting.
+
+## The contract
+
+- **One file, many kernels.** `build.rs` compiles a `.comp` once per kernel:
+  every `KERNEL_<name>` the file mentions is a kernel `<name>` (exactly the
+  Metal kernel function's name, which the Rust side passes to
+  `ctx.pipeline("<name>", ...)`), built with `-DKERNEL_<name>`. Put each
+  kernel's `main()` (and what only it needs) under `#ifdef KERNEL_<name>`;
+  kernels of one family (a Metal template or macro instantiated under several
+  names) share code under `#if defined(KERNEL_a) || defined(KERNEL_b)` and
+  differ by `#ifdef`. Use the prefix `KERNEL_` for nothing else. A kernel
+  name must be unique across all `.comp` files. Helpers shared by several
+  files go in a `.glsl` include.
+- **Test kernels.** Some unit tests run kernels of their own from
+  `tests/metal/<file>_test.metal` (an older form a shipped kernel is checked
+  against). Their ports go in `tests/vulkan/<file>_test.comp`, same rules,
+  includes from `src/kernels/vulkan`. The Rust test passes the Metal source
+  to `ctx.pipeline`, which ignores it here, so the test itself needs no
+  change.
+- **Arguments.** `arg(i)` (common.glsl) is the 64-bit GPU address of what
+  Metal binds at `[[buffer(i)]]`: a `device T*` pointer (already at its
+  offset), or the value of a `constant T&` param. A four-byte param (`uint`,
+  `int`, `float`) is read with `arg_u32(i)`, `arg_i32(i)` or `arg_f32(i)`
+  and in no other way: the backend may pass it by value in place of its
+  address. A larger one (a `uint4`, a struct) is read through a buffer
+  reference at `arg(i)`. Read and write memory
+  through the buffer references of common.glsl: `BF16(arg(0)).v[i]`,
+  `U32(address).v[i]`, `F32x4(...)`, ...; declare more where a kernel has a
+  struct. All are `scalar` layout: fields at their C offsets (declare the
+  struct's fields in the Metal order and check its size against the Rust
+  side's).
+- **64-bit offsets.** A GLSL array index is 32 bits and the expression
+  `x.v[uint64]` does not compile. Where the Metal kernel indexes with a
+  `ulong` (`x[(ulong)row * H + i]`), put the wide part into the address:
+  `BF16(arg(0) + 2 * uint64_t(row) * H).v[i]` (times the element size in
+  bytes). Do this wherever the product could pass 2^32 elements; tensors here
+  reach tens of GB.
+- **Types.** `bfloat` is `bfloat16_t` (GL_EXT_bfloat16): `float(x)` widens
+  exactly and `bfloat16_t(f)` rounds to nearest even, as Metal's `bfloat`
+  does. That rounding is common.glsl's: the driver's own conversion
+  truncates, so `bfloat16_t(f)` is a macro for the function `bf16(f)`. A
+  vector conversion must be written `bf16(v)` (`bf16vec4(v)` of a `vec4`
+  truncates; `bf16vec4(a, b, c, d)` of four bfloats is fine), and a constant
+  initializer cannot use either (write the bits). `half` is `float16_t`. `bfloat4`/`float4`/`uint4` are
+  `bf16vec4`/`vec4`/`uvec4`. Metal `uchar`/`ushort`/`ulong` are
+  `uint8_t`/`uint16_t`/`uint64_t`. `as_type<T>(x)` is the
+  `floatBitsToUint`/`uintBitsToFloat` family (for bfloat:
+  `bfloat16BitsToUintEXT`, `uintBitsToBFloat16EXT`).
+- **Grid.** The Metal threadgroup grid is the Vulkan workgroup grid; the
+  threadgroup size of a dispatch is the shader's local size (the backend sets
+  it from the dispatch, never write `local_size` yourself). common.glsl
+  defines the Metal input names: `thread_position_in_grid`,
+  `threadgroup_position_in_grid`, `thread_index_in_threadgroup`,
+  `thread_position_in_threadgroup`, `simdgroup_index_in_threadgroup`,
+  `thread_index_in_simdgroup`, `threads_per_threadgroup` (all `uvec3` or
+  `uint` as in GLSL: take `.x` etc. where Metal declares a `uint` or
+  `uint2`). `threads_per_grid` is `lily_dispatch.grid`.
+- **`Grid::Threads` dispatches** (Metal `dispatchThreads`: look at the Rust
+  wrapper) run exactly the grid's threads on Metal. Vulkan runs whole
+  threadgroups, so such a kernel must start with
+  `if (!LILY_THREAD_IN_GRID) return;`. After it, a subgroup may be partly
+  inactive: subgroup operations cover the active lanes only, and "lane 0"
+  may not be among them (use
+  `gl_SubgroupInvocationID == subgroupBallotFindLSB(subgroupBallot(true))`
+  for "one lane of the subgroup"). A kernel that uses `barrier()` must not
+  return before it in some threads only: guard the body instead.
+  `Grid::Threadgroups` dispatches need no guard.
+- **Subgroups.** A Metal simdgroup is a Vulkan subgroup, 32 lanes on this
+  GPU. `simd_sum/min/max/or/xor/and` are `subgroupAdd/Min/Max/Or/Xor/And`;
+  `simd_prefix_exclusive_sum` is `subgroupExclusiveAdd`;
+  `simd_shuffle(v, lane)` is `subgroupShuffle`; `simd_shuffle_xor(v, m)` is
+  `subgroupShuffleXor`; `simd_shuffle_down/up(v, d)` are
+  `subgroupShuffle(v, lane +/- d)` where the source lane exists (a reduction
+  written as shuffle-downs by 16, 8, 4, 2, 1 folded into lane 0 is the same
+  tree with `subgroupShuffleXor`, which is defined for every lane);
+  `simd_broadcast(v, lane)` is `subgroupBroadcast` (constant lane) or
+  `subgroupShuffle`; `simd_broadcast_first` is `subgroupBroadcastFirst`;
+  `simd_ballot`, `simd_is_first`, `simd_all/any` are the ballot/vote
+  functions (enable `GL_KHR_shader_subgroup_vote` if needed).
+- **Threadgroup memory.** `threadgroup T x[N]` is a global `shared T x[N];`
+  (declared at file scope, under the kernel's `#ifdef`);
+  `threadgroup_barrier(mem_flags::mem_threadgroup)` is `barrier()`. Atomics
+  are `atomicAdd/Xor/...` on shared variables or on a buffer reference's
+  member.
+- **Arithmetic.** Keep the Metal kernel's order of operations and where it
+  rounds to bf16; the tests compare against CPU references with tight bounds
+  and some results must be bit-identical between kernels. Mark an
+  accumulation whose order matters `precise` (the compiler may otherwise
+  reassociate or contract it differently between two kernels). Metal's
+  `fast::`/`precise::` functions are the plain GLSL ones; `rsqrt` is
+  `inversesqrt`; `INFINITY` is `1.0 / 0.0`; `fma`, `exp`, `log`, `tanh`,
+  `clamp`, `select` (`mix` with a bool) exist. Do not write a `half`
+  through `packHalf2x16`: it truncates on this driver. `float16_t(f)` rounds
+  when it is stored, but the compiler folds `float(float16_t(f))` of a
+  register value to `f`, unrounded: where a kernel needs the rounded value
+  back, round in integer math (attention_common.glsl).
+  `precise` does not reach `exp` and the other extended instructions.
+- **Params are loads.** `arg(i)` is a push constant, read once per
+  dispatch; `arg_u32(i)` loads through it unless the param came by value:
+  take each once, outside loops (the compiler does not hoist the load).
+- **Templates and macros.** MSL is C++: templates, lambdas, references,
+  `static inline` helpers. GLSL has none of that: functions take
+  `in`/`out`/`inout` parameters, families become `#define`d constants per
+  kernel or function-like macros. GLSL inlines everything and has no
+  recursion.
+- **Tensor ops.** Kernels compiled as MSL 4 use MetalPerformancePrimitives
+  (`matmul2d`, `metal::tensor`, cooperative tensors) to reach the GPU's
+  matrix units. Here those are 16x16x16 cooperative matrices: read
+  `matmul.glsl` and `gemm.comp`. A threadgroup of S simdgroups running one
+  `matmul2d` of a BM x BN tile becomes S subgroups each running the tile's
+  16x16 blocks it owns, with the same K walk; `acc[i]` over the destination
+  cooperative tensor becomes the lane's eight elements of each block
+  (`mat_row`, `mat_col`). Never let `coopMatLoad` read past a tensor's end:
+  stage edge blocks (`MAT_STAGE`). Where a Metal kernel has both a tensor
+  path and an older `simdgroup_matrix` or scalar fallback, port the path the
+  Rust wrapper dispatches on a family-10 GPU (`apple_gpu_family() >= 10`).
+- **The one-job limit.** The kernel driver gives a GPU job about two seconds.
+  A direct port never comes near it; a kernel far slower than its original
+  might.
+
+## Driver notes
+
+Things this driver and compiler do that a plain translation trips over:
+
+- **Wide bfloat loads.** A `bf16vec4` read through `BF16x4` is four 16-bit
+  loads (the reference is 2-byte aligned). Where the Metal kernel reads
+  `bfloat4`s for speed, load `uvec4` words through `U32x4` (16 bytes, eight
+  bfloats) and widen them: `uintBitsToFloat(w << 16)` and
+  `uintBitsToFloat(w & 0xffff0000u)` are a word's two bfloats, exactly.
+- **Lookup tables.** Declare a table as a global with an initializer
+  (`uint kTable[256] = uint[256](...);`), not as a `const` array: indexing a
+  `const` array copies it into every function that does, and so into every
+  inlined use, which the driver compiles badly or not at all.
+- **Code size.** Everything is inlined and a kernel is compiled once per
+  threadgroup size it is dispatched with. Unrolling a loop over a body with a
+  dozen format branches makes megabytes of SPIR-V; keep unrolled bodies small
+  and leave rare paths in loops.
+- **Cooperative matrices** are 16x16x16 with `bfloat16_t` operands and a
+  `float` accumulator, one per subgroup (matmul.glsl); `coopMatLoad` takes a
+  `bfloat16_t` array (a buffer reference's `.v` or a `shared` array), an
+  element offset and a stride. Arrays of matrices and `acc[i]` element access
+  work. Subgroup-scope matrices need the whole subgroup in uniform control
+  flow around the matrix operations.
+- **Subgroup shuffles** with an out-of-range source lane are undefined, not
+  zero.
+- **Reads past a buffer** fault the GPU job; Metal tensor slices clamp where
+  a pointer walk does not.
+
+## What is fast on this compiler and GPU
+
+Measured while tuning the kernels (2026-11-10 and 11, M5 Max); some of
+these costs are the driver's and go away as it improves.
+
+- **Loads are the unit of cost.** A load from cache costs about what five
+  or six adds do, and about thirteen when its address depends on the load
+  before it; from DRAM about 0.3 us. A thread waits for each. Prefer few,
+  wide, independent loads (16 bytes at a time), issued together, and avoid
+  chains where one load's result addresses the next.
+- **Registers written cost time**, and past about 123 live 32-bit values the
+  compiler spills to per-thread stack memory. Fewer live registers was
+  faster at every step of the MoE kernels' tuning. The highest register
+  number alone is free. An array of accumulators or matrices indexed by a
+  loop variable lives in stack memory: name them.
+- **Row addresses** are `base + uint64_t(row) * (element_size * stride)`
+  with both factors 32-bit: one multiply. A 64x64 product adds cross terms.
+  Index a loop-invariant 64-bit base with a 32-bit index: a load takes
+  `base64 + (index32 << shift)` natively.
+- **A 32-bit load ignores the low two bits of its address**, so the
+  alignment branches around them must stay. 16-bit vector loads of two to
+  four elements are exact at any 2-byte offset.
+- **Shuffles.** `subgroupShuffleXor` with a constant mask of 1 to 31 is one
+  instruction on the compiler branch; a non-constant mask or a general
+  shuffle costs about twenty adds. `subgroupAdd` is one instruction and adds
+  as a pairwise tree over adjacent lanes (tests pin it: kernels rely on it
+  for bit-identical sums).
+- **Loops.** Put `[[unroll]]` or `[[dont_unroll]]` on every hot loop whose
+  bound the compiler can see. Left alone, a loop of at most 32 trips with
+  trips times body under about 830 instructions is unrolled, and when the
+  bound is not a constant the copies are a nest of guarded blocks that ran
+  slower than the loop (the small-m MoE down kernel: 35 us against 28). An
+  iteration left as a loop costs about six adds of overhead. A division by
+  a non-constant is about twenty instructions: make the divisor a power of
+  two and shift.
+- **A load waits for every line its lanes touch**: do not point idle lanes
+  at other lines to read ahead. Work that follows a streaming pass from
+  cache is not hidden under it either.
+- **Dispatches with no barrier between them run side by side** on a
+  Honeykrisp that leaves out the ordering barrier between application
+  dispatches (one after another before that).
+  Independent same-level work is cheapest as separate dispatches when the
+  weights are small (the router level: 13.4 us as three against 14.6
+  fused) and fused when they are large (the attention level: 71.7 fused
+  against 78.9). A small dispatch beside a large one still costs about
+  half its lone time; a tiny level costs 2.5 to 3 us, a barrier about
+  0.35 us. A kernel with more than 512 bytes of per-thread scratch keeps
+  its barriers and runs alone.
+- **The matrix lane layout** (`mat_a_col` and friends in matmul.glsl) is
+  shared with Mesa's lowering: a change must land in both.
+- **`fma()`** may be split by the compiler; a `precise dot()` is an in-order
+  chain of fused multiply-adds.
+
+Start with a direct, readable translation that passes the tests. Then, where
+the Rust side or `docs/performance.md` says a kernel is on the decode or
+prefill hot path, look at what the translation costs: the Metal kernels were
+tuned (loads by `uint4`, work split across lanes, no divisions in loops) and
+the port should keep those shapes, not undo them. Leave a comment only where
+the port differs from the Metal kernel and why; the reasoning of the kernel
+itself stays in the `.metal` file, which the `.comp` header names.
+
+## Build and test
+
+On a Linux machine with a Vulkan 1.3 driver that has `VK_KHR_cooperative_matrix`
+and `VK_KHR_shader_bfloat16` (Honeykrisp on an M5), with `glslc` on the path
+(`build.rs` compiles every kernel of `src/kernels/vulkan/*.comp` and
+`tests/vulkan/*.comp` to SPIR-V):
+
+    cargo build --release
+    cargo test --release --lib kernels::<module> -- --test-threads=1
+
+Run one GPU user at a time: timings are worthless otherwise, and two model
+loads at once exhaust memory. A kernel's unit tests are
+`tests/unit/kernels/<module>.rs`, each against the f32 CPU reference in
+`tests/support/cpu_ref.rs`; tests marked
+`#[ignore = "requires LILY_MODEL_DIR_FLASH"]` need a checkpoint, and the
+ignored `*_timing` and `*_probe` tests print timings (`--ignored
+--nocapture`). A kernel without a shader fails with "has no Vulkan shader".
+
+To compile the kernels of one file without the crate, run `glslc` once per
+`KERNEL_<name>` the file defines, as `build.rs` does.
+
+Environment:
+
+- `LILY_VK_SHADER_DIR=<dir>` makes the backend load `<dir>/<kernel>.spv` in
+  place of the built-in shader, for trying a variant without a rebuild.
+- `MESA_SHADER_CACHE_DIR=<fresh dir>` (or `MESA_SHADER_CACHE_DISABLE=true`)
+  when the driver or a shader changed: the driver's disk cache has served
+  stale shaders.
+- `LILY_PROFILE=1` prints each pass's GPU time; `lily-bench
+  --kernel-profile` the per-kernel table (each dispatch alone, so it
+  overstates small dispatches that normally overlap).
+- `LILY_VK_TRACE=<file>` writes a timeline of passes.
+- `LILY_VK_BATCH`, `LILY_VK_WINDOW`: dispatches per command buffer and
+  command buffers in flight. `LILY_VK_CLOCK=0` turns the CPU clock hold off.
+- `LILY_FUSE_LEVELS=1` sends shared-input projections fused, for a driver
+  whose dispatches do not overlap.
+
+A GPU fault or a job over its time shows as "Vulkan command buffer failed"
+(or the test hangs until its timeout): do not loop on it; the kernel log
+says what happened.

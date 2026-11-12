@@ -1,0 +1,34 @@
+#version 460
+// The kernels of src/kernels/metal/spec.metal: speculative-step control on
+// the GPU (the accepted count and the values derived from it, in the slot
+// layout spec.metal describes) and a row copy at a GPU-supplied row index.
+#include "common.glsl"
+
+#ifdef KERNEL_spec_accept
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    if (thread_position_in_grid.x != 0) return;
+    U32 draws = U32(arg(0)), ids = U32(arg(1)), ctrl = U32(arg(2));
+    uint m = arg_u32(3), pos0 = arg_u32(4), ratio = arg_u32(5), chain = arg_u32(6), stride = arg_u32(7);
+    uint a = 0;
+    while (a + 1 < m && draws.v[a] == ids.v[a + 1]) ++a;
+    ctrl.v[0] = a;
+    ctrl.v[stride] = a + 1;
+    for (uint i = 0; i < chain; ++i) {
+        uint p = pos0 + a + 1 + i;
+        ctrl.v[(2 + 3 * i) * stride] = p;
+        ctrl.v[(3 + 3 * i) * stride] = p / ratio;
+        ctrl.v[(4 + 3 * i) * stride] = ((p + 1) % ratio == 0) ? 1u : 0u;
+    }
+}
+#endif
+
+// dst[0..words] = src[row, 0..words]; nothing is written when row >= rows.
+#ifdef KERNEL_copy_row_u32
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    uint words = arg_u32(2), rows = arg_u32(3), row = arg_u32(4), gid = thread_position_in_grid.x;
+    if (row >= rows || gid >= words) return;
+    U32(arg(1)).v[gid] = U32(arg(0) + 4 * uint64_t(row) * words).v[gid];
+}
+#endif

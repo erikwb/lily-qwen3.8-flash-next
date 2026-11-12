@@ -2670,10 +2670,39 @@ impl Recorder {
 /// `--stats-db`'s default: `~/Library/Application Support/lily/lily.sqlite`,
 /// or `None` when `HOME` is unset or not absolute (history is then off
 /// rather than written relative to whatever the working directory is).
+#[cfg(target_os = "macos")]
 pub fn default_path() -> Option<PathBuf> {
     default_path_in(std::env::var_os("HOME"))
 }
 
+/// Linux: `$XDG_STATE_HOME/lily/lily.sqlite`, the XDG base directory for
+/// history that should outlive restarts, or `~/.local/state/lily/lily.sqlite`
+/// when it is unset or relative; `None` when neither it nor `HOME` is an
+/// absolute path, as on macOS.
+#[cfg(target_os = "linux")]
+pub fn default_path() -> Option<PathBuf> {
+    default_path_in_xdg(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
+}
+
+#[cfg(target_os = "linux")]
+fn default_path_in_xdg(
+    state: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    let state = match state.map(PathBuf::from) {
+        Some(dir) if dir.is_absolute() => dir,
+        _ => {
+            let home = PathBuf::from(home?);
+            if !home.is_absolute() {
+                return None;
+            }
+            home.join(".local").join("state")
+        }
+    };
+    Some(state.join("lily").join("lily.sqlite"))
+}
+
+#[cfg(target_os = "macos")]
 fn default_path_in(home: Option<std::ffi::OsString>) -> Option<PathBuf> {
     let home = PathBuf::from(home?);
     home.is_absolute().then(|| {

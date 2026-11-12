@@ -173,6 +173,7 @@ impl Checkpoint {
         file.seek(SeekFrom::Start(meta.start))
             .with_context(|| format!("seeking to {name}"))?;
         file.read_exact(buf).with_context(|| format!("reading {name}"))?;
+        drop_cached(&file, meta.start, buf.len());
         Ok(())
     }
 }
@@ -194,6 +195,31 @@ fn set_nocache(file: &File) {
 
 #[cfg(not(target_os = "macos"))]
 fn set_nocache(_file: &File) {}
+
+/// Linux has no `F_NOCACHE`: the read went through the page cache, so the
+/// pages of the range it read are dropped from it right after
+/// (`POSIX_FADV_DONTNEED`). The cache then holds at most one tensor of the
+/// weights at a time instead of all of them, which leaves the paged n-gram
+/// table's pages alone as `F_NOCACHE` does on macOS. Pages that a mapping
+/// uses (the n-gram table's, where a tensor's first or last page is shared
+/// with it) are not dropped. Best effort.
+#[cfg(target_os = "linux")]
+fn drop_cached(file: &File, start: u64, len: usize) {
+    use std::os::unix::io::AsRawFd as _;
+    // SAFETY: advice on a valid descriptor; the return value is ignored.
+    unsafe {
+        libc::posix_fadvise(
+            file.as_raw_fd(),
+            start as libc::off_t,
+            len as libc::off_t,
+            libc::POSIX_FADV_DONTNEED,
+        );
+    }
+}
+
+/// macOS's reads bypassed the cache already ([`set_nocache`]).
+#[cfg(not(target_os = "linux"))]
+fn drop_cached(_file: &File, _start: u64, _len: usize) {}
 
 /// Parses one shard's header: 8-byte little-endian header length, then the
 /// JSON header; `data_offsets` are relative to the data section that follows.

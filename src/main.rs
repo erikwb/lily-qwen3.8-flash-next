@@ -17,15 +17,24 @@ use lily::serve::{SamplingOverrides, ServeOptions, parse_duration_secs};
 /// twice that, unmeasured.
 const DEFAULT_THINKING_BUDGET: &str = "low=8000,medium=8000,xhigh=16000";
 
+/// The `--help` epilogue, naming the platform's instance lock
+/// (`lily::instance::DEFAULT_PATH`).
+#[cfg(target_os = "macos")]
+const AFTER_HELP: &str = "Only one lily instance runs at a time: a server, lily-bench or lily-probe started \
+                  while another one, of any user, holds /Users/Shared/lily-instance.lock refuses \
+                  to start and exits with status 75 (EX_TEMPFAIL). Stop the background service first \
+                  with tools/service/lily-service.sh stop.";
+#[cfg(target_os = "linux")]
+const AFTER_HELP: &str = "Only one lily instance runs at a time: a server, lily-bench or lily-probe started \
+                  while another one, of any user, holds /tmp/lily-instance.lock refuses to start and \
+                  exits with status 75 (EX_TEMPFAIL). Stop the other instance first.";
+
 #[derive(Parser)]
 #[command(
     name = "lily",
     version,
     about = "Qwen3.8-Flash-Next inference server",
-    after_help = "Only one lily instance runs at a time: a server, lily-bench or lily-probe started \
-                  while another one, of any user, holds /Users/Shared/lily-instance.lock refuses \
-                  to start and exits with status 75 (EX_TEMPFAIL). Stop the background service first \
-                  with tools/service/lily-service.sh stop."
+    after_help = AFTER_HELP
 )]
 struct Cli {
     /// Checkpoint directory: a Qwen3.8-Flash-Next conversion from
@@ -73,7 +82,12 @@ struct Cli {
 
     /// Directory for the disk tier of the session cache (sessions evicted
     /// from GPU memory are written here and read back when a prompt shares
-    /// their prefix). Default: ~/Library/Caches/lily/sessions.
+    /// their prefix).
+    #[cfg_attr(target_os = "macos", doc = "Default: ~/Library/Caches/lily/sessions.")]
+    #[cfg_attr(
+        target_os = "linux",
+        doc = "Default: $XDG_CACHE_HOME/lily/sessions (~/.cache/lily/sessions)."
+    )]
     #[arg(long)]
     disk_cache_dir: Option<PathBuf>,
 
@@ -137,7 +151,15 @@ struct Cli {
     /// The dashboard's 7-day history: a SQLite database of request numbers
     /// (counts, durations, rates; never text or tokens), machine load and
     /// cache tiers per minute. `off` records nothing and the dashboard shows
-    /// no history. Default: ~/Library/Application Support/lily/lily.sqlite.
+    /// no history.
+    #[cfg_attr(
+        target_os = "macos",
+        doc = "Default: ~/Library/Application Support/lily/lily.sqlite."
+    )]
+    #[cfg_attr(
+        target_os = "linux",
+        doc = "Default: $XDG_STATE_HOME/lily/lily.sqlite (~/.local/state/lily/lily.sqlite)."
+    )]
     #[arg(long, value_name = "PATH|off")]
     stats_db: Option<String>,
 
@@ -148,6 +170,11 @@ struct Cli {
     /// and every 30 s otherwise, and kept in the history. `off` starts no
     /// sampler and the dashboard shows none of them. A sampler that cannot
     /// start, or fails later, logs once and stops; serving is unaffected.
+    #[cfg_attr(
+        target_os = "linux",
+        doc = "On Linux there is no source for these figures: the sampler logs that once and \
+               stops, and the dashboard shows them as unknown."
+    )]
     #[arg(long, default_value = "on", value_name = "on|off")]
     machine_stats: lily::serve::machine::MachineStats,
 
@@ -331,12 +358,26 @@ fn parse_bytes(text: &str) -> Result<usize> {
 /// (`lily::instance::home_dir`): without `HOME` it used to be
 /// relative to the working directory, so a server started that way spilled
 /// its sessions there.
+#[cfg(target_os = "macos")]
 fn default_disk_cache_dir() -> Result<PathBuf> {
     Ok(lily::instance::home_dir()?
         .join("Library")
         .join("Caches")
         .join("lily")
         .join("sessions"))
+}
+
+/// Linux: `$XDG_CACHE_HOME/lily/sessions`, or `.cache/lily/sessions` under
+/// the account's home (`lily::instance::home_dir`, for the reason above)
+/// when `XDG_CACHE_HOME` is unset or relative (the XDG base directory
+/// specification says to ignore a relative one).
+#[cfg(target_os = "linux")]
+fn default_disk_cache_dir() -> Result<PathBuf> {
+    let cache = match std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from) {
+        Some(dir) if dir.is_absolute() => dir,
+        _ => lily::instance::home_dir()?.join(".cache"),
+    };
+    Ok(cache.join("lily").join("sessions"))
 }
 
 /// Every argument of the command line as the dashboard's settings view

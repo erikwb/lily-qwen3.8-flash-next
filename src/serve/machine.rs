@@ -125,6 +125,11 @@
 //!
 //! `--machine-stats off` ([`MachineStats`]) starts no thread: the state is
 //! [`State::Off`].
+//!
+//! **Linux** has no `macmon` and none of the figures a [`Reading`] needs
+//! ([`LinuxSensors`]): the sampler fails at its start with that reason, and
+//! the dashboard shows the machine figures as unknown. lily's own CPU energy
+//! is unknown there too (`stats::own_energy_nj`).
 
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -385,8 +390,10 @@ pub trait Source {
 /// takes a `mach_host_self` send right, which a loop over thousands of calls
 /// can leak; the ignored real-hardware test measures lily's footprint over
 /// 300 calls so a leak that matters shows.
+#[cfg(target_os = "macos")]
 pub struct Macmon(macmon::Sampler);
 
+#[cfg(target_os = "macos")]
 impl Macmon {
     /// Opens IOReport and the SMC; about 0.7 s. Fails where IOReport is
     /// blocked (a sandbox).
@@ -395,6 +402,7 @@ impl Macmon {
     }
 }
 
+#[cfg(target_os = "macos")]
 impl Source for Macmon {
     fn read(&mut self, window: Duration) -> Result<Reading, String> {
         let ms = window.as_millis().min(u32::MAX as u128) as u32;
@@ -410,6 +418,35 @@ impl Source for Macmon {
             gpu_temp_c: m.temp.gpu_temp_avg.map(f64::from),
             lily: None,
         })
+    }
+}
+
+/// The production source on Linux, which cannot be created: a [`Reading`]
+/// needs the CPU, GPU and ANE power and the GPU's activity and frequency,
+/// and Linux on Apple Silicon exposes none of them (no IOReport; the SMC
+/// driver offers the battery's and the charger's figures, not the
+/// components'). Reporting 0 for them would show an idle GPU at 0 W, so the
+/// sampler fails at its start the way it does where IOReport is refused, and
+/// the dashboard shows the power, the GPU and the temperatures as unknown.
+/// What Linux does expose (the battery's discharge power, a CPU frequency
+/// per cluster in `cpufreq`) would need those fields to be optional first.
+#[cfg(target_os = "linux")]
+pub enum LinuxSensors {}
+
+#[cfg(target_os = "linux")]
+impl LinuxSensors {
+    /// Always fails, saying why.
+    pub fn new() -> Result<Self, String> {
+        Err("Linux exposes no CPU, GPU or ANE power and no GPU activity or frequency on this \
+             machine; the dashboard's power, GPU and temperature figures stay unknown"
+            .to_owned())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Source for LinuxSensors {
+    fn read(&mut self, _window: Duration) -> Result<Reading, String> {
+        match *self {}
     }
 }
 
@@ -575,7 +612,11 @@ impl Machine {
     /// default [`Intervals`]); `busy` says whether the engine is working.
     /// Returns at once: the thread creates the sampler.
     pub fn start(busy: impl Fn() -> bool + Send + 'static) -> Arc<Self> {
-        Self::spawn_counting(Macmon::new, OwnCounters::read, busy, Intervals::default())
+        #[cfg(target_os = "macos")]
+        let make = Macmon::new;
+        #[cfg(target_os = "linux")]
+        let make = LinuxSensors::new;
+        Self::spawn_counting(make, OwnCounters::read, busy, Intervals::default())
     }
 
     /// Starts a sampler thread that creates its source with `make` (on the
@@ -971,11 +1012,19 @@ fn guarded<T>(
 /// Puts the calling thread at the utility quality of service: below the
 /// engine's threads, above the background class (which would also throttle
 /// its I/O). A failure is not worth a log line.
+#[cfg(target_os = "macos")]
 fn utility_priority() {
     // SAFETY: a plain call on the current thread with a class from the enum.
     let _ = unsafe {
         libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0)
     };
+}
+
+/// Linux: nice 10 and the lowest best-effort I/O priority
+/// (`crate::priority`). A failure is not worth a log line.
+#[cfg(target_os = "linux")]
+fn utility_priority() {
+    crate::priority::lower_current_thread(crate::priority::Class::Utility);
 }
 
 #[cfg(test)]

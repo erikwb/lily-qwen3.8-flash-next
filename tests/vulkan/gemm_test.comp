@@ -1,0 +1,71 @@
+#version 460
+// The reference kernels of tests/unit/kernels/gemm.rs: the dense GEMM as it
+// was first ported, each operand block a coopMatLoad straight from device
+// memory (4.3 TFLOP/s at M=4096, N=K=2560, 2026-11-10). The shipped kernels
+// (gemm.comp) walk K in the same 16-deep steps and must match these bit for
+// bit. A threadgroup of four subgroups computes a 64x64 tile of C: subgroup
+// s its columns 16 s.., in four 16-row blocks.
+#include "common.glsl"
+#include "matmul.glsl"
+
+const uint NAX_BM = 64;
+const uint NAX_BN = 64;
+
+shared bfloat16_t mat_stage[MAT_STAGE_ELEMENTS(4)];
+
+#if defined(KERNEL_gemm_bf16_nt_nax_ref) || defined(KERNEL_gemm_bf16_nt_bias_nax_ref)
+void main() {
+    uint64_t a = arg(0), b = arg(1), c = arg(2);
+#ifdef KERNEL_gemm_bf16_nt_bias_nax_ref
+    BF16 bias = BF16(arg(3));
+    uint K = arg_u32(4), N = arg_u32(5), M = arg_u32(6);
+#else
+    uint K = arg_u32(3), N = arg_u32(4), M = arg_u32(5);
+#endif
+    uint row0 = threadgroup_position_in_grid.y * NAX_BM;
+    uint col0 = threadgroup_position_in_grid.x * NAX_BN + 16 * gl_SubgroupID;
+    if (col0 >= N) return;
+    uint cols = min(16u, N - col0);
+    uint64_t b_rows = b + 2 * uint64_t(col0) * K;
+
+    MatC acc[4];
+    for (uint i = 0; i < 4; ++i) acc[i] = MatC(0.0);
+    for (uint k0 = 0; k0 < K; k0 += 16) {
+        uint depth = min(16u, K - k0);
+        bool edge_k = depth < 16;
+        MatB mb;
+        if (edge_k || cols < 16) {
+            MAT_STAGE(b_rows + 2 * k0, K, cols, depth)
+            MAT_LOAD_STAGED_B(mb);
+        } else {
+            MAT_LOAD_B(mb, BF16(b_rows).v, k0, K);
+        }
+        for (uint i = 0; i < 4; ++i) {
+            uint r0 = row0 + 16 * i;
+            if (r0 >= M) break;
+            uint rows = min(16u, M - r0);
+            uint64_t a_rows = a + 2 * uint64_t(r0) * K;
+            MatA ma;
+            if (edge_k || rows < 16) {
+                MAT_STAGE(a_rows + 2 * k0, K, rows, depth)
+                MAT_LOAD_STAGED_A(ma);
+            } else {
+                MAT_LOAD_A(ma, BF16(a_rows).v, k0, K);
+            }
+            acc[i] = coopMatMulAdd(ma, mb, acc[i]);
+        }
+    }
+    for (uint i = 0; i < 4; ++i) {
+        for (uint e = 0; e < 8; ++e) {
+            uint row = row0 + 16 * i + mat_row(e), col = col0 + mat_col(e);
+            if (row >= M || col >= N) continue;
+            float v = acc[i][e];
+#ifdef KERNEL_gemm_bf16_nt_bias_nax_ref
+            // The bias goes in before the one rounding, as a Linear layer's.
+            v += float(bias.v[col]);
+#endif
+            BF16(c + 2 * (uint64_t(row) * N)).v[col] = bfloat16_t(v);
+        }
+    }
+}
+#endif

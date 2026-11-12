@@ -2,7 +2,9 @@
 
 use anyhow::{Result, anyhow, ensure};
 use half::bf16;
+#[cfg(target_os = "macos")]
 use objc2::runtime::ProtocolObject;
+#[cfg(target_os = "macos")]
 use objc2_metal::MTLBuffer;
 
 use crate::metal::{Buffer, GpuBuffer, MetalContext};
@@ -201,7 +203,15 @@ impl Tensor {
     /// The raw buffer — element 0 sits at [`Self::binding`]'s byte offset, so
     /// kernel dispatches must bind through `binding()`, never `buffer()` plus
     /// an assumed zero offset.
+    #[cfg(target_os = "macos")]
     pub fn buffer(&self) -> &ProtocolObject<dyn MTLBuffer> {
+        &self.buf
+    }
+
+    /// The raw buffer (Linux: the Vulkan buffer itself); the offset caveat
+    /// above applies.
+    #[cfg(target_os = "linux")]
+    pub fn buffer(&self) -> &GpuBuffer {
         &self.buf
     }
 

@@ -33,6 +33,7 @@ fn counters_are_per_thread_and_subtract_to_what_a_phase_added() {
     assert_eq!(before.since(counters()).gather.rows, 0);
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn mach_layouts_match_the_sdk_headers() {
     use std::mem::{offset_of, size_of};
@@ -89,6 +90,9 @@ fn machine_figures_can_be_sampled() {
     }
 }
 
+/// macOS only: Linux keeps no per-process energy account
+/// (`own_cpu_energy_is_unknown_on_linux`).
+#[cfg(target_os = "macos")]
 #[test]
 fn own_cpu_energy_is_cumulative() {
     let a = own_energy_nj().expect("proc_pid_rusage");
@@ -99,4 +103,70 @@ fn own_cpu_energy_is_cumulative() {
     }
     let b = own_energy_nj().expect("proc_pid_rusage");
     assert!(b >= a, "energy went back: {a} -> {b} ({x})");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn own_cpu_energy_is_unknown_on_linux() {
+    assert_eq!(own_energy_nj(), None);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn proc_values_reads_named_counters_and_kilobytes() {
+    let text = "MemTotal:       132024464 kB\nMemAvailable:   125234928 kB\n\
+                pgpgin 253499776\nRssAnon:\t    1024 kB\nbroken\n";
+    assert_eq!(
+        procfs::proc_values(text, ["MemTotal", "pgpgin", "RssAnon", "SwapTotal"]),
+        [Some(132024464 * 1024), Some(253499776), Some(1024 * 1024), None]
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn psi_maps_to_the_macos_pressure_levels() {
+    let psi = |some: f64, full: f64| {
+        format!(
+            "some avg10={some:.2} avg60=0.00 avg300=0.00 total=1\n\
+             full avg10={full:.2} avg60=0.00 avg300=0.00 total=1\n"
+        )
+    };
+    assert_eq!(procfs::psi_level(&psi(0.0, 0.0)), Some(1));
+    assert_eq!(procfs::psi_level(&psi(9.99, 0.0)), Some(1));
+    assert_eq!(procfs::psi_level(&psi(procfs::PSI_WARNING_PCT, 2.0)), Some(2));
+    assert_eq!(procfs::psi_level(&psi(60.0, procfs::PSI_CRITICAL_PCT)), Some(4));
+    assert_eq!(procfs::psi_level("some avg10=0.50 avg60=0.00\n"), Some(1));
+    assert_eq!(procfs::psi_level(""), None);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn the_cpu_line_counts_interrupts_as_busy_and_iowait_as_idle() {
+    let ticks =
+        procfs::cpu_line("cpu  23059 2 40357 2222684 13561 2093 5886 0 0 0").unwrap();
+    assert_eq!(
+        ticks,
+        CpuTicks {
+            user: 23059,
+            system: 40357 + 2093 + 5886,
+            idle: 2222684 + 13561,
+            nice: 2
+        }
+    );
+    assert_eq!(procfs::cpu_line("cpu0 1 2 3 4 5 6 7 8"), None);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn the_wire_limit_is_the_memlock_limit_or_the_memory() {
+    let limit = user_wire_limit().expect("RLIMIT_MEMLOCK");
+    let memory = crate::qwen4exp::weights::physical_memory().expect("memory");
+    let mut rlimit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut rlimit) }, 0);
+    // `CAP_IPC_LOCK` (root) lifts a finite limit to the memory as well.
+    if rlimit.rlim_cur == libc::RLIM_INFINITY {
+        assert_eq!(limit, memory);
+    } else {
+        assert!(limit == rlimit.rlim_cur || limit == memory, "limit {limit}");
+    }
 }

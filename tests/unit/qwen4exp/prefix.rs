@@ -226,6 +226,8 @@ fn synthetic_state(
             hidden: Tensor::zeros(ctx, &[8], DType::BF16).expect("hidden"),
         }),
         spec: None,
+        #[cfg(target_os = "linux")]
+        ahead: Default::default(),
         kv_format: format,
         kv_heads: HEADS,
         head_dim: HEAD_DIM,

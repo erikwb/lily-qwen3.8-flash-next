@@ -73,6 +73,10 @@ pub struct ExpertStore {
     tensors: Vec<[TensorLoc; REGIONS]>,
     experts: usize,
     region_lens: [usize; REGIONS],
+    /// Linux's stand-in for `F_NOCACHE` ([`ExpertStore::set_nocache`]):
+    /// every read drops the pages it brought in.
+    #[cfg(target_os = "linux")]
+    nocache: std::sync::atomic::AtomicBool,
 }
 
 impl ExpertStore {
@@ -155,7 +159,14 @@ impl ExpertStore {
             }
             tensors.push(locs);
         }
-        Ok(Self { shards, tensors, experts: e, region_lens })
+        Ok(Self {
+            shards,
+            tensors,
+            experts: e,
+            region_lens,
+            #[cfg(target_os = "linux")]
+            nocache: std::sync::atomic::AtomicBool::new(false),
+        })
     }
 
     /// Language-model layers served.
@@ -190,6 +201,7 @@ impl ExpertStore {
     /// still be served from memory, which `lily-ssd-probe` checks with
     /// `mincore`). Set by `lily-ssd-probe` and by the diagnostic
     /// `LILY_EXPERT_NOCACHE=1`; the server reads through the cache.
+    #[cfg(target_os = "macos")]
     pub fn set_nocache(&self, on: bool) -> Result<()> {
         use std::os::fd::AsRawFd as _;
         for (path, file) in &self.shards {
@@ -208,6 +220,34 @@ impl ExpertStore {
                 std::io::Error::last_os_error()
             );
         }
+        Ok(())
+    }
+
+    /// Linux has no `F_NOCACHE`; the same effect, emulated: `on` turns the
+    /// kernel's read-ahead off for every shard the store opened
+    /// (`POSIX_FADV_RANDOM`, so a read brings in only its own pages, as an
+    /// uncached read does) and makes every read drop the pages of its range
+    /// from the page cache right after it (`POSIX_FADV_DONTNEED`), so reads
+    /// leave no pages behind and the next read of the same expert goes to
+    /// the drive. Pages resident before are still served from memory, as on
+    /// macOS; pages another process maps are not dropped. `off` restores
+    /// normal read-ahead and stops the dropping.
+    #[cfg(target_os = "linux")]
+    pub fn set_nocache(&self, on: bool) -> Result<()> {
+        use std::os::fd::AsRawFd as _;
+        let advice = if on { libc::POSIX_FADV_RANDOM } else { libc::POSIX_FADV_NORMAL };
+        for (path, file) in &self.shards {
+            // SAFETY: advice on a descriptor the store owns; it returns the
+            // error number instead of setting `errno`.
+            let rc = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, advice) };
+            ensure!(
+                rc == 0,
+                "posix_fadvise on {}: {}",
+                path.display(),
+                std::io::Error::from_raw_os_error(rc)
+            );
+        }
+        self.nocache.store(on, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -275,7 +315,22 @@ impl ExpertStore {
                 REGION_NAMES[r],
                 path.display()
             )
-        })
+        })?;
+        #[cfg(target_os = "linux")]
+        if self.nocache.load(std::sync::atomic::Ordering::Relaxed) {
+            use std::os::fd::AsRawFd as _;
+            // SAFETY: advice on a descriptor the store owns. Best effort: a
+            // page left behind only makes a later read faster.
+            unsafe {
+                libc::posix_fadvise(
+                    file.as_raw_fd(),
+                    region.offset as libc::off_t,
+                    region.len as libc::off_t,
+                    libc::POSIX_FADV_DONTNEED,
+                );
+            }
+        }
+        Ok(())
     }
 }
 

@@ -1,0 +1,114 @@
+#version 460
+// The kernels of src/kernels/metal/ple.metal: the per-layer (n-gram)
+// embedding table gather, the per-stream gate and the dilated depthwise conv,
+// the same arithmetic in the same order. Streams are laid out [rows, G*H].
+#include "common.glsl"
+#include "hc_common.glsl"
+
+#define TG 256
+#define PLE_MAX_CONTEXT 16  // (kernel-1)*dilation entries the conv window holds
+
+// out[r, j*K .. (j+1)*K] = table[ids[r, j]]: one thread per (code word, head,
+// row). The table is tens of GB: its row offsets are 64-bit addresses.
+#ifdef KERNEL_ple_gather_q4_bf16
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    uint K = arg_u32(5), GS = arg_u32(6), NH = arg_u32(7);
+    uint words = K / 8;
+    uint w = thread_position_in_grid.x, j = thread_position_in_grid.y, r = thread_position_in_grid.z;
+    if (w >= words) return;
+    uint64_t row = U32(arg(3)).v[r * NH + j];
+    uint groups = K / GS;
+    uint g = w / (GS / 8);
+    float s = float(BF16(arg(1) + 2 * row * groups).v[g]);
+    float b = float(BF16(arg(2) + 2 * row * groups).v[g]);
+    uint word = U32(arg(0) + 4 * row * words).v[w];
+    vec4 lo = vec4(float((word >> 0) & 0xFu), float((word >> 4) & 0xFu),
+                   float((word >> 8) & 0xFu), float((word >> 12) & 0xFu));
+    vec4 hi = vec4(float((word >> 16) & 0xFu), float((word >> 20) & 0xFu),
+                   float((word >> 24) & 0xFu), float((word >> 28) & 0xFu));
+    BF16x4 dst = BF16x4(arg(4) + 2 * (uint64_t(r) * NH + j) * K);
+    dst.v[2 * w] = bf16_rne(lo * s + b);
+    dst.v[2 * w + 1] = bf16_rne(hi * s + b);
+}
+#endif
+
+// gate_g = <key[r, g], query[r, g]> / sqrt(H), signed-sqrt'ed, then
+// gated[r, g*H + i] = sigmoid(gate_g) * value[r, i]. One threadgroup per (row, g).
+#ifdef KERNEL_ple_gate_value_bf16
+shared float partial[TG / 32];
+shared float gate_s;
+void main() {
+    uint H = arg_u32(4), G = arg_u32(5);
+    float inv_sqrt_h = arg_f32(6);
+    uint seg = threadgroup_position_in_grid.x, tid = thread_index_in_threadgroup;
+    uint sg = simdgroup_index_in_threadgroup, lane = thread_index_in_simdgroup;
+    BF16 key = BF16(arg(0) + 2 * uint64_t(seg) * H), query = BF16(arg(1) + 2 * uint64_t(seg) * H);
+    BF16 value = BF16(arg(2) + 2 * uint64_t(seg / G) * H), gated = BF16(arg(3) + 2 * uint64_t(seg) * H);
+    float acc = 0.0;
+    for (uint i = tid; i < H; i += TG) acc += float(key.v[i]) * float(query.v[i]);
+    acc = subgroupAdd(acc);
+    if (lane == 0) partial[sg] = acc;
+    barrier();
+    if (tid == 0) {
+        float total = 0.0;
+        for (uint i = 0; i < TG / 32; ++i) total += partial[i];
+        float gate = total * inv_sqrt_h;
+        float mag = sqrt(max(abs(gate), 1e-6));
+        float signed_gate = gate < 0.0 ? -mag : mag;
+        gate_s = 1.0 / (1.0 + exp(-signed_gate));
+    }
+    barrier();
+    float s = gate_s;
+    for (uint i = tid; i < H; i += TG) gated.v[i] = bf16_rne(s * float(value.v[i]));
+}
+#endif
+
+// Dilated causal depthwise conv over x[M, C] (kernel KD, dilation DIL), then
+// hyper[m, c] += base[m, c] + silu(conv). The window holds the S = (KD-1)*DIL
+// inputs before the chunk, oldest first; win_out receives the post-chunk window.
+#ifdef KERNEL_ple_conv1d_prefill_bf16
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    uint C = arg_u32(6), KD = arg_u32(7), DIL = arg_u32(8), M = arg_u32(9);
+    uint c = thread_position_in_grid.x;
+    BF16 win_in = BF16(arg(0)), win_out = BF16(arg(1)), w = BF16(arg(3));
+    uint S = (KD - 1) * DIL;
+    float win[PLE_MAX_CONTEXT];
+    for (uint s = 0; s < S; ++s) win[s] = float(win_in.v[c * S + s]);
+    for (uint m = 0; m < M; ++m) {
+        uint64_t row = uint64_t(m) * C;
+        float xc = float(BF16(arg(2) + 2 * row).v[c]);
+        float acc = xc * float(w.v[(KD - 1) * C + c]);
+        for (uint t = 0; t + 1 < KD; ++t) {
+            acc += win[S - (KD - 1 - t) * DIL] * float(w.v[t * C + c]);
+        }
+        float conv = acc / (1.0 + exp(-acc));
+        BF16 hyper = BF16(arg(5) + 2 * row);
+        hyper.v[c] = bf16_rne(float(hyper.v[c]) + float(BF16(arg(4) + 2 * row).v[c]) + conv);
+        for (uint s = 0; s + 1 < S; ++s) win[s] = win[s + 1];
+        win[S - 1] = xc;
+    }
+    for (uint s = 0; s < S; ++s) win_out.v[c * S + s] = bf16_rne(win[s]);
+}
+#endif
+
+// Single-token variant of the above; the window is shifted in place.
+#ifdef KERNEL_ple_conv1d_step_bf16
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    uint C = arg_u32(5), KD = arg_u32(6), DIL = arg_u32(7);
+    uint c = thread_position_in_grid.x;
+    BF16 window = BF16(arg(0)), w = BF16(arg(2)), hyper = BF16(arg(4));
+    uint S = (KD - 1) * DIL;
+    float xc = float(BF16(arg(1)).v[c]);
+    float acc = xc * float(w.v[(KD - 1) * C + c]);
+    for (uint t = 0; t + 1 < KD; ++t) {
+        acc += float(window.v[c * S + S - (KD - 1 - t) * DIL]) * float(w.v[t * C + c]);
+    }
+    float conv = acc / (1.0 + exp(-acc));
+    hyper.v[c] = bf16_rne(float(hyper.v[c]) + float(BF16(arg(3)).v[c]) + conv);
+    for (uint s = 0; s + 1 < S; ++s) window.v[c * S + s] = window.v[c * S + s + 1];
+    window.v[c * S + S - 1] = bf16_rne(xc);
+}
+#endif

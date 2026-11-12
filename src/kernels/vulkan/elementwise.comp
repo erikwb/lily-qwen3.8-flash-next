@@ -1,0 +1,213 @@
+#version 460
+// The kernels of src/kernels/metal/elementwise.metal: elementwise, embedding
+// and argmax kernels, each the same arithmetic in the same order.
+#include "common.glsl"
+
+#ifdef KERNEL_copy_u32
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    uint gid = thread_position_in_grid.x;
+    U32(arg(1)).v[gid] = U32(arg(0)).v[gid];
+}
+#endif
+
+// XOR of every word of `src` into out[0] (one atomic per subgroup).
+#ifdef KERNEL_checksum_u32
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    U32x4 src = U32x4(arg(0));
+    uint n4 = arg_u32(2), gid = thread_position_in_grid.x, grid = lily_dispatch.grid.x;
+    uint acc = 0u;
+    for (uint i = gid; i < n4; i += grid) {
+        uvec4 v = src.v[i];
+        acc ^= v.x ^ v.y ^ v.z ^ v.w;
+    }
+    acc = subgroupXor(acc);
+    if (gl_SubgroupInvocationID == subgroupBallotFindLSB(subgroupBallot(true))) atomicXor(U32(arg(1)).v[0], acc);
+}
+#endif
+
+#ifdef KERNEL_add_bf16
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    uint gid = thread_position_in_grid.x;
+    BF16(arg(2)).v[gid] = bfloat16_t(float(BF16(arg(0)).v[gid]) + float(BF16(arg(1)).v[gid]));
+}
+#endif
+
+// SwiGLU: out = silu(gate) * up.
+#ifdef KERNEL_silu_mul_bf16
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    uint gid = thread_position_in_grid.x;
+    float g = float(BF16(arg(0)).v[gid]);
+    float s = g / (1.0 + exp(-g));
+    BF16(arg(2)).v[gid] = bfloat16_t(s * float(BF16(arg(1)).v[gid]));
+}
+#endif
+
+// out[r, c] = silu(gu[r, c]) * gu[r, N + c] over a [m, 2N] gate|up stack.
+#ifdef KERNEL_silu_mul_gu_rows_bf16
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    uint N = arg_u32(2), c = thread_position_in_grid.x, r = thread_position_in_grid.y;
+    if (c >= N) return;
+    BF16 gu = BF16(arg(0) + 2 * (uint64_t(r) * 2 * N));
+    float g = float(gu.v[c]);
+    float s = g / (1.0 + exp(-g));
+    BF16(arg(1) + 2 * (uint64_t(r) * N)).v[c] = bfloat16_t(s * float(gu.v[N + c]));
+}
+#endif
+
+// Attention output gate: out = x * sigmoid(gate).
+#ifdef KERNEL_sigmoid_mul_bf16
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    uint gid = thread_position_in_grid.x;
+    float g = float(BF16(arg(0)).v[gid]);
+    BF16(arg(2)).v[gid] = bfloat16_t(float(BF16(arg(1)).v[gid]) / (1.0 + exp(-g)));
+}
+#endif
+
+// Splits [m, n_total] into up to four contiguous column segments.
+#ifdef KERNEL_split_cols_bf16
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    uvec4 w = U32x4(arg(5)).v[0];
+    uint n_total = arg_u32(6), col = thread_position_in_grid.x;
+    uint64_t row = thread_position_in_grid.y;
+    bfloat16_t v = BF16(arg(0) + 2 * (row * n_total)).v[col];
+    for (uint d = 0; d < 4; ++d) {
+        if (col < w[d]) {
+            BF16(arg(1 + d) + 2 * (row * w[d])).v[col] = v;
+            return;
+        }
+        col -= w[d];
+    }
+}
+#endif
+
+// Embedding lookup: copies row `row` of a [rows, H] bf16 table.
+#ifdef KERNEL_gather_row_bf16
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    uint row = arg_u32(2), H = arg_u32(3), gid = thread_position_in_grid.x;
+    BF16(arg(1)).v[gid] = BF16(arg(0) + 2 * (uint64_t(row) * H)).v[gid];
+}
+#endif
+
+// Batched embedding lookup: out[i, :] = table[ids[i], :].
+#ifdef KERNEL_gather_rows_bf16
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    uint H = arg_u32(3), gid = thread_position_in_grid.x;
+    uint i = gid / H, d = gid % H;
+    BF16(arg(2)).v[gid] = BF16(arg(0) + 2 * (uint64_t(U32(arg(1)).v[i]) * H)).v[d];
+}
+#endif
+
+// gather_rows_bf16 by eight elements (one uvec4) per thread.
+#ifdef KERNEL_gather_rows_bf16_x8
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    uint W = arg_u32(3), gid = thread_position_in_grid.x;
+    uint i = gid / W, w = gid - i * W;
+    U32x4(arg(2)).v[gid] = U32x4(arg(0) + 16 * (uint64_t(U32(arg(1)).v[i]) * W)).v[w];
+}
+#endif
+
+#if defined(KERNEL_argmax_f32_partial) || defined(KERNEL_argmax_f32_final)
+#define ARGMAX_TG 256
+// {float v; uint i;} pairs, eight bytes each.
+layout(buffer_reference, scalar, buffer_reference_align = 4) buffer ArgMaxPairs { uvec2 v[]; };
+shared float part_v[ARGMAX_TG / 32];
+shared uint part_i[ARGMAX_TG / 32];
+
+void argmax_merge(inout float bv, inout uint bi, float v, uint i) {
+    if (v > bv || (v == bv && i < bi)) {
+        bv = v;
+        bi = i;
+    }
+}
+// The subgroup's best into its lane 0 (Metal: simd_shuffle_down by 16, 8, ..,
+// of which lane 0 sees the tree this folds).
+void argmax_fold(inout float bv, inout uint bi) {
+    for (uint off = 16; off > 0; off >>= 1) {
+        float ov = subgroupShuffleXor(bv, off);
+        uint oi = subgroupShuffleXor(bi, off);
+        argmax_merge(bv, bi, ov, oi);
+    }
+}
+#endif
+
+#ifdef KERNEL_argmax_f32_partial
+void main() {
+    F32 x = F32(arg(0));
+    uint n = arg_u32(2), chunk = arg_u32(3);
+    uint g = threadgroup_position_in_grid.x, tid = thread_index_in_threadgroup;
+    float bv = -1.0 / 0.0;
+    uint bi = 0;
+    uint end = min((g + 1) * chunk, n);
+    for (uint i = g * chunk + tid; i < end; i += ARGMAX_TG) argmax_merge(bv, bi, x.v[i], i);
+    argmax_fold(bv, bi);
+    if (thread_index_in_simdgroup == 0) {
+        part_v[simdgroup_index_in_threadgroup] = bv;
+        part_i[simdgroup_index_in_threadgroup] = bi;
+    }
+    barrier();
+    if (tid == 0) {
+        for (uint s = 1; s < ARGMAX_TG / 32; ++s) argmax_merge(bv, bi, part_v[s], part_i[s]);
+        ArgMaxPairs(arg(1)).v[g] = uvec2(floatBitsToUint(bv), bi);
+    }
+}
+#endif
+
+// Reduces partial argmax results to one index.
+#ifdef KERNEL_argmax_f32_final
+void main() {
+    ArgMaxPairs partials = ArgMaxPairs(arg(0));
+    uint groups = arg_u32(2), tid = thread_index_in_threadgroup;
+    float bv = -1.0 / 0.0;
+    uint bi = 0;
+    for (uint g = tid; g < groups; g += ARGMAX_TG) {
+        uvec2 pair = partials.v[g];
+        argmax_merge(bv, bi, uintBitsToFloat(pair.x), pair.y);
+    }
+    argmax_fold(bv, bi);
+    if (thread_index_in_simdgroup == 0) {
+        part_v[simdgroup_index_in_threadgroup] = bv;
+        part_i[simdgroup_index_in_threadgroup] = bi;
+    }
+    barrier();
+    if (tid == 0) {
+        for (uint s = 1; s < ARGMAX_TG / 32; ++s) argmax_merge(bv, bi, part_v[s], part_i[s]);
+        U32(arg(1)).v[0] = bi;
+    }
+}
+#endif
+
+#ifdef KERNEL_gelu_bf16
+// erf for the exact GELU: Abramowitz and Stegun 7.1.26, as the Metal kernel.
+float erf_f32(float x) {
+    float sign = x < 0.0 ? -1.0 : 1.0;
+    float a = abs(x);
+    float t = 1.0 / (1.0 + 0.3275911 * a);
+    float poly = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
+    return sign * (1.0 - poly * exp(-a * a));
+}
+// x = gelu(x) in place: erf_form 0 the tanh approximation, 1 the erf form.
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    BF16 x = BF16(arg(0));
+    uint erf_form = arg_u32(1), gid = thread_position_in_grid.x;
+    float v = float(x.v[gid]);
+    float g;
+    if (erf_form != 0u) {
+        g = 0.5 * v * (1.0 + erf_f32(v * 0.70710678118654752));
+    } else {
+        float u = 0.79788456080286536 * (v + 0.044715 * v * v * v);
+        g = v / (1.0 + exp(-2.0 * u));
+    }
+    x.v[gid] = bfloat16_t(g);
+}
+#endif

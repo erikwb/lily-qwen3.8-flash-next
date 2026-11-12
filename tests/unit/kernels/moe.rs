@@ -450,6 +450,32 @@ fn smallm_routing(
                 }
                 indices.extend(&pool[..top_k]);
             }
+            // What a verify pass routes (docs/performance.md: a draft row
+            // routes to 6 to 7 experts the rows before it did not): the
+            // first row as "random", a later row 3 or 4 experts of the
+            // earlier rows' and the rest new, in random slots.
+            "draft" => {
+                let seen: Vec<u32> = indices.clone();
+                let shared = if seen.is_empty() { 0 } else { 3 + indices.len() / top_k % 2 };
+                let mut row: Vec<u32> = Vec::with_capacity(top_k);
+                while row.len() < shared.min(top_k) {
+                    let pick = seen[rng.gen_range(0..seen.len())];
+                    if !row.contains(&pick) {
+                        row.push(pick);
+                    }
+                }
+                while row.len() < top_k {
+                    let pick = rng.gen_range(0..e as u32);
+                    if !row.contains(&pick) && !seen.contains(&pick) {
+                        row.push(pick);
+                    }
+                }
+                for k in 0..top_k {
+                    let pick = rng.gen_range(k..top_k);
+                    row.swap(k, pick);
+                }
+                indices.extend(&row);
+            }
             other => panic!("unknown routing mode {other}"),
         }
     }
@@ -1294,6 +1320,7 @@ fn down_combine_named(
 
 /// Dispatches a named fused gate-up instantiation walking `2 * r4` rows per
 /// threadgroup.
+#[cfg(not(target_os = "linux"))]
 #[allow(clippy::too_many_arguments)]
 fn gate_up_named(
     ctx: &MetalContext,
@@ -1416,6 +1443,8 @@ fn smallm_moe_timing() {
             .unwrap();
             pass.level_barrier(&[&ea]).unwrap();
         });
+        // On Vulkan the two K > 512 tiers are one kernel (moe.comp).
+        #[cfg(not(target_os = "linux"))]
         time("fused gate_up r8 (R4=2)", &|pass, inp| {
             gate_up_named(
                 &ctx,
@@ -1485,6 +1514,82 @@ fn smallm_moe_timing() {
     }
 }
 
+/// The fused small-m pair and its halves as the verify pass of speculative
+/// decode runs them (m = 3, and m = 1 for the one-row use), at the model's
+/// shape, with the routings of `smallm_moe_timing` ("random": every row its
+/// own experts, 30 streamed at m = 3) and of a verify pass ("draft": about 23
+/// streamed, 7 pairs walk an expert a second row). Prints us per layer, best
+/// of `LILY_SMALLM_PASSES` (5) passes of 256 layers over 64 routings. Run
+/// with `--ignored --nocapture`.
+#[test]
+#[ignore = "timing only"]
+fn smallm_verify_timing() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(93);
+    let (e, inter, k_in, h, gs, top_k) =
+        (512usize, 640usize, 2560usize, 2560usize, 64usize, 10usize);
+    let gate = random_q4_stack(&ctx, &mut rng, e * inter, k_in, gs);
+    let up = random_q4_stack(&ctx, &mut rng, e * inter, k_in, gs);
+    let down = random_q4_stack(&ctx, &mut rng, e * h, inter, gs);
+    let passes: usize = std::env::var("LILY_SMALLM_PASSES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
+    let routings = 64;
+    let iters = 256;
+    for (m, mode) in [(1usize, "random"), (3, "random"), (3, "draft")] {
+        let s = m * top_k;
+        let inputs: Vec<SmallmInputs> = (0..routings)
+            .map(|_| smallm_inputs(&ctx, &mut rng, e, k_in, h, m, top_k, mode))
+            .collect();
+        let ea = Tensor::zeros(&ctx, &[s, inter], DType::BF16).expect("ea");
+        let out = Tensor::zeros(&ctx, &[m, h], DType::BF16).expect("out");
+        let time = |f: &dyn Fn(&ComputePass<'_>, &SmallmInputs)| {
+            let mut best = f64::MAX;
+            for _ in 0..passes {
+                let pass = ctx.begin_concurrent().expect("pass");
+                for i in 0..iters {
+                    f(&pass, &inputs[i % routings]);
+                }
+                let start = std::time::Instant::now();
+                pass.commit_wait().expect("commit");
+                best = best.min(start.elapsed().as_secs_f64() * 1e6 / iters as f64);
+            }
+            best
+        };
+        let w3 = (&gate, &up, &down);
+        let pair = time(&|pass, inp| {
+            smallm_fused_chain(&ctx, pass, w3, inter, h, inp, &ea, &out, top_k).unwrap();
+        });
+        let gate_up = time(&|pass, inp| {
+            moe_smallm_gate_up(&ctx, pass, &gate, &up, inter, &inp.x, &inp.indices, &ea, top_k)
+                .unwrap();
+            pass.level_barrier(&[&ea]).unwrap();
+        });
+        let down_combine = time(&|pass, inp| {
+            moe_smallm_down_combine(
+                &ctx,
+                pass,
+                &down,
+                h,
+                &ea,
+                &inp.indices,
+                &inp.scores,
+                &inp.shared_out,
+                &inp.shared_gate,
+                &out,
+                top_k,
+            )
+            .unwrap();
+            pass.level_barrier(&[&out]).unwrap();
+        });
+        eprintln!(
+            "smallm m={m} {mode}: pair {pair:.1} gate_up {gate_up:.1} down_combine \
+             {down_combine:.1} us per layer (best of {passes})"
+        );
+    }
+}
+
 /// The decode expert gathers as decode runs them: per layer the gate/up
 /// gather over 10 routed experts, a barrier, the down/combine gather, a
 /// barrier, over 12 layers with their own 128-expert stacks (3.8 GB, so the
@@ -1533,6 +1638,15 @@ fn moe_gather_chain_timing() {
             .unwrap_or_else(|_| {
                 vec![("moe_gather_gemv_q4_gate_up", "moe_gather_gemv_q4_down_combine")]
             });
+    // Walks of the 12 layers per timed pass (`LILY_MOE_GATHER_REPEAT`). On
+    // Vulkan a pass's span is the host's and carries the submission's fixed
+    // cost, some 130 us: 11 us per layer of one walk (an empty kernel on the
+    // down gather's grid measured 11.3 us "per layer" so, 2026-11-10), which
+    // four walks spread to under 3.
+    let repeat = std::env::var("LILY_MOE_GATHER_REPEAT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(if cfg!(target_os = "linux") { 4usize } else { 1 });
     let modes = [("pair", true, true), ("gate_up", true, false), ("down", false, true)];
     let mut best = vec![[f64::INFINITY; 3]; pairs.len()];
     let warm = crate::kernels::qsa::tests::chain_warmup();
@@ -1544,7 +1658,9 @@ fn moe_gather_chain_timing() {
             let (gname, dname) = pairs[which];
             for (m, &(_, run_gu, run_down)) in modes.iter().enumerate() {
                 let pass = ctx.begin_concurrent().expect("pass");
-                for ((gate, up, down), inp) in stacks.iter().zip(&inputs) {
+                for ((gate, up, down), inp) in
+                    stacks.iter().zip(&inputs).cycle().take(layers * repeat)
+                {
                     if run_gu {
                         moe_gather_gemv_gate_up_named(
                             &ctx,
@@ -1580,8 +1696,9 @@ fn moe_gather_chain_timing() {
                 let done = pass.commit().expect("commit").wait_retain().expect("wait");
                 let t = done.timing().expect("timing");
                 if timed && round > 0 {
-                    best[which][m] = best[which][m]
-                        .min((t.gpu_end_secs - t.gpu_start_secs) / layers as f64);
+                    best[which][m] = best[which][m].min(
+                        (t.gpu_end_secs - t.gpu_start_secs) / (layers * repeat) as f64,
+                    );
                 }
             }
         }
@@ -1619,7 +1736,13 @@ fn down_combine_variants_bit_identical() {
     let (e, inter, h, top_k, gs) = (128usize, 640usize, 2560usize, 10usize, 64usize);
     let down = random_q4_stack(&ctx, &mut rng, e * h, inter, gs);
     let shared_gate = Tensor::from_f32(&ctx, &[0.3], &[1]).expect("gate");
-    let variants = ["moe_gather_gemv_q4_down_combine"];
+    // On Vulkan the shipped kernel is a form of its own and Metal's is
+    // `_sg4` (moe.comp).
+    let variants: &[&'static str] = if cfg!(target_os = "linux") {
+        &["moe_gather_gemv_q4_down_combine", "moe_gather_gemv_q4_down_combine_sg4"]
+    } else {
+        &["moe_gather_gemv_q4_down_combine"]
+    };
     for trial in 0..3 {
         let inp = smallm_inputs(&ctx, &mut rng, e, h, h, 1, top_k, "random");
         let act = Tensor::from_f32_as_bf16(
@@ -1649,7 +1772,7 @@ fn down_combine_variants_bit_identical() {
         };
         for shared in [true, false] {
             let want = run("moe_gather_gemv_q4_down_combine_sg1", shared);
-            for name in variants {
+            for &name in variants {
                 let got = run(name, shared);
                 assert!(
                     got == want,
@@ -1715,6 +1838,213 @@ fn router_topk_wider_selection_extends_the_narrow_one() {
                     assert_eq!(bits(&w_sc[..k]), bits(&n_sc), "scores {tag}");
                 }
             }
+        }
+    }
+}
+
+/// The Vulkan kernels lean on the order of the hardware's subgroup sum: a
+/// pairwise tree over adjacent lanes, `((v0 + v1) + (v2 + v3)) + ..`. With
+/// the lanes laid out for it one `subgroupAdd` reproduces the reference
+/// kernels' strided-lane sums and shuffle trees (moe.comp); this pins the
+/// order itself, on values whose sum depends on it.
+#[cfg(target_os = "linux")]
+#[test]
+fn subgroup_add_is_a_pairwise_tree() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(5);
+    let trials = 64usize;
+    let v: Vec<f32> = (0..trials * 32)
+        .map(|_| rng.gen_range(-1.0f32..1.0) * (1u32 << rng.gen_range(0..14)) as f32)
+        .collect();
+    let t = Tensor::from_f32(&ctx, &v, &[trials * 32]).expect("v");
+    let out = Tensor::zeros(&ctx, &[trials], DType::F32).expect("out");
+    let pass = ctx.begin().expect("pass");
+    let pipeline = ctx
+        .pipeline("moe_subgroup_add_probe", TEST_SOURCE, MslVersion::V3_1)
+        .expect("pipeline");
+    pass.dispatch_at(
+        &pipeline,
+        &[t.binding(), out.binding()],
+        &[],
+        Grid::Threadgroups { groups: (trials, 1, 1), threadgroup: (32, 1, 1) },
+    )
+    .expect("dispatch");
+    pass.commit_wait().expect("commit");
+    let got = out.to_f32().expect("read");
+    let mut sequential_differs = 0;
+    for (trial, lanes) in v.chunks(32).enumerate() {
+        let mut level = lanes.to_vec();
+        while level.len() > 1 {
+            level = level.chunks(2).map(|p| p[0] + p[1]).collect();
+        }
+        assert_eq!(got[trial].to_bits(), level[0].to_bits(), "trial {trial}");
+        let sequential = lanes.iter().fold(0.0f32, |a, x| a + x);
+        sequential_differs += usize::from(sequential.to_bits() != level[0].to_bits());
+    }
+    assert!(sequential_differs > trials / 4, "the values do not tell the orders apart");
+}
+
+/// The shipped gate/up gather against the Metal kernel's form
+/// (`moe_gather_gemv_q4_gate_up_ref`, which reads a group's scales and
+/// biases where it uses them): bit-identical at the model's shape.
+#[cfg(target_os = "linux")]
+#[test]
+fn gather_gate_up_matches_reference_form() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(97);
+    let (e, inter, h, top_k, gs) = (32usize, 640usize, 2560usize, 10usize, 64usize);
+    let gate = random_q4_stack(&ctx, &mut rng, e * inter, h, gs);
+    let up = random_q4_stack(&ctx, &mut rng, e * inter, h, gs);
+    for trial in 0..3 {
+        let inp = smallm_inputs(&ctx, &mut rng, e, h, h, 1, top_k, "random");
+        let x =
+            Tensor::from_f32_as_bf16(&ctx, &random_vec(&mut rng, h, -2.0, 2.0), &[h])
+                .expect("x");
+        let run = |name: &'static str| -> Vec<u8> {
+            let act = Tensor::zeros(&ctx, &[top_k, inter], DType::BF16).expect("act");
+            let pass = ctx.begin_concurrent().expect("pass");
+            moe_gather_gemv_gate_up_named(
+                &ctx,
+                &pass,
+                name,
+                &gate,
+                &up,
+                inter,
+                &x,
+                &inp.indices,
+                &act,
+            )
+            .expect("dispatch");
+            pass.commit_wait().expect("commit");
+            act.contents().to_vec()
+        };
+        let want = run("moe_gather_gemv_q4_gate_up_ref");
+        let got = run("moe_gather_gemv_q4_gate_up");
+        assert!(
+            got == want,
+            "trial {trial}: the gate/up gather differs from its reference form"
+        );
+    }
+}
+
+/// What a dispatch's grid costs by itself on this driver: a kernel whose
+/// threads load one param and return (`moe_grid_probe`), over threadgroup
+/// counts and sizes (`LILY_GRID_PROBE=AxBxT,..`), 256 dispatches with a
+/// level barrier after each. Prints microseconds per dispatch (2026-11-10:
+/// 2.1 for one threadgroup, 2.7 for the down gather's former 1280 x 128, 5.0
+/// for 6400 x 32). Run with `--ignored --nocapture`.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "timing only"]
+fn grid_spawn_timing() {
+    let ctx = MetalContext::new().expect("metal context");
+    let t = Tensor::zeros(&ctx, &[16], DType::U32).expect("t");
+    let iters = 256;
+    let grids: Vec<((usize, usize, usize), usize)> = std::env::var("LILY_GRID_PROBE")
+        .map(|v| {
+            v.split(',')
+                .map(|g| {
+                    let p: Vec<usize> =
+                        g.split('x').map(|n| n.parse().expect("AxBxT")).collect();
+                    ((p[0], p[1], 1), p[2])
+                })
+                .collect()
+        })
+        .unwrap_or_else(|_| {
+            vec![
+                ((1, 1, 1), 32),
+                ((1280, 1, 1), 128),
+                ((6400, 1, 1), 32),
+                ((640, 10, 1), 32),
+                ((160, 1, 1), 320),
+                ((320, 3, 1), 320),
+                ((320, 30, 1), 32),
+            ]
+        });
+    let pipeline = ctx
+        .pipeline("moe_grid_probe", TEST_SOURCE, MslVersion::V3_1)
+        .expect("pipeline");
+    for &(groups, tg) in &grids {
+        let mut best = f64::MAX;
+        for _ in 0..4 {
+            let pass = ctx.begin_concurrent().expect("pass");
+            for _ in 0..iters {
+                pass.dispatch_at(
+                    &pipeline,
+                    &[t.binding()],
+                    &[&u32_bytes(7)],
+                    Grid::Threadgroups { groups, threadgroup: (tg, 1, 1) },
+                )
+                .unwrap();
+                pass.level_barrier(&[&t]).unwrap();
+            }
+            let start = std::time::Instant::now();
+            pass.commit_wait().expect("commit");
+            best = best.min(start.elapsed().as_secs_f64() * 1e6 / iters as f64);
+        }
+        eprintln!(
+            "{}x{} threadgroups of {tg}: {best:.2} us per dispatch",
+            groups.0, groups.1
+        );
+    }
+}
+
+/// What a load costs a thread on this GPU: `moe_load_probe` runs, per
+/// subgroup, a chain of 2048 trips that each load 16 bytes per lane in one
+/// of several patterns (0 one streaming load; 1 four independent streaming
+/// loads; 2 four loads each addressed by the one before; 3 one load of the
+/// same cached bytes by every lane; 4 one load per lane from addresses 320
+/// bytes apart; 5 no load; 6 four cached loads; 7 eight streaming loads),
+/// over 1 to 4000 subgroups. Prints nanoseconds per trip of a chain.
+/// 2026-11-10: a chain alone takes 190 ns a trip without a load, 400 with a
+/// streaming one, and some 50 more for each further load, cached or not;
+/// 400 subgroups run as fast as one; at 4000 the trips take six times as
+/// long without loads (the cores run some 700 subgroups at once) and the
+/// streaming patterns reach 560 GB/s, but a load whose lanes are 320 bytes
+/// apart 2.5 us a trip against 0.8 for the cached one. Run with `--ignored
+/// --nocapture`.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "timing only"]
+fn load_latency_probe() {
+    let ctx = MetalContext::new().expect("metal context");
+    let span = 1usize << 16; // 16-byte elements per subgroup: 1 MB
+    let max_sg = 4000usize;
+    let buf = Tensor::zeros(&ctx, &[max_sg * span * 4], DType::U32).expect("buf");
+    let out = Tensor::zeros(&ctx, &[max_sg * 4], DType::U32).expect("out");
+    let pipeline = ctx
+        .pipeline("moe_load_probe", TEST_SOURCE, MslVersion::V3_1)
+        .expect("pipeline");
+    for (groups, tg) in [(1usize, 32usize), (40, 32), (400, 32), (4000, 32)] {
+        for mode in 0..8usize {
+            let iters = 2048usize;
+            let reps = 4;
+            let mut best = f64::MAX;
+            for _ in 0..4 {
+                let pass = ctx.begin_concurrent().expect("pass");
+                for _ in 0..reps {
+                    pass.dispatch_at(
+                        &pipeline,
+                        &[buf.binding(), out.binding()],
+                        &[&u32_bytes(mode), &u32_bytes(iters), &u32_bytes(span)],
+                        Grid::Threadgroups {
+                            groups: (groups, 1, 1),
+                            threadgroup: (tg, 1, 1),
+                        },
+                    )
+                    .unwrap();
+                    pass.level_barrier(&[&out]).unwrap();
+                }
+                let start = std::time::Instant::now();
+                pass.commit_wait().expect("commit");
+                best = best.min(start.elapsed().as_secs_f64() / reps as f64);
+            }
+            eprintln!(
+                "subgroups {:5} pattern {mode}: {:8.1} us, {:7.1} ns per trip",
+                groups * tg / 32,
+                best * 1e6,
+                best * 1e9 / iters as f64,
+            );
         }
     }
 }

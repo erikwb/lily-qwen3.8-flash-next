@@ -329,6 +329,15 @@ fn kernel_profile_report(passes: &[PassProfile]) -> serde_json::Value {
     serde_json::Value::Array(tables)
 }
 
+/// A point of the loop's host work in the backend's trace (`LILY_VK_TRACE`).
+#[cfg(target_os = "linux")]
+fn mark(name: &'static str) {
+    lily::metal::trace::mark(name);
+}
+
+#[cfg(not(target_os = "linux"))]
+fn mark(_name: &'static str) {}
+
 /// Encodes, prepares and commits one step (no lookahead): the warm-up cadence.
 fn submit_step<'a, M: LanguageModel>(
     model: &M,
@@ -392,10 +401,12 @@ fn deliver<'a, M: LanguageModel>(
     encoded: Option<EncodedPass<'a>>,
     prepare_secs: &mut Vec<f64>,
 ) -> Result<(u32, PendingPass<'a>)> {
+    mark("deliver");
     let token = scratch.next_token().view(index % 2, &[1])?.to_u32()?[0];
     let prepare_started = Instant::now();
     model.prepare_step_inputs(state, scratch, token)?;
     prepare_secs.push(prepare_started.elapsed().as_secs_f64());
+    mark("prepared");
     let next = match (parked, encoded) {
         (Some(pass), _) => {
             model.release_parked(scratch)?;
@@ -408,6 +419,7 @@ fn deliver<'a, M: LanguageModel>(
         }
         (None, None) => anyhow::bail!("no next step staged"),
     };
+    mark("released");
     Ok((token, next))
 }
 
@@ -551,8 +563,10 @@ fn bench<M: LanguageModel>(cli: &Cli) -> Result<()> {
         });
     for index in 1..cli.decode_steps {
         let levels_before = profile::levels();
+        mark("stage");
         let (parked, encoded) =
             stage_next(&model, &ctx, &mut state, &scratch, index, parking)?;
+        mark("staged");
         if cli.gpu_timing && index == 1 {
             eprintln!("levels per step: {}", profile::levels() - levels_before);
         }

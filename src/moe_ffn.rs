@@ -36,6 +36,25 @@ pub(crate) fn project_stack_fused(
     stack_c: &Tensor,
     widths: &[usize],
 ) -> Result<Option<Tensor>> {
+    let Some(c) = stack_fused_view(a, stack_w, stack_c, widths)? else {
+        return Ok(None);
+    };
+    if stack_w.bits == 4 {
+        skinny::gemm_skinny_q4_nt(ctx, pass, a, stack_w, &c)?;
+    } else {
+        skinny::gemm_skinny_q8_nt(ctx, pass, a, stack_w, &c)?;
+    }
+    Ok(Some(c))
+}
+
+/// Whether [`project_stack_fused`] projects this stack as one skinny GEMM,
+/// and if so the `[m, n_total]` view of `stack_c` it writes.
+pub(crate) fn stack_fused_view(
+    a: &Tensor,
+    stack_w: &LinearWeights,
+    stack_c: &Tensor,
+    widths: &[usize],
+) -> Result<Option<Tensor>> {
     let m = a.shape()[0];
     let n_total = stack_w.out_features();
     if widths.iter().sum::<usize>() != n_total || !skinny::dense_smallm_routes(m) {
@@ -64,19 +83,19 @@ pub(crate) fn project_stack_fused(
     if !fused {
         return Ok(None);
     }
-    let c = stack_c.view(0, &[m, n_total])?;
-    if stack_w.bits == 4 {
-        skinny::gemm_skinny_q4_nt(ctx, pass, a, stack_w, &c)?;
-    } else {
-        skinny::gemm_skinny_q8_nt(ctx, pass, a, stack_w, &c)?;
-    }
-    Ok(Some(c))
+    Ok(Some(stack_c.view(0, &[m, n_total])?))
 }
 
 /// Projects an already-stacked weight group as one skinny GEMM when eligible
 /// and splits the result into the slice outputs; otherwise dispatches the
 /// corresponding per-slice projections. Keeping both arms here prevents the
 /// fused and fallback projection lists from drifting.
+///
+/// On Vulkan a stack that could go out fused at a register-A row count goes
+/// out as its slices instead (`skinny::stack_as_slices`): dispatches of one
+/// level, the smallest first, each writing its own output, so the level that
+/// splits the fused output is not encoded. The bits are the fused stack's
+/// (`stack_fused_view` admits a stack only where they are).
 pub(crate) fn project_stack_or_slices<const N: usize>(
     ctx: &MetalContext,
     pass: &ComputePass<'_>,
@@ -88,6 +107,17 @@ pub(crate) fn project_stack_or_slices<const N: usize>(
 ) -> Result<()> {
     let m = a.shape()[0];
     let widths: [usize; N] = std::array::from_fn(|i| projections[i].1.numel() / m);
+    if skinny::stack_as_slices(m)
+        && stack_fused_view(a, stack_w, stack_c, &widths)?.is_some()
+    {
+        let mut order: [usize; N] = std::array::from_fn(|i| i);
+        order.sort_by_key(|&i| widths[i]);
+        for i in order {
+            let (w, out) = projections[i];
+            project_mat(ctx, pass, a, w, out, scratch)?;
+        }
+        return Ok(());
+    }
     if let Some(c) = project_stack_fused(ctx, pass, a, stack_w, stack_c, &widths)? {
         pass.level_barrier(&[&c])?;
         let outs: [&Tensor; N] = std::array::from_fn(|i| projections[i].1);
@@ -459,23 +489,64 @@ pub(crate) fn prefill_moe(
     // are encoded alongside the router and the two chains meet at the final
     // gated add.
     let shared = &moe_w.shared;
-    router_project_rows(ctx, pass, &moe_w.gate, io.x, &ms.router_logits, io.dequant)?;
     // The shared expert's gate|up as one stacked GEMM when eligible: its
     // SwiGLU then reads the two halves in place (no split copy).
     let inter_s = io.mlp_gate.numel() / m;
-    let stacked_gu = project_stack_fused(
-        ctx,
-        pass,
-        io.x,
-        &shared.gate_up_proj,
-        io.stack,
-        &[inter_s, inter_s],
-    )?;
-    if stacked_gu.is_none() {
-        project_mat(ctx, pass, io.x, &shared.gate_proj, io.mlp_gate, io.dequant)?;
-        project_mat(ctx, pass, io.x, &shared.up_proj, io.mlp_up, io.dequant)?;
-    }
-    project_mat(ctx, pass, io.x, &moe_w.shared_gate, &ms.shared_gate, io.dequant)?;
+    let stack_view =
+        stack_fused_view(io.x, &shared.gate_up_proj, io.stack, &[inter_s, inter_s])?;
+    // The route `project_mat` gives an 8-bit weight at a small m.
+    let skinny_q8 = |w: &LinearWeights| {
+        skinny::dense_smallm_routes(m)
+            && w.bits == 8
+            && w.group_size.is_multiple_of(8)
+            && w.in_features().is_multiple_of(8)
+    };
+    let stacked_gu = match stack_view {
+        // Where the router, the stack and the shared gate all take the
+        // small-m 8-bit kernel they go out together: one dispatch where the
+        // backend does not overlap a level's dispatches (the same bits).
+        Some(c)
+            if skinny_q8(&moe_w.gate)
+                && skinny_q8(&shared.gate_up_proj)
+                && skinny_q8(&moe_w.shared_gate) =>
+        {
+            skinny::gemm_skinny_q8_nt_sets(
+                ctx,
+                pass,
+                io.x,
+                &[
+                    (&moe_w.gate, &ms.router_logits),
+                    (&shared.gate_up_proj, &c),
+                    (&moe_w.shared_gate, &ms.shared_gate),
+                ],
+            )?;
+            Some(c)
+        }
+        _ => {
+            router_project_rows(
+                ctx,
+                pass,
+                &moe_w.gate,
+                io.x,
+                &ms.router_logits,
+                io.dequant,
+            )?;
+            let stacked_gu = project_stack_fused(
+                ctx,
+                pass,
+                io.x,
+                &shared.gate_up_proj,
+                io.stack,
+                &[inter_s, inter_s],
+            )?;
+            if stacked_gu.is_none() {
+                project_mat(ctx, pass, io.x, &shared.gate_proj, io.mlp_gate, io.dequant)?;
+                project_mat(ctx, pass, io.x, &shared.up_proj, io.mlp_up, io.dequant)?;
+            }
+            project_mat(ctx, pass, io.x, &moe_w.shared_gate, &ms.shared_gate, io.dequant)?;
+            stacked_gu
+        }
+    };
     pass.level_barrier(&[
         &ms.router_logits,
         io.stack,
@@ -698,14 +769,18 @@ pub(crate) fn decode_moe(
     if crate::ablate::on(crate::ablate::Group::Moe) {
         return Ok(());
     }
-    // Level 0 — everything whose only input is `x`.
+    // Level 0 — everything whose only input is `x`: the router's projection
+    // (`router_project_decode`) and the shared expert's, as one dispatch
+    // where the backend does not overlap a level's dispatches.
+    let mut level0: Vec<(&LinearWeights, &Tensor)> = Vec::with_capacity(3);
     if !crate::ablate::on(crate::ablate::Group::Router) {
-        router_project_decode(ctx, pass, &moe_w.gate, io.x, &ms.router_logits)?;
+        level0.push((&moe_w.gate, &ms.router_logits));
     }
     if !crate::ablate::on(crate::ablate::Group::Shared) {
-        quant::gemv_quant(ctx, pass, &shared.gate_up_proj, io.x, io.mlp_gu)?;
-        quant::gemv_quant(ctx, pass, &moe_w.shared_gate, io.x, &ms.shared_gate)?;
+        level0.push((&shared.gate_up_proj, io.mlp_gu));
+        level0.push((&moe_w.shared_gate, &ms.shared_gate));
     }
+    quant::gemv_quant_sets(ctx, pass, io.x, &level0)?;
     pass.level_barrier(&[&ms.router_logits, io.mlp_gu, &ms.shared_gate])?;
 
     // Level 1 — the routing decision, and the shared expert's activation.

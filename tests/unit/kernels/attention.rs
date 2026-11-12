@@ -326,6 +326,27 @@ fn check_sdpa_prefill(
     base_len: usize,
     seed: u64,
 ) {
+    check_sdpa_prefill_with(SDPA_PREFILL_KERNEL, m, nq, kvh, d, max_seq, base_len, seed);
+    // And the kernel sdpa_prefill dispatches on this device, if another.
+    let ctx = MetalContext::new().expect("metal context");
+    let chosen = sdpa_prefill_kernel(&ctx);
+    drop(ctx);
+    if chosen != SDPA_PREFILL_KERNEL {
+        check_sdpa_prefill_with(chosen, m, nq, kvh, d, max_seq, base_len, seed);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_sdpa_prefill_with(
+    kernel: &'static str,
+    m: usize,
+    nq: usize,
+    kvh: usize,
+    d: usize,
+    max_seq: usize,
+    base_len: usize,
+    seed: u64,
+) {
     let ctx = MetalContext::new().expect("metal context");
     let mut rng = StdRng::seed_from_u64(seed);
     let scale = 1.0 / (d as f32).sqrt();
@@ -351,7 +372,23 @@ fn check_sdpa_prefill(
     let out = Tensor::zeros(&ctx, &[m, nq, d], DType::BF16).expect("out");
 
     let pass = ctx.begin().expect("pass");
-    sdpa_prefill(&ctx, &pass, &tq, &tk, &tv, &out, base_len, scale).expect("sdpa");
+    #[cfg(target_os = "linux")]
+    if kernel == SDPA_ROWS_SPLIT {
+        let scratch = Tensor::zeros(
+            &ctx,
+            &[sdpa_rows_split_scratch_numel(m, nq, d, base_len + m)],
+            DType::F32,
+        )
+        .expect("scratch");
+        sdpa_rows_split(&ctx, &pass, &tq, &tk, &tv, &out, base_len, scale, &scratch)
+            .expect("sdpa");
+    } else {
+        sdpa_prefill_with(&ctx, &pass, kernel, &tq, &tk, &tv, &out, base_len.into(), scale)
+            .expect("sdpa");
+    }
+    #[cfg(not(target_os = "linux"))]
+    sdpa_prefill_with(&ctx, &pass, kernel, &tq, &tk, &tv, &out, base_len.into(), scale)
+        .expect("sdpa");
     pass.commit_wait().expect("commit");
 
     let (rq, rk, rv) =
@@ -399,6 +436,229 @@ fn sdpa_prefill_matches_cpu_causal() {
     check_sdpa_prefill(16, 8, 2, 256, 64, 0, 23);
     check_sdpa_prefill(40, 4, 2, 256, 128, 9, 24);
     check_sdpa_prefill(33, 8, 2, 256, 96, 47, 25);
+}
+
+/// The name [`check_sdpa_prefill_with`] takes for [`sdpa_rows_split`].
+#[cfg(target_os = "linux")]
+const SDPA_ROWS_SPLIT: &str = "sdpa_rows_split";
+
+/// The split few-row route against the CPU: one row and a full tile, a
+/// length inside the first key tile, lengths on and off the 128-key splits
+/// (the last split holding only the chunk's last keys, so the earlier rows
+/// see none of it), one and several heads per key head.
+#[cfg(target_os = "linux")]
+#[test]
+fn sdpa_rows_split_matches_cpu_causal() {
+    check_sdpa_prefill_with(SDPA_ROWS_SPLIT, 3, 4, 2, FA_D, 64, 9, 41);
+    check_sdpa_prefill_with(SDPA_ROWS_SPLIT, 1, 8, 2, FA_D, 512, 300, 42);
+    check_sdpa_prefill_with(SDPA_ROWS_SPLIT, 3, 24, 2, FA_D, 1280, 1097, 43);
+    check_sdpa_prefill_with(SDPA_ROWS_SPLIT, 3, 4, 1, FA_D, 512, 254, 44);
+    check_sdpa_prefill_with(SDPA_ROWS_SPLIT, 4, 4, 2, FA_D, 512, 128, 45);
+    check_sdpa_prefill_with(SDPA_ROWS_SPLIT, 16, 8, 2, FA_D, 512, 200, 46);
+}
+
+/// The first port of the dense prefill kernel (`tests/vulkan/attention_test.comp`).
+#[cfg(target_os = "linux")]
+const SDPA_PREFILL_FIRST_PORT: &str = "sdpa_prefill_nax_qdev128_ref";
+
+/// The shipped prefill kernel against its first port: the same arithmetic in
+/// the same order, however the operands are loaded, so every output matches
+/// bit for bit. Few rows (the verify pass of speculative decode), query
+/// tiles on both sides of an edge, key tiles across the causal diagonal and
+/// the cache's last row, one and several heads per key head.
+#[cfg(target_os = "linux")]
+#[test]
+fn sdpa_prefill_bit_identical_to_first_port() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(31);
+    let d = FA_D;
+    for (m, nq, kvh, max_seq, base_len) in [
+        (1usize, 2usize, 2usize, 64usize, 0usize),
+        (3, 4, 2, 1200, 1100),
+        (6, 4, 2, 64, 9),
+        (16, 8, 2, 64, 0),
+        (17, 4, 1, 300, 250),
+        (40, 4, 2, 128, 9),
+        (33, 8, 2, 96, 47),
+        (130, 2, 1, 400, 270),
+    ] {
+        let rows = |rng: &mut StdRng, n: usize| -> Vec<f32> {
+            (0..n).map(|_| rng.gen_range(-1.0f32..1.0)).collect()
+        };
+        let filled = base_len + m;
+        let mut k = vec![0.0f32; kvh * max_seq * d];
+        let mut v = vec![0.0f32; kvh * max_seq * d];
+        for h in 0..kvh {
+            let at = h * max_seq * d;
+            k[at..at + filled * d].copy_from_slice(&rows(&mut rng, filled * d));
+            v[at..at + filled * d].copy_from_slice(&rows(&mut rng, filled * d));
+        }
+        let tq =
+            Tensor::from_f32_as_bf16(&ctx, &rows(&mut rng, m * nq * d), &[m, nq, d])
+                .expect("q");
+        let tk = Tensor::from_f32_as_bf16(&ctx, &k, &[kvh, max_seq, d]).expect("k");
+        let tv = Tensor::from_f32_as_bf16(&ctx, &v, &[kvh, max_seq, d]).expect("v");
+        let out = Tensor::zeros(&ctx, &[m, nq, d], DType::BF16).expect("out");
+        let first = Tensor::zeros(&ctx, &[m, nq, d], DType::BF16).expect("out");
+        let scale = 1.0 / (d as f32).sqrt();
+        let pass = ctx.begin().expect("pass");
+        sdpa_prefill_with(
+            &ctx,
+            &pass,
+            SDPA_PREFILL_KERNEL,
+            &tq,
+            &tk,
+            &tv,
+            &out,
+            base_len.into(),
+            scale,
+        )
+        .expect("sdpa");
+        sdpa_prefill_with(
+            &ctx,
+            &pass,
+            SDPA_PREFILL_FIRST_PORT,
+            &tq,
+            &tk,
+            &tv,
+            &first,
+            base_len.into(),
+            scale,
+        )
+        .expect("first port");
+        pass.commit_wait().expect("commit");
+        let bits = |t: &Tensor| -> Vec<u32> {
+            t.to_f32().expect("read").iter().map(|x| x.to_bits()).collect()
+        };
+        let (got, want) = (bits(&out), bits(&first));
+        let differ = got.iter().zip(&want).filter(|(g, w)| g != w).count();
+        assert_eq!(
+            differ,
+            0,
+            "M={m} NQ={nq} KVH={kvh} base {base_len}: {differ} of {} outputs differ from the first port",
+            got.len()
+        );
+        assert!(want.iter().any(|&b| b != 0), "M={m}: empty output");
+    }
+}
+
+/// The prefill tile with the scores in registers (src/kernels/vulkan/
+/// attention_cm2.comp, VK_NV_cooperative_matrix2), against the CPU.
+#[cfg(target_os = "linux")]
+const SDPA_PREFILL_CM2: [&str; 2] = ["sdpa_prefill_cm2", "sdpa_prefill_cm2_split"];
+
+/// Whether the device has the cooperative-matrix operations the `_cm2`
+/// kernels use (VK_NV_cooperative_matrix2's conversions, reductions and
+/// per-element operations); their tests are skipped without them.
+#[cfg(target_os = "linux")]
+fn cm2_offered(ctx: &MetalContext, test: &str) -> bool {
+    let offered = ctx.cooperative_matrix_register_ops();
+    if !offered {
+        eprintln!("{test}: skipped, the device lacks VK_NV_cooperative_matrix2's register operations");
+    }
+    offered
+}
+
+/// sdpa_prefill takes the kernel with the scores in registers exactly where
+/// the device has what it needs and LILY_VK_PREFILL_CM2=1 asks for it.
+#[cfg(target_os = "linux")]
+#[test]
+fn sdpa_prefill_kernel_follows_device() {
+    let ctx = MetalContext::new().expect("metal context");
+    let chosen = sdpa_prefill_kernel(&ctx);
+    eprintln!(
+        "register operations {}: sdpa_prefill dispatches {chosen}",
+        ctx.cooperative_matrix_register_ops()
+    );
+    let asked = std::env::var("LILY_VK_PREFILL_CM2").is_ok_and(|v| v == "1");
+    if ctx.cooperative_matrix_register_ops() && asked {
+        assert_eq!(chosen, SDPA_PREFILL_CM2[0]);
+    } else {
+        assert_eq!(chosen, SDPA_PREFILL_KERNEL);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn sdpa_prefill_cm2_matches_cpu_causal() {
+    if !cm2_offered(&MetalContext::new().expect("metal context"), "sdpa_prefill_cm2_matches_cpu_causal") {
+        return;
+    }
+    for kernel in SDPA_PREFILL_CM2 {
+        check_sdpa_prefill_with(kernel, 6, 4, 2, FA_D, 64, 9, 22);
+        check_sdpa_prefill_with(kernel, 16, 8, 2, 256, 64, 0, 23);
+        check_sdpa_prefill_with(kernel, 40, 4, 2, 256, 128, 9, 24);
+        check_sdpa_prefill_with(kernel, 33, 8, 2, 256, 96, 47, 25);
+        check_sdpa_prefill_with(kernel, 3, 24, 2, 256, 1200, 1097, 26);
+        check_sdpa_prefill_with(kernel, 130, 2, 1, 256, 400, 270, 27);
+    }
+}
+
+/// GPU time of one layer's prefill attention, the shipped kernel against
+/// those with the scores in registers: a long chunk from an empty cache, and
+/// the three rows of a speculative verify over a long one.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "timing; run with --nocapture"]
+fn sdpa_prefill_cm2_timing() {
+    let ctx = MetalContext::new().expect("metal context");
+    if !cm2_offered(&ctx, "sdpa_prefill_cm2_timing") {
+        return;
+    }
+    let (nq, kvh, d) = (24usize, 2usize, 256usize);
+    let mut rng = StdRng::seed_from_u64(11);
+    let cap = 4096;
+    let fill = |n: usize, rng: &mut StdRng| -> Vec<f32> {
+        (0..n).map(|_| rng.gen_range(-1.0f32..1.0)).collect()
+    };
+    let k = Tensor::from_f32_as_bf16(&ctx, &fill(kvh * cap * d, &mut rng), &[kvh, cap, d])
+        .expect("k");
+    let v = Tensor::from_f32_as_bf16(&ctx, &fill(kvh * cap * d, &mut rng), &[kvh, cap, d])
+        .expect("v");
+    let kernels = [SDPA_PREFILL_KERNEL, SDPA_PREFILL_CM2[0], SDPA_PREFILL_CM2[1]];
+    for (m, len, layers) in [
+        (2048usize, 2048usize, 4usize),
+        (1024, 1024, 4),
+        (512, 2048, 4),
+        (3, 1100, 24),
+        (3, 2048, 24),
+        (3, 4096, 24),
+    ] {
+        let q = Tensor::from_f32_as_bf16(&ctx, &fill(m * nq * d, &mut rng), &[m, nq, d])
+            .expect("q");
+        let out: Vec<Tensor> = kernels
+            .iter()
+            .map(|_| Tensor::zeros(&ctx, &[m, nq, d], DType::BF16).expect("out"))
+            .collect();
+        let mut best = vec![f64::MAX; kernels.len()];
+        for round in 0..6 {
+            for (i, kernel) in kernels.iter().enumerate() {
+                let pass = ctx.begin().expect("pass");
+                for _ in 0..layers {
+                    sdpa_prefill_with(&ctx, &pass, kernel, &q, &k, &v, &out[i], (len - m).into(), 0.0625)
+                        .expect(kernel);
+                    pass.level_barrier(&[&out[i]]).expect("barrier");
+                }
+                let done = pass.commit().expect("commit").wait_retain().expect("wait");
+                let t = done.timing().expect("timing");
+                if round > 0 {
+                    best[i] = best[i].min((t.gpu_end_secs - t.gpu_start_secs) / layers as f64);
+                }
+            }
+        }
+        let first = out[0].to_f32().expect("read");
+        let mut line = format!("sdpa prefill m={m} len={len}:");
+        for (i, kernel) in kernels.iter().enumerate() {
+            let other = out[i].to_f32().expect("read");
+            let diff = first.iter().zip(&other).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+            line += &format!(
+                " {kernel} {:.1} us ({:.2}x, max |diff| {diff:.4});",
+                best[i] * 1e6,
+                best[0] / best[i]
+            );
+        }
+        eprintln!("{line}");
+    }
 }
 
 #[test]
@@ -452,7 +712,7 @@ fn sdpa_small_m_timing() {
         let partials =
             Tensor::zeros(&ctx, &[nq, splits, d], DType::F32).expect("partials");
         let stats = Tensor::zeros(&ctx, &[nq, splits, 2], DType::F32).expect("stats");
-        for m in [1usize, 2, 4] {
+        for m in [1usize, 3, 4, 512] {
             let q = Tensor::from_f32_as_bf16(
                 &ctx,
                 &(0..m * nq * d)
@@ -462,9 +722,26 @@ fn sdpa_small_m_timing() {
             )
             .expect("q");
             let out = Tensor::zeros(&ctx, &[m, nq, d], DType::BF16).expect("out");
-            for variant in ["prefill", "decode-per-row"] {
+            #[cfg(target_os = "linux")]
+            let variants = ["prefill", "split", "first-port", "decode-per-row"];
+            #[cfg(not(target_os = "linux"))]
+            let variants = ["prefill", "decode-per-row"];
+            for variant in variants {
+                // A dispatch pair per row and layer is not a route for a chunk.
+                if (variant == "decode-per-row" && m > 4)
+                    || (variant == "split" && m > SDPA_ROWS_SPLIT_MAX_ROWS)
+                {
+                    continue;
+                }
+                #[cfg(target_os = "linux")]
+                let rows_scratch = Tensor::zeros(
+                    &ctx,
+                    &[sdpa_rows_split_scratch_numel(m.min(16), nq, d, len)],
+                    DType::F32,
+                )
+                .expect("scratch");
                 let mut best = f64::MAX;
-                for _ in 0..3 {
+                for _ in 0..5 {
                     let pass = ctx.begin_concurrent().expect("pass");
                     for _ in 0..layers {
                         if variant == "prefill" {
@@ -479,6 +756,34 @@ fn sdpa_small_m_timing() {
                                 0.0625,
                             )
                             .expect("prefill");
+                        } else if variant == "split" {
+                            #[cfg(target_os = "linux")]
+                            sdpa_rows_split(
+                                &ctx,
+                                &pass,
+                                &q,
+                                &k,
+                                &v,
+                                &out,
+                                len - m,
+                                0.0625,
+                                &rows_scratch,
+                            )
+                            .expect("split");
+                        } else if variant == "first-port" {
+                            #[cfg(target_os = "linux")]
+                            sdpa_prefill_with(
+                                &ctx,
+                                &pass,
+                                SDPA_PREFILL_FIRST_PORT,
+                                &q,
+                                &k,
+                                &v,
+                                &out,
+                                (len - m).into(),
+                                0.0625,
+                            )
+                            .expect("first port");
                         } else {
                             for r in 0..m {
                                 let qr = q.view(r * nq * d, &[nq, d]).expect("q row");
@@ -773,4 +1078,113 @@ fn q8_caches_are_refused_where_no_q8_kernel_reads_them() {
     let bare = Kv { values: &q8.values, scales: None };
     assert!(sdpa_decode(&ctx, &pass, &q, bare, bare, &out, 10, 1.0, scratch).is_err());
     pass.commit_wait().expect("commit");
+}
+
+// --- cooperative matrix operations in registers (VK_NV_cooperative_matrix2) ---
+
+/// tests/vulkan/cm2_test.comp, one subgroup on one 16x16 block of values a
+/// bfloat and a half hold exactly (and every sum of them a float does).
+#[cfg(target_os = "linux")]
+#[test]
+fn cm2_register_ops_are_exact() {
+    let ctx = MetalContext::new().expect("metal context");
+    if !cm2_offered(&ctx, "cm2_register_ops_are_exact") {
+        return;
+    }
+    let x: Vec<f32> = (0..256).map(|i| ((i * 37) % 256) as f32 / 4.0 - 32.0).collect();
+    let at = |r: usize, c: usize| x[r * 16 + c];
+    let tx = Tensor::from_f32(&ctx, &x, &[256]).expect("x");
+    let out = Tensor::zeros(&ctx, &[11 * 256], DType::F32).expect("out");
+    let pipeline = ctx.pipeline("cm2_ops_test", SOURCE, MslVersion::V4_0).expect("pipeline");
+    let pass = ctx.begin().expect("pass");
+    pass.dispatch_with(
+        &pipeline,
+        &[tx.binding(), out.binding()],
+        &[],
+        Grid::Threadgroups { groups: (1, 1, 1), threadgroup: (32, 1, 1) },
+    )
+    .expect("dispatch");
+    pass.commit_wait().expect("commit");
+    let got = out.to_f32().expect("read");
+
+    let mut want = vec![0.0f32; 11 * 256];
+    let total_max = x.iter().cloned().fold(f32::MIN, f32::max);
+    for r in 0..16 {
+        let row_sum: f32 = (0..16).map(|c| at(r, c)).sum();
+        let row_max = (0..16).map(|c| at(r, c)).fold(f32::MIN, f32::max);
+        for c in 0..16 {
+            let col_sum: f32 = (0..16).map(|k| at(k, c)).sum();
+            let tagged = at(r, c) + (r * 100 + c) as f32;
+            want[r * 16 + c] = row_sum;
+            want[256 + r * 16 + c] = row_max;
+            want[2 * 256 + r * 16 + c] = col_sum;
+            want[3 * 256 + r * 16 + c] = total_max;
+            want[5 * 256 + r * 16 + c] = tagged;
+            want[6 * 256 + r * 16 + c] = at(r, c) * 3.0 + tagged;
+            want[7 * 256 + r * 16 + c] = at(r, c);
+            want[8 * 256 + r * 16 + c] = at(r, c);
+            want[9 * 256 + r * 16 + c] = at(c, r);
+            want[10 * 256 + r * 16 + c] = at(r, c);
+        }
+    }
+    for r in 0..8 {
+        for c in 0..8 {
+            want[4 * 256 + r * 8 + c] =
+                at(2 * r, 2 * c) + at(2 * r, 2 * c + 1) + at(2 * r + 1, 2 * c) + at(2 * r + 1, 2 * c + 1);
+        }
+    }
+    let names = [
+        "row sum", "row max", "column sum", "max", "2x2 sum", "per-element (row, col)",
+        "per-element with a matrix", "to A", "to B", "transposed to B", "to half A",
+    ];
+    let mut bad = Vec::new();
+    for (i, name) in names.iter().enumerate() {
+        let n = if i == 4 { 64 } else { 256 };
+        let wrong = (0..n).filter(|&j| got[i * 256 + j] != want[i * 256 + j]).count();
+        if wrong > 0 {
+            let j = (0..n).find(|&j| got[i * 256 + j] != want[i * 256 + j]).unwrap();
+            bad.push(format!(
+                "{name}: {wrong} wrong, first [{j}] {} != {}",
+                got[i * 256 + j],
+                want[i * 256 + j]
+            ));
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("; "));
+}
+
+/// tests/vulkan/cm2_pairing_test.comp: a 16x64 accumulator converted to an A
+/// operand times a 64x16 B operand read by a tensor load, exact. It also
+/// needs the extension's flexible dimensions and tensor addressing, which
+/// every driver with its register operations here has.
+#[cfg(target_os = "linux")]
+#[test]
+fn cm2_converted_operand_times_tensor_load_is_exact() {
+    let ctx = MetalContext::new().expect("metal context");
+    if !cm2_offered(&ctx, "cm2_converted_operand_times_tensor_load_is_exact") {
+        return;
+    }
+    let x: Vec<f32> = (0..16 * 64).map(|i| ((i * 7) % 9) as f32 - 4.0).collect();
+    let y: Vec<f32> = (0..64 * 16).map(|i| ((i * 5) % 7) as f32 - 3.0).collect();
+    let tx = Tensor::from_f32(&ctx, &x, &[16 * 64]).expect("x");
+    let ty = Tensor::from_f32_as_bf16(&ctx, &y, &[64 * 16]).expect("y");
+    let out = Tensor::zeros(&ctx, &[256], DType::F32).expect("out");
+    let pipeline =
+        ctx.pipeline("cm2_convert_pairing_test", SOURCE, MslVersion::V4_0).expect("pipeline");
+    let pass = ctx.begin().expect("pass");
+    pass.dispatch_with(
+        &pipeline,
+        &[tx.binding(), ty.binding(), out.binding()],
+        &[],
+        Grid::Threadgroups { groups: (1, 1, 1), threadgroup: (32, 1, 1) },
+    )
+    .expect("dispatch");
+    pass.commit_wait().expect("commit");
+    let got = out.to_f32().expect("read");
+    let want: Vec<f32> = (0..256)
+        .map(|i| (0..64).map(|k| x[(i / 16) * 64 + k] * y[k * 16 + i % 16]).sum())
+        .collect();
+    let wrong = (0..256).filter(|&i| got[i] != want[i]).count();
+    let first = (0..256).find(|&i| got[i] != want[i]).map(|i| (i, got[i], want[i]));
+    assert_eq!(wrong, 0, "{wrong} wrong, first (index, got, want) {first:?}");
 }

@@ -336,6 +336,7 @@ fn load_mlp(
 }
 
 /// Physical memory of this machine in bytes (`hw.memsize`).
+#[cfg(target_os = "macos")]
 pub(crate) fn physical_memory() -> Option<u64> {
     let mut size: u64 = 0;
     let mut len = std::mem::size_of::<u64>();
@@ -351,6 +352,20 @@ pub(crate) fn physical_memory() -> Option<u64> {
         )
     };
     (rc == 0 && len == std::mem::size_of::<u64>()).then_some(size)
+}
+
+/// Physical memory of this machine in bytes: the physical pages times the
+/// page size, the RAM the kernel manages (`MemTotal` in `/proc/meminfo`,
+/// which leaves out what the firmware and the kernel image reserved, a few
+/// hundred MB below the installed size that `hw.memsize` reports on macOS).
+#[cfg(target_os = "linux")]
+pub(crate) fn physical_memory() -> Option<u64> {
+    // SAFETY: sysconf has no preconditions.
+    let (pages, page) = unsafe {
+        (libc::sysconf(libc::_SC_PHYS_PAGES), libc::sysconf(libc::_SC_PAGESIZE))
+    };
+    let (pages, page) = (u64::try_from(pages).ok()?, u64::try_from(page).ok()?);
+    pages.checked_mul(page).filter(|&bytes| bytes > 0)
 }
 
 /// What the plan keeps free of `ram` for the OS, other apps and the page

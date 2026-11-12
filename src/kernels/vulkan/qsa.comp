@@ -1,0 +1,940 @@
+#version 460
+// The kernels of src/kernels/metal/qsa.metal: Qwen Sparse Attention, the
+// lightning indexer (query prep, raw-key cache, block keys, block scores,
+// top-k block selection) and the sparse attention over the selected tokens.
+// The comments there say why each kernel is as it is; a comment here marks
+// where the port differs.
+#include "common.glsl"
+#include "qsa_common.glsl"
+
+#define TG 256
+#define QSA_SPLIT 256      // largest split (tokens per threadgroup) of the split kernel
+#define QSA_HPP 4          // query heads folded per K/V pass
+#define QSA_SELECT_TG 512  // threads of the per-query top-k selection
+
+const float INFINITY = 1.0 / 0.0;
+
+// Complete blocks visible to the query at position `pos`.
+uint qsa_visible_blocks(uint pos, uint ratio) {
+    return (pos + 1) / ratio;
+}
+
+// The four bfloats of two words of a wide load, as a float4 (Metal:
+// float4(as_type<bfloat4>(...)) of half a uint4): a bfloat is the high half
+// of its float.
+vec4 qsa_bf16x4(uvec2 w) {
+    return uintBitsToFloat(uvec4(w.x << 16, w.x & 0xFFFF0000u, w.y << 16, w.y & 0xFFFF0000u));
+}
+
+// --- Indexer projections --------------------------------------------------------
+
+#if defined(KERNEL_qsa_prep_q_bf16) || defined(KERNEL_qsa_prep_q_mrope_bf16) || \
+    defined(KERNEL_qsa_block_keys_bf16) || defined(KERNEL_qsa_block_keys_mrope_bf16)
+shared float partial[TG / 32];
+shared float inv_rms;
+shared bfloat16_t normed[TG];
+
+float qsa_rope_position(uint seq_index, int rope_delta) {
+    return float(int(seq_index) + rope_delta);
+}
+
+uint qsa_mrope_axis(uint j, uint sec_h_end, uint sec_w_end) {
+    uint axis = j % 3;
+    if (axis == 1) return j < sec_h_end ? 1u : 0u;
+    if (axis == 2) return j < sec_w_end ? 2u : 0u;
+    return 0u;
+}
+
+// RMSNorm(+1) of one D-wide row held in `value` per thread into `normed`.
+// The scalar and the M-RoPE kernels must agree bit for bit, so the
+// arithmetic is `precise` (one order, no contraction) in both.
+void qsa_norm_row(float value, BF16 w, uint D, float eps) {
+    uint tid = thread_index_in_threadgroup;
+    precise float acc = subgroupAdd(value * value);
+    if (thread_index_in_simdgroup == 0) partial[simdgroup_index_in_threadgroup] = acc;
+    barrier();
+    if (tid == 0) {
+        precise float total = 0.0;
+        for (uint i = 0; i < (D + 31) / 32; ++i) total += partial[i];
+        precise float rms = inversesqrt(total / float(D) + eps);
+        inv_rms = rms;
+    }
+    barrier();
+    precise float n = value * inv_rms * (1.0 + float(w.v[tid]));
+    normed[tid] = qsa_bf16(n);
+    barrier();
+}
+
+// The row's partial NeoX RoPE at `position` from `normed` into `dst`: one
+// pair with the reference's bf16 arithmetic (cos/sin, both products and the
+// sum each rounded to bf16), the dims past `rot` copied.
+void qsa_rope_row(BF16 dst, uint rot, float position, float theta) {
+    uint tid = thread_index_in_threadgroup;
+    uint half_rot = rot / 2;
+    if (tid < half_rot) {
+        precise float angle = position * pow(theta, -2.0 * float(tid) / float(rot));
+        precise float c = qsa_round_bf16(cos(angle));
+        precise float s = qsa_round_bf16(sin(angle));
+        precise float l = float(normed[tid]);
+        precise float h = float(normed[half_rot + tid]);
+        precise float lc = l * c, hs = h * s, hc = h * c, ls = l * s;
+        precise float lo = qsa_round_bf16(lc) - qsa_round_bf16(hs);
+        precise float hi = qsa_round_bf16(hc) + qsa_round_bf16(ls);
+        dst.v[tid] = qsa_bf16(lo);
+        dst.v[half_rot + tid] = qsa_bf16(hi);
+    } else if (tid >= rot) {
+        dst.v[tid] = normed[tid];
+    }
+}
+#endif
+
+#if defined(KERNEL_qsa_prep_q_bf16) || defined(KERNEL_qsa_prep_q_mrope_bf16)
+void main() {
+    BF16 w = BF16(arg(1));
+#ifdef KERNEL_qsa_prep_q_mrope_bf16
+    U32 positions = U32(arg(3));
+    uint D = arg_u32(4), NH = arg_u32(5), rot = arg_u32(6), base_pos = arg_u32(7);
+    float theta = arg_f32(8), eps = arg_f32(9);
+    uint pos_base = arg_u32(10), sec_h_end = arg_u32(11), sec_w_end = arg_u32(12);
+#else
+    uint D = arg_u32(3), NH = arg_u32(4), rot = arg_u32(5), base_pos = arg_u32(6);
+    float theta = arg_f32(7), eps = arg_f32(8);
+    int rope_delta = int(arg_u32(9));
+#endif
+    uint seg = threadgroup_position_in_grid.x, tid = thread_index_in_threadgroup;
+    uint row = seg / NH;
+    uint h = seg % NH;
+    BF16 src = BF16(arg(0) + 2 * (uint64_t(row) * (NH + 1) * D + uint64_t(h) * D));
+    BF16 dst = BF16(arg(2) + 2 * uint64_t(seg) * D);
+    qsa_norm_row(float(src.v[tid]), w, D, eps);
+    float position = 0.0;
+    if (tid < rot / 2) {
+#ifdef KERNEL_qsa_prep_q_mrope_bf16
+        uint axis = qsa_mrope_axis(tid, sec_h_end, sec_w_end);
+        position = float(positions.v[(base_pos + row - pos_base) * 3 + axis]);
+#else
+        position = qsa_rope_position(base_pos + row, rope_delta);
+#endif
+    }
+    qsa_rope_row(dst, rot, position, theta);
+}
+#endif
+
+// cache[base_pos + m, :] = qk[m, NH*D ..]: the raw (unnormed, unroped) indexer key.
+#ifdef KERNEL_qsa_scatter_keys_bf16
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    uint D = arg_u32(2), NH = arg_u32(3), base_pos = arg_u32(4);
+    uint d = thread_position_in_grid.x, m = thread_position_in_grid.y;
+    BF16(arg(1) + 2 * uint64_t(base_pos + m) * D).v[d] =
+        BF16(arg(0) + 2 * (uint64_t(m) * (NH + 1) * D + uint64_t(NH) * D)).v[d];
+}
+#endif
+
+#if defined(KERNEL_qsa_block_keys_bf16) || defined(KERNEL_qsa_block_keys_mrope_bf16)
+void main() {
+    uint64_t cache = arg(0);
+    BF16 w = BF16(arg(1));
+#ifdef KERNEL_qsa_block_keys_mrope_bf16
+    U32 positions = U32(arg(3));
+    uint D = arg_u32(4), ratio = arg_u32(5), first_block = arg_u32(6), rot = arg_u32(7);
+    float theta = arg_f32(8), eps = arg_f32(9);
+    uint count = arg_u32(10), pos_base = arg_u32(11);
+    uint sec_h_end = arg_u32(12), sec_w_end = arg_u32(13);
+#else
+    uint D = arg_u32(3), ratio = arg_u32(4), first_block = arg_u32(5), rot = arg_u32(6);
+    float theta = arg_f32(7), eps = arg_f32(8);
+    uint count = arg_u32(9);
+    int rope_delta = int(arg_u32(10));
+#endif
+    uint tg = threadgroup_position_in_grid.x, tid = thread_index_in_threadgroup;
+    if (tg >= count) return;  // uniform per threadgroup
+    uint b = first_block + tg;
+    precise float pooled = 0.0;
+    for (uint i = 0; i < ratio; ++i) pooled += float(BF16(cache + 2 * uint64_t(b * ratio + i) * D).v[tid]);
+    precise float mean = pooled / float(ratio);
+    float value = qsa_round_bf16(mean);
+    qsa_norm_row(value, w, D, eps);
+    float position = 0.0;
+    if (tid < rot / 2) {
+#ifdef KERNEL_qsa_block_keys_mrope_bf16
+        uint axis = qsa_mrope_axis(tid, sec_h_end, sec_w_end);
+        position = float(positions.v[(b * ratio - pos_base) * 3 + axis]);
+#else
+        position = qsa_rope_position(b * ratio, rope_delta);
+#endif
+    }
+    qsa_rope_row(BF16(arg(2) + 2 * uint64_t(b) * D), rot, position, theta);
+}
+#endif
+
+// --- Block scoring and selection --------------------------------------------------
+
+#ifdef KERNEL_qsa_scores_f32
+// The query's heads are staged by float4 (Metal: by float; NH * D <= 512),
+// so a block's eight dims of a head are two loads, and a block's key row is
+// requested QSA_SCORE_KB loads (32 dims) at a time ahead of their dots
+// (Metal: a load, then its dots): a dot waits for the load before it.
+#define QSA_SCORE_KB 4
+shared vec4 qs[4 * 128 / 4];
+void main() {
+    uint64_t q = arg(0), blk = arg(1), scores = arg(2);
+    uint D = arg_u32(3), NH = arg_u32(4), nb_max = arg_u32(5), base_pos = arg_u32(6);
+    uint ratio = arg_u32(7);
+    float inv_sqrt_d = arg_f32(8);
+    uint tid = thread_index_in_threadgroup;
+    uint qi = threadgroup_position_in_grid.y;
+    U32x2 q_row = U32x2(q + 2 * uint64_t(qi) * NH * D);
+    for (uint i = tid; i < NH * D / 4; i += TG) qs[i] = qsa_bf16x4(q_row.v[i]);
+    barrier();
+
+    uint b = threadgroup_position_in_grid.x * TG + tid;
+    if (b >= nb_max) return;
+    uint nb = qsa_visible_blocks(base_pos + qi, ratio);
+    float score = -INFINITY;
+    if (b < nb) {
+        U32x4 krow = U32x4(blk + 2 * uint64_t(b) * D);
+        uint loads = D / 8, head = D / 4;
+        // The four heads' dots as one vector (NH <= 4; a head past NH dots
+        // staged memory nobody wrote and is not summed).
+        vec4 dots = vec4(0.0);
+        for (uint i = 0; i < loads; i += QSA_SCORE_KB) {
+            uvec4 kq[QSA_SCORE_KB];
+            for (uint j = 0; j < QSA_SCORE_KB; ++j) kq[j] = krow.v[min(i + j, loads - 1)];
+            for (uint j = 0; j < QSA_SCORE_KB; ++j) {
+                if (i + j < loads) {
+                    vec4 ka = qsa_bf16x4(kq[j].xy);
+                    vec4 kb = qsa_bf16x4(kq[j].zw);
+                    uint at = 2 * (i + j);
+                    vec4 qa0 = qs[at], qb0 = qs[at + 1];
+                    vec4 qa1 = qs[head + at], qb1 = qs[head + at + 1];
+                    vec4 qa2 = qs[2 * head + at], qb2 = qs[2 * head + at + 1];
+                    vec4 qa3 = qs[3 * head + at], qb3 = qs[3 * head + at + 1];
+                    dots += vec4(dot(ka, qa0) + dot(kb, qb0), dot(ka, qa1) + dot(kb, qb1),
+                                 dot(ka, qa2) + dot(kb, qb2), dot(ka, qa3) + dot(kb, qb3));
+                }
+            }
+        }
+        score = 0.0;
+        for (uint h = 0; h < 4; ++h) {
+            if (h < NH) score += max(dots[h], 0.0);
+        }
+        score *= inv_sqrt_d;
+    }
+    F32(scores + 4 * uint64_t(qi) * nb_max).v[b] = score;
+}
+#endif
+
+#ifdef KERNEL_qsa_select_blocks
+// Two histograms: the one the next pass counts into is cleared while the
+// current pass picks its digit.
+shared uint hist[2][256];
+shared uint sums[QSA_SELECT_TG / 32];
+shared uint prefix_s;
+shared uint k_rem_s;
+
+// Non-negative float scores order like their bit patterns. (The sign of a
+// key is clear: a negative zero or a NaN is key 0, as Metal's max gives.)
+uint qsa_key(float s) {
+    return floatBitsToUint(s > 0.0 ? s : 0.0);
+}
+uvec4 qsa_key(vec4 s) {
+    return floatBitsToUint(mix(vec4(0.0), s, greaterThan(s, vec4(0.0))));
+}
+// The key of block b of a row of nb blocks, or QSA_NO_KEY past the row: a
+// value below every key as a signed number, with a top digit no key has.
+const uint QSA_NO_KEY = 0x80000000u;
+uint qsa_key_at(F32 row, uint b, uint nb) {
+    float s = row.v[min(b, nb - 1)];
+    return b < nb ? qsa_key(s) : QSA_NO_KEY;
+}
+
+// Exclusive prefix sum of one value per thread over the whole threadgroup
+// (the sum must fit 32 bits); returns this thread's rank and writes the
+// total. Consecutive scans need a threadgroup barrier between them (`sums`
+// is rewritten by the next call).
+uint qsa_scan(uint value, out uint total) {
+    uint sg = simdgroup_index_in_threadgroup, lane = thread_index_in_simdgroup;
+    uint local = subgroupExclusiveAdd(value);
+    uint sg_total = subgroupAdd(value);
+    if (lane == 0) sums[sg] = sg_total;
+    barrier();
+    // Lane s holds subgroup s's total: the sum over the lanes below this
+    // subgroup's is its offset (Metal: a scan over the lanes and a shuffle
+    // from lane `sg`, which is several instructions on this driver).
+    uint mine = sums[lane & (QSA_SELECT_TG / 32 - 1)];
+    if (lane >= QSA_SELECT_TG / 32) mine = 0u;
+    uint before = subgroupAdd(lane < sg ? mine : 0u);
+    total = subgroupAdd(mine);
+    return before + local;
+}
+
+#define QSA_KEYS_4(M, i) M(i) M(i + 1) M(i + 2) M(i + 3)
+#define QSA_KEYS_8(M, i) QSA_KEYS_4(M, i) QSA_KEYS_4(M, i + 4)
+#define QSA_KEYS_16(M, i) QSA_KEYS_8(M, i) QSA_KEYS_8(M, i + 8)
+
+#define QSA_CACHE 4
+#define QSA_EACH_KEY(M) QSA_KEYS_4(M, 0)
+#define QSA_EACH_QUAD(M) M(0)
+#define QSA_SELECT_BODY qsa_select_body_4
+#include "qsa_select.glsl"
+#undef QSA_CACHE
+#undef QSA_EACH_KEY
+#undef QSA_EACH_QUAD
+#undef QSA_SELECT_BODY
+#define QSA_CACHE 8
+#define QSA_EACH_KEY(M) QSA_KEYS_8(M, 0)
+#define QSA_EACH_QUAD(M) M(0) M(1)
+#define QSA_SELECT_BODY qsa_select_body_8
+#include "qsa_select.glsl"
+#undef QSA_CACHE
+#undef QSA_EACH_KEY
+#undef QSA_EACH_QUAD
+#undef QSA_SELECT_BODY
+// The largest register cache, which also takes the rows of more than one
+// chunk (past 32K tokens at ratio 4). The Metal kernel has an instance of
+// 32 blocks per thread above it; here one measured slower than two chunks
+// of this one (25 against 18 us at 64K tokens).
+#define QSA_CACHE 16
+#define QSA_SELECT_CHUNKS
+#define QSA_EACH_KEY(M) QSA_KEYS_16(M, 0)
+#define QSA_EACH_QUAD(M) M(0) M(1) M(2) M(3)
+#define QSA_SELECT_BODY qsa_select_body_16
+#include "qsa_select.glsl"
+#undef QSA_CACHE
+#undef QSA_SELECT_CHUNKS
+#undef QSA_EACH_KEY
+#undef QSA_EACH_QUAD
+#undef QSA_SELECT_BODY
+
+void main() {
+    uint nb_max = arg_u32(3), base_pos = arg_u32(4), ratio = arg_u32(5), k_max = arg_u32(6);
+    uint qi = threadgroup_position_in_grid.x, tid = thread_index_in_threadgroup;
+    uint nb = qsa_visible_blocks(base_pos + qi, ratio);
+    F32 row = F32(arg(0) + 4 * uint64_t(qi) * nb_max);
+    U32 sel_row = U32(arg(1) + 4 * uint64_t(qi) * k_max);
+    U32 n_sel = U32(arg(2));
+
+    if (nb <= k_max) {
+        for (uint b = tid; b < nb; b += QSA_SELECT_TG) sel_row.v[b] = b;
+        if (tid == 0) n_sel.v[qi] = nb;
+        return;
+    }
+    if (nb <= 4 * QSA_SELECT_TG) {
+        qsa_select_body_4(row, sel_row, nb, k_max);
+    } else if (nb <= 8 * QSA_SELECT_TG) {
+        qsa_select_body_8(row, sel_row, nb, k_max);
+    } else {
+        qsa_select_body_16(row, sel_row, nb, k_max);
+    }
+    if (tid == 0) n_sel.v[qi] = k_max;
+}
+#endif
+
+// --- Sparse attention -----------------------------------------------------------
+
+// Cache position of the i-th attended token of a query: selected blocks
+// expand to `ratio` consecutive tokens, then the incomplete tail follows.
+// (The block id is read at a clamped index, so the load is unconditional
+// and in range for any i.)
+uint qsa_token_at(U32 sel_row, uint nblk, uint ratio, uint tail_start, uint i) {
+    uint in_blocks = nblk * ratio;
+    uint block = i / ratio;
+    uint id = sel_row.v[i < in_blocks ? block : 0u];
+    return i < in_blocks ? id * ratio + (i - block * ratio) : tail_start + (i - in_blocks);
+}
+
+#if defined(KERNEL_qsa_attn_split_bf16) || defined(KERNEL_qsa_attn_split_q8)
+#define QSA_KB 4  // K (then V) rows a subgroup requests per step
+// The threadgroup arrays of the Metal kernel, by vectors: a token's scores
+// of the pass's four heads are one float4 (Metal: scores[head][token]), as
+// are a subgroup's four maxima and sums, and a lane's eight staged V
+// partials are two float4s, which the first 64 threads reduce four dims at a
+// time (Metal: every thread one dim). Each value is computed and summed in
+// the Metal kernel's order; the staging takes a quarter of the loads and
+// stores. A pass of fewer than four heads (a GQA group that is not a
+// multiple of four) runs the missing ones on a zero query and writes
+// nothing for them.
+shared vec4 scores[QSA_SPLIT];
+shared vec4 part[TG / 32];
+shared vec4 part_sum[TG / 32];
+shared vec4 red;
+shared uint tok[QSA_SPLIT];
+shared vec4 v_stage[2][(TG / 32) * 64];
+
+#ifdef KERNEL_qsa_attn_split_q8
+#define QSA_Q8_ARGS 2
+#else
+#define QSA_Q8_ARGS 0
+#endif
+
+void main() {
+    uint64_t q = arg(0);
+    U32 n_sel = U32(arg(4 + QSA_Q8_ARGS));
+    uint64_t partials = arg(5 + QSA_Q8_ARGS), stats = arg(6 + QSA_Q8_ARGS);
+    uint D = arg_u32(7 + QSA_Q8_ARGS), max_seq = arg_u32(8 + QSA_Q8_ARGS);
+    uint group = arg_u32(9 + QSA_Q8_ARGS), splits = arg_u32(10 + QSA_Q8_ARGS);
+    uint k_max = arg_u32(11 + QSA_Q8_ARGS), ratio = arg_u32(12 + QSA_Q8_ARGS);
+    uint base_pos = arg_u32(13 + QSA_Q8_ARGS);
+    float scale = arg_f32(14 + QSA_Q8_ARGS);
+    uint NQ = arg_u32(15 + QSA_Q8_ARGS), split = arg_u32(16 + QSA_Q8_ARGS);
+    uint head_groups = arg_u32(17 + QSA_Q8_ARGS);
+    uint tid = thread_index_in_threadgroup;
+    uint sg = simdgroup_index_in_threadgroup, lane = thread_index_in_simdgroup;
+
+    uint kh = threadgroup_position_in_grid.x / head_groups;
+    uint hg = threadgroup_position_in_grid.x - kh * head_groups;
+    uint split_idx = threadgroup_position_in_grid.y;
+    uint qi = threadgroup_position_in_grid.z;
+    uint pos = base_pos + qi;
+    uint nblk = n_sel.v[qi];
+    uint tail_start = qsa_visible_blocks(pos, ratio) * ratio;
+    uint total = nblk * ratio + (pos + 1 - tail_start);
+    uint slot0 = split_idx * split;
+    uint count = slot0 < total ? min(split, total - slot0) : 0;
+    uint h_begin = hg * QSA_HPP;
+    uint h_end = head_groups == 1 ? group : min(h_begin + QSA_HPP, group);
+    U32 sel_row = U32(arg(3 + QSA_Q8_ARGS) + 4 * uint64_t(qi) * k_max);
+    // A lane's eight dims of a row are one load: the row's index is 32 bits
+    // (rows of 16 or 8 bytes times 32 lanes), the head's offset is in the
+    // address.
+    uint row_step = D / 8;
+#ifdef KERNEL_qsa_attn_split_q8
+    U32x2 k_head = U32x2(arg(1) + uint64_t(kh) * max_seq * D);
+    U32x2 v_head = U32x2(arg(2) + uint64_t(kh) * max_seq * D);
+    F16 ks_head = F16(arg(3) + 2 * uint64_t(kh) * max_seq * (D / 32));
+    F16 vs_head = F16(arg(4) + 2 * uint64_t(kh) * max_seq * (D / 32));
+    uint scale_step = D / 32;
+#else
+    U32x4 k_head = U32x4(arg(1) + 2 * uint64_t(kh) * max_seq * D);
+    U32x4 v_head = U32x4(arg(2) + 2 * uint64_t(kh) * max_seq * D);
+#endif
+    // First query head of the KV head.
+    uint64_t hq0 = uint64_t(qi) * NQ + uint64_t(kh) * group;
+
+    if (count == 0) {
+        if (tid == 0) {
+            for (uint h = h_begin; h < h_end; ++h) {
+                F32 st = F32(stats + 8 * ((hq0 + h) * splits + split_idx));
+                st.v[0] = -INFINITY;
+                st.v[1] = 0.0;
+            }
+        }
+        return;
+    }
+    // The split's cache positions, one dependent load per thread.
+    if (tid < count) tok[tid] = qsa_token_at(sel_row, nblk, ratio, tail_start, slot0 + tid);
+    barrier();
+
+    for (uint h0 = h_begin; h0 < h_end; h0 += QSA_HPP) {
+        uint gh = min(uint(QSA_HPP), h_end - h0);
+        vec4 qa[QSA_HPP];
+        vec4 qb[QSA_HPP];
+        for (uint h = 0; h < QSA_HPP; ++h) {
+            qa[h] = vec4(0.0);
+            qb[h] = vec4(0.0);
+            if (h < gh) {
+                uvec4 qh = U32x4(q + 2 * (hq0 + h0 + h) * D).v[lane];
+                qa[h] = qsa_bf16x4(qh.xy);
+                qb[h] = qsa_bf16x4(qh.zw);
+            }
+        }
+        // The pass's first head's stats and partials of this split; head h's
+        // are h * splits further.
+        F32 st = F32(stats + 8 * ((hq0 + h0) * splits + split_idx));
+        F32x4 part_out = F32x4(partials + 4 * ((hq0 + h0) * splits + split_idx) * D);
+        vec4 local_max = vec4(-INFINITY);
+        // Subgroup sg takes tokens sg, sg + 8, ... in order, QSA_KB rows
+        // requested per step.
+        for (uint p0 = sg; p0 < count; p0 += QSA_KB * (TG / 32)) {
+#ifdef KERNEL_qsa_attn_split_q8
+            uvec2 kq[QSA_KB];
+            float ksc[QSA_KB];
+#else
+            uvec4 kq[QSA_KB];
+#endif
+            for (uint j = 0; j < QSA_KB; ++j) {
+                uint p = p0 + j * (TG / 32);
+                uint token = tok[p < count ? p : p0];
+                kq[j] = k_head.v[token * row_step + lane];
+#ifdef KERNEL_qsa_attn_split_q8
+                ksc[j] = float(ks_head.v[token * scale_step + lane / 4]);
+#endif
+            }
+            for (uint j = 0; j < QSA_KB; ++j) {
+                uint p = p0 + j * (TG / 32);
+                if (p < count) {
+#ifdef KERNEL_qsa_attn_split_q8
+                    vec4 ka = vec4(unpack8(int(kq[j].x))) * ksc[j];
+                    vec4 kb = vec4(unpack8(int(kq[j].y))) * ksc[j];
+#else
+                    vec4 ka = qsa_bf16x4(kq[j].xy);
+                    vec4 kb = qsa_bf16x4(kq[j].zw);
+#endif
+                    vec4 s = subgroupAdd(vec4(dot(ka, qa[0]) + dot(kb, qb[0]),
+                                              dot(ka, qa[1]) + dot(kb, qb[1]),
+                                              dot(ka, qa[2]) + dot(kb, qb[2]),
+                                              dot(ka, qa[3]) + dot(kb, qb[3]))) * scale;
+                    if (lane == 0) scores[p] = s;
+                    local_max = max(local_max, s);
+                }
+            }
+        }
+        vec4 sg_max = subgroupMax(local_max);
+        if (lane == 0) part[sg] = sg_max;
+        barrier();
+        if (tid == 0) {
+            vec4 m = vec4(-INFINITY);
+            for (uint i = 0; i < TG / 32; ++i) m = max(m, part[i]);
+            red = m;
+        }
+        barrier();
+        vec4 chunk_max = red;
+        vec4 e = vec4(0.0);
+        if (tid < count) {
+            e = exp(scores[tid] - chunk_max);
+            scores[tid] = e;
+        }
+        vec4 local_sum = subgroupAdd(e);
+        if (lane == 0) part_sum[sg] = local_sum;
+        barrier();
+        if (tid == 0) {
+            vec4 s = vec4(0.0);
+            for (uint i = 0; i < TG / 32; ++i) s += part_sum[i];
+            for (uint h = 0; h < QSA_HPP; ++h) {
+                if (h < gh) {
+                    st.v[2 * splits * h] = chunk_max[h];
+                    st.v[2 * splits * h + 1] = s[h];
+                }
+            }
+        }
+
+        vec4 acc0[QSA_HPP];
+        vec4 acc1[QSA_HPP];
+        for (uint h = 0; h < QSA_HPP; ++h) {
+            acc0[h] = vec4(0.0);
+            acc1[h] = vec4(0.0);
+        }
+        for (uint p0 = sg; p0 < count; p0 += QSA_KB * (TG / 32)) {
+#ifdef KERNEL_qsa_attn_split_q8
+            uvec2 vq[QSA_KB];
+            float vsc[QSA_KB];
+#else
+            uvec4 vq[QSA_KB];
+#endif
+            for (uint j = 0; j < QSA_KB; ++j) {
+                uint p = p0 + j * (TG / 32);
+                uint token = tok[p < count ? p : p0];
+                vq[j] = v_head.v[token * row_step + lane];
+#ifdef KERNEL_qsa_attn_split_q8
+                vsc[j] = float(vs_head.v[token * scale_step + lane / 4]);
+#endif
+            }
+            for (uint j = 0; j < QSA_KB; ++j) {
+                uint p = p0 + j * (TG / 32);
+                if (p < count) {
+#ifdef KERNEL_qsa_attn_split_q8
+                    vec4 va = vec4(unpack8(int(vq[j].x))) * vsc[j];
+                    vec4 vb = vec4(unpack8(int(vq[j].y))) * vsc[j];
+#else
+                    vec4 va = qsa_bf16x4(vq[j].xy);
+                    vec4 vb = qsa_bf16x4(vq[j].zw);
+#endif
+                    vec4 wgt = scores[p];
+                    acc0[0] += wgt.x * va;
+                    acc1[0] += wgt.x * vb;
+                    acc0[1] += wgt.y * va;
+                    acc1[1] += wgt.y * vb;
+                    acc0[2] += wgt.z * va;
+                    acc1[2] += wgt.z * vb;
+                    acc0[3] += wgt.w * va;
+                    acc1[3] += wgt.w * vb;
+                }
+            }
+        }
+        for (uint hb = 0; hb < QSA_HPP; hb += 2) {
+            if (hb < gh) {
+                uint nh = min(2u, gh - hb);
+                for (uint h = 0; h < 2; ++h) {
+                    v_stage[h][sg * 64 + lane * 2] = acc0[hb + h];
+                    v_stage[h][sg * 64 + lane * 2 + 1] = acc1[hb + h];
+                }
+                barrier();
+                if (tid < 64) {
+                    for (uint h = 0; h < 2; ++h) {
+                        if (h < nh) {
+                            vec4 acc = vec4(0.0);
+                            for (uint s = 0; s < TG / 32; ++s) acc += v_stage[h][s * 64 + tid];
+                            part_out.v[(hb + h) * splits * (D / 4) + tid] = acc;
+                        }
+                    }
+                }
+                barrier();
+            }
+        }
+    }
+}
+#endif
+
+// --- Tensor-op kernels (Metal 4) --------------------------------------------------
+
+#if defined(KERNEL_qsa_scores_nax) || defined(KERNEL_qsa_attn_gqa_nax) || \
+    defined(KERNEL_qsa_attn_gqa_nax_q8)
+#include "matmul.glsl"
+
+// The elements a lane holds of a 16x16 matrix (matmul.glsl has the
+// accumulator's): element e is row QSA_MAT_ROW + (e >> 2) of every matrix,
+// and column 4 * QSA_MAT_QUAD + (e & 3) of a right operand or an
+// accumulator, column QSA_MAT_LEFT_COL + 2 * (e & 3) of a left operand.
+#define QSA_MAT_ROW ((gl_SubgroupInvocationID & 6) | ((gl_SubgroupInvocationID >> 1) & 8))
+#define QSA_MAT_QUAD ((gl_SubgroupInvocationID & 1) | ((gl_SubgroupInvocationID >> 2) & 2))
+#define QSA_MAT_LEFT_COL (((gl_SubgroupInvocationID >> 3) & 1) | ((gl_SubgroupInvocationID & 1) << 3))
+
+// A matrix from the lane's elements: its first row's four, then its second's.
+#define QSA_MAT_FILL(m, lo, hi)                                                              \
+    {                                                                                        \
+        m[0] = lo.x; m[1] = lo.y; m[2] = lo.z; m[3] = lo.w;                                  \
+        m[4] = hi.x; m[5] = hi.y; m[6] = hi.z; m[7] = hi.w;                                  \
+    }
+#endif
+
+// --- Indexer scores on the tensor ops ---------------------------------------------
+//
+// A subgroup's sixteen rows (four queries' four heads) against the
+// threadgroup's QSA_SCORE_BN blocks in eight 16-block products (Metal: four
+// of 32 blocks). The rows' eight K chunks are loaded once and held; each
+// 16-block group then walks K into one accumulator. A score row (query,
+// head) sits in the lanes whose bit 1 is the head's bit 1 and in the
+// element half (e >> 2) that is its bit 0, so the head sum is one in-lane
+// add and one shuffle (Metal: two shuffles), in the same order.
+#ifdef KERNEL_qsa_scores_nax
+#define QSA_SCORE_BN 128
+shared bfloat16_t mat_stage[MAT_STAGE_ELEMENTS(4)];
+// The rows' K chunk k (a ragged last group of queries is staged).
+#define QSA_SCORE_ROWS(k, a)                                                                 \
+    MatA a;                                                                                  \
+    if (rows < 16) {                                                                         \
+        MAT_STAGE(a_rows + 2 * 16 * (k), D, rows, 16u)                                       \
+        MAT_LOAD_STAGED_A(a);                                                                \
+    } else {                                                                                 \
+        MAT_LOAD_A(a, BF16(a_rows).v, 16 * (k), D);                                          \
+    }
+// The blocks' K chunk k (a ragged last group of blocks is staged) and its
+// product.
+#define QSA_SCORE_K(k, a)                                                                    \
+    {                                                                                        \
+        MatB mb;                                                                             \
+        if (cols < 16) {                                                                     \
+            MAT_STAGE(b_rows + 2 * 16 * (k), D, cols, 16u)                                   \
+            MAT_LOAD_STAGED_B(mb);                                                           \
+        } else {                                                                             \
+            MAT_LOAD_B(mb, BF16(b_rows).v, 16 * (k), D);                                     \
+        }                                                                                    \
+        acc = coopMatMulAdd(a, mb, acc);                                                     \
+    }
+void main() {
+    const uint D = 128;
+    uint64_t q = arg(0), blk = arg(1), scores = arg(2);
+    uint nb_max = arg_u32(3), base_pos = arg_u32(4), ratio = arg_u32(5);
+    float inv_sqrt_d = arg_f32(6);
+    uint QB = arg_u32(7);
+    uint lane = thread_index_in_simdgroup;
+    uint q0 = threadgroup_position_in_grid.y * 16 + simdgroup_index_in_threadgroup * 4;
+    if (q0 >= QB) return;  // per subgroup: the kernel has no barriers
+    uint rows = min(16u, (QB - q0) * 4);
+    uint64_t a_rows = q + 2 * uint64_t(q0) * 4 * D;
+    uint cb0 = threadgroup_position_in_grid.x * QSA_SCORE_BN;
+    QSA_SCORE_ROWS(0, a0) QSA_SCORE_ROWS(1, a1) QSA_SCORE_ROWS(2, a2) QSA_SCORE_ROWS(3, a3)
+    QSA_SCORE_ROWS(4, a4) QSA_SCORE_ROWS(5, a5) QSA_SCORE_ROWS(6, a6) QSA_SCORE_ROWS(7, a7)
+
+    uint qi = q0 + ((lane >> 2) & 1) + ((lane >> 3) & 2);
+    bool writer = (lane & 2) == 0 && qi < QB;
+    uint nb = qsa_visible_blocks(base_pos + qi, ratio);
+    F32 row = F32(scores + 4 * uint64_t(qi) * nb_max);
+    for (uint n = 0; n < QSA_SCORE_BN / 16; ++n) {
+        uint cb = cb0 + 16 * n;
+        if (cb >= nb_max) break;
+        uint cols = min(16u, nb_max - cb);
+        uint64_t b_rows = blk + 2 * uint64_t(cb) * D;
+        MatC acc = MatC(0.0);
+        QSA_SCORE_K(0, a0) QSA_SCORE_K(1, a1) QSA_SCORE_K(2, a2) QSA_SCORE_K(3, a3)
+        QSA_SCORE_K(4, a4) QSA_SCORE_K(5, a5) QSA_SCORE_K(6, a6) QSA_SCORE_K(7, a7)
+        vec4 v = max(vec4(acc[0], acc[1], acc[2], acc[3]), 0.0) +
+                 max(vec4(acc[4], acc[5], acc[6], acc[7]), 0.0);
+        v += subgroupShuffleXor(v, 2);
+        if (writer) {
+            for (uint e = 0; e < 4; ++e) {
+                uint b = cb + 4 * QSA_MAT_QUAD + e;
+                if (b < nb_max) row.v[b] = b < nb ? v[e] * inv_sqrt_d : -INFINITY;
+            }
+        }
+    }
+}
+#endif
+
+// --- Per-query tensor-op sparse attention ------------------------------------------
+//
+// The Metal kernel's products are 16 x 32 x 32 with every operand filled
+// from registers; here they are 16 x 16 x 16, a step's 32 keys two blocks of
+// sixteen and a subgroup's 128 head dims eight chunks of sixteen, and the
+// operand layouts differ from Metal's, so the products are arranged for
+// them:
+//
+// - Scores are computed transposed, S^T[key, head] = K[key, dim] Q^T[dim,
+//   head]: as the left operand a lane's two keys' rows each give it four
+//   dims out of eight consecutive ones (one 16-byte load), and Q^T is staged
+//   once per threadgroup in threadgroup memory, [dim][head], where a lane's
+//   four heads of a dim are one 8-byte load.
+// - The outputs are O[head, dim] = P[head, key] V[key, dim]: as the right
+//   operand a lane's two keys' rows give it four consecutive dims (one
+//   8-byte load each), the same two keys per block as for K, so a lane
+//   follows four keys of a step as in the Metal kernel.
+// - P as a left operand holds two heads by four keys of a block; the score
+//   accumulators hold two keys by four heads. The exchange of the two
+//   subgroups' partial scores through threadgroup memory, which the Metal
+//   kernel has, also carries that change of layout: a subgroup writes its
+//   partials [key][head] and each lane reads both subgroups' partials of its
+//   own heads and keys back (Metal: only the other subgroup's).
+//
+// The softmax runs in registers on a lane's two heads as in the Metal
+// kernel, reduced over the four lanes sharing them (lane bits 0 and 3).
+#if defined(KERNEL_qsa_attn_gqa_nax) || defined(KERNEL_qsa_attn_gqa_nax_q8)
+#define QSA_TILE_D 256   // attention head dim the tensor-op kernels are written for
+#define QSA_GQA_DH 128   // head dims per subgroup
+#define QSA_GQA_BK 32    // keys per step
+
+// Partial scores [step parity][subgroup][key][pair of heads], and Q^T
+// [subgroup][dim][four heads], the four bfloats as two words.
+shared vec2 xs[2 * 2 * QSA_GQA_BK * 8];
+shared uvec2 qt[2 * QSA_GQA_DH * 4];
+
+#ifdef KERNEL_qsa_attn_gqa_nax_q8
+#define QSA_Q8_ARGS 2
+// A cache row's values are bytes, each scaled by its 32-dim group's scale
+// and rounded to bf16, the operand type.
+#define QSA_K_ROWS U32x2
+#define QSA_V_ROWS U32
+uint64_t qsa_cache_head(uint index, uint kh, uint max_seq) {
+    return arg(index) + uint64_t(kh) * max_seq * QSA_TILE_D;
+}
+// A left operand's four dims of a row: every other byte of eight.
+bf16vec4 qsa_k4(uvec2 bytes, uint odd, float scale) {
+    ivec2 x = ivec2(bytes << (24 - 8 * odd)) >> 24;
+    ivec2 y = ivec2(bytes << (8 - 8 * odd)) >> 24;
+    return qsa_bf16_finite(vec4(x.x, y.x, x.y, y.y) * scale);
+}
+bf16vec4 qsa_v4(uint bytes, float scale) {
+    return qsa_bf16_finite(vec4(unpack8(int(bytes))) * scale);
+}
+#else
+#define QSA_Q8_ARGS 0
+#define QSA_K_ROWS U32x4
+#define QSA_V_ROWS U32x2
+uint64_t qsa_cache_head(uint index, uint kh, uint max_seq) {
+    return arg(index) + 2 * uint64_t(kh) * max_seq * QSA_TILE_D;
+}
+// A left operand's four dims of a row: every other bfloat of eight.
+bf16vec4 qsa_k4(uvec4 halves, uint odd) {
+    return uintBitsToBFloat16EXT(u16vec4(halves >> (16 * odd)));
+}
+#endif
+
+// The V rows of output chunk c (the lane's two keys of each block, four
+// dims each) and their two products into the chunk's accumulator; a q8
+// group's two chunks share their rows' scales.
+#ifdef KERNEL_qsa_attn_gqa_nax_q8
+#define QSA_PV_SCALES(c2)                                                                    \
+    uvec4 sc_at = tok * (QSA_TILE_D / 32) + sg * 4 + (c2);                                   \
+    vec4 sc = vec4(vs_head.v[sc_at.x], vs_head.v[sc_at.y], vs_head.v[sc_at.z], vs_head.v[sc_at.w]);
+#define QSA_V4(i, comp) qsa_v4(v_head.v[i], sc.comp)
+#else
+#define QSA_PV_SCALES(c2)
+#define QSA_V4(i, comp) qsa_bf16_of_words(v_head.v[i])
+#endif
+#define QSA_PV(c, m)                                                                         \
+    {                                                                                        \
+        uvec4 at = tok * 64 + v_at + 4 * (c);                                                \
+        MatB v0m, v1m;                                                                       \
+        QSA_MAT_FILL(v0m, QSA_V4(at.x, x), QSA_V4(at.y, y))                                  \
+        QSA_MAT_FILL(v1m, QSA_V4(at.z, z), QSA_V4(at.w, w))                                  \
+        m = coopMatMulAdd(p0m, v0m, m);                                                      \
+        m = coopMatMulAdd(p1m, v1m, m);                                                      \
+    }
+#define QSA_PV2(c2, ma, mb)                                                                  \
+    {                                                                                        \
+        QSA_PV_SCALES(c2)                                                                    \
+        QSA_PV(2 * (c2), ma)                                                                 \
+        QSA_PV(2 * (c2) + 1, mb)                                                             \
+    }
+// An accumulator's two heads rescaled by their alphas, and stored.
+#define QSA_RESCALE(m)                                                                       \
+    m[0] *= alpha.x; m[1] *= alpha.x; m[2] *= alpha.x; m[3] *= alpha.x;                      \
+    m[4] *= alpha.y; m[5] *= alpha.y; m[6] *= alpha.y; m[7] *= alpha.y;
+#define QSA_STORE(c, m)                                                                      \
+    if (row < group) out4.v[row * 64 + v_at + 4 * (c)] = qsa_bf16_words(vec4(m[0], m[1], m[2], m[3]) * inv.x); \
+    if (row + 1 < group) out4.v[(row + 1) * 64 + v_at + 4 * (c)] = qsa_bf16_words(vec4(m[4], m[5], m[6], m[7]) * inv.y);
+
+void main() {
+    uint64_t q = arg(0);
+    QSA_K_ROWS k_head;
+    QSA_V_ROWS v_head;
+    U32 n_sel = U32(arg(4 + QSA_Q8_ARGS));
+    uint64_t out_rows = arg(5 + QSA_Q8_ARGS);
+    uint max_seq = arg_u32(6 + QSA_Q8_ARGS), group = arg_u32(7 + QSA_Q8_ARGS);
+    uint k_max = arg_u32(8 + QSA_Q8_ARGS), ratio = arg_u32(9 + QSA_Q8_ARGS);
+    uint base_pos = arg_u32(10 + QSA_Q8_ARGS);
+    float scale = arg_f32(11 + QSA_Q8_ARGS);
+    uint NQ = arg_u32(12 + QSA_Q8_ARGS);
+    uint kh = threadgroup_position_in_grid.x, qi = threadgroup_position_in_grid.y;
+    uint sg = simdgroup_index_in_threadgroup, lane = thread_index_in_simdgroup;
+
+    uint pos = base_pos + qi;
+    uint nblk = n_sel.v[qi];
+    uint tail_start = qsa_visible_blocks(pos, ratio) * ratio;
+    uint in_blocks = nblk * ratio;
+    uint total = in_blocks + (pos + 1 - tail_start);
+    U32 sel_row = U32(arg(3 + QSA_Q8_ARGS) + 4 * uint64_t(qi) * k_max);
+    k_head = QSA_K_ROWS(qsa_cache_head(1, kh, max_seq));
+    v_head = QSA_V_ROWS(qsa_cache_head(2, kh, max_seq));
+#ifdef KERNEL_qsa_attn_gqa_nax_q8
+    F16 ks_head = F16(arg(3) + 2 * uint64_t(kh) * max_seq * (QSA_TILE_D / 32));
+    F16 vs_head = F16(arg(4) + 2 * uint64_t(kh) * max_seq * (QSA_TILE_D / 32));
+#endif
+    // The KV head's query rows and output rows, by four dims (two words).
+    uint64_t group_at = 2 * (uint64_t(qi) * NQ + kh * group) * QSA_TILE_D;
+    U32x2 q4 = U32x2(q + group_at);
+    U32x2 out4 = U32x2(out_rows + group_at);
+
+    // The lane's elements: keys (of K, V and the scores) or heads (of P and
+    // the outputs) row and row + 1, columns by quad or by left_col.
+    uint row = QSA_MAT_ROW, quad = QSA_MAT_QUAD, left_col = QSA_MAT_LEFT_COL;
+    uint odd = left_col & 1;
+    // Where the lane's elements are: a K row's eight dims holding its four
+    // (16-byte loads of a bf16 row, 8-byte of a q8 one, chunk c two
+    // further), a V or output row's four dims (chunk c four further), its
+    // two dims' heads of Q^T (chunk c 64 further).
+    uint k_at = sg * 16 + (left_col >> 3);
+    uint v_at = sg * 32 + quad;
+    uint qt_at = (sg * QSA_GQA_DH + row) * 4 + quad;
+
+    // Q^T: a lane transposes four dims of the sixteen rows (rows past the
+    // group read row 0 and are never written).
+    for (uint hq = 0; hq < 4; ++hq) {
+        uvec2 r[4];
+        for (uint i = 0; i < 4; ++i) {
+            uint head = 4 * hq + i;
+            r[i] = q4.v[(head < group ? head : 0u) * 64 + sg * 32 + lane];
+        }
+        // Dims 0 and 1 are the halves of the rows' first words, 2 and 3 of
+        // their second.
+        uvec4 lo = uvec4(r[0].x, r[1].x, r[2].x, r[3].x), hi = uvec4(r[0].y, r[1].y, r[2].y, r[3].y);
+        uint at = (sg * QSA_GQA_DH + 4 * lane) * 4 + hq;
+        qt[at] = uvec2((lo.x & 0xFFFFu) | (lo.y << 16), (lo.z & 0xFFFFu) | (lo.w << 16));
+        qt[at + 4] = uvec2((lo.x >> 16) | (lo.y & 0xFFFF0000u), (lo.z >> 16) | (lo.w & 0xFFFF0000u));
+        qt[at + 8] = uvec2((hi.x & 0xFFFFu) | (hi.y << 16), (hi.z & 0xFFFFu) | (hi.w << 16));
+        qt[at + 12] = uvec2((hi.x >> 16) | (hi.y & 0xFFFF0000u), (hi.z >> 16) | (hi.w & 0xFFFF0000u));
+    }
+    barrier();
+
+    // The eight output chunks' accumulators, named: an array of them
+    // indexed by a loop's chunk lives in the lane's stack memory.
+    MatC o0 = MatC(0.0), o1 = MatC(0.0), o2 = MatC(0.0), o3 = MatC(0.0);
+    MatC o4 = MatC(0.0), o5 = MatC(0.0), o6 = MatC(0.0), o7 = MatC(0.0);
+    vec2 m_run = vec2(-INFINITY);
+    precise vec2 l_run = vec2(0.0);
+
+    // The cache rows of this lane's keys: keys row and row + 1 of the
+    // step's two blocks; keys past the list read the query's own row, which
+    // is finite. (Metal computes them a step ahead; here the four more
+    // registers that takes cost more than the wait they save.)
+    uvec4 key_at = uvec4(row, row + 1, 16 + row, 17 + row);
+
+    uint parity = 0;
+    for (uint k0 = 0; k0 < total; k0 += QSA_GQA_BK) {
+        uvec4 key = k0 + key_at;
+        uvec4 key_block = key / ratio;
+        bvec4 listed = lessThan(key, uvec4(in_blocks));
+        uvec4 id_at = mix(uvec4(0), key_block, listed);
+        uvec4 id = uvec4(sel_row.v[id_at.x], sel_row.v[id_at.y], sel_row.v[id_at.z], sel_row.v[id_at.w]);
+        uvec4 tail = mix(uvec4(pos), tail_start + (key - in_blocks), lessThan(key, uvec4(total)));
+        uvec4 tok = mix(tail, id * ratio + (key - key_block * ratio), listed);
+        MatC s0 = MatC(0.0), s1 = MatC(0.0);
+        // Scores over the head-dim chunks, two per 32-dim q8 group.
+        for (uint c2 = 0; c2 < 4; ++c2) {
+#ifdef KERNEL_qsa_attn_gqa_nax_q8
+            uvec4 sc_at = tok * (QSA_TILE_D / 32) + sg * 4 + c2;
+            vec4 sc = vec4(ks_head.v[sc_at.x], ks_head.v[sc_at.y], ks_head.v[sc_at.z], ks_head.v[sc_at.w]);
+#endif
+            for (uint c = 2 * c2; c < 2 * c2 + 2; ++c) {
+                MatB qm;
+                QSA_MAT_FILL(qm, qsa_bf16_of_words(qt[qt_at + 64 * c]), qsa_bf16_of_words(qt[qt_at + 64 * c + 4]))
+                uvec4 at = tok * 32 + k_at + 2 * c;
+                MatA k0m, k1m;
+#ifdef KERNEL_qsa_attn_gqa_nax_q8
+                QSA_MAT_FILL(k0m, qsa_k4(k_head.v[at.x], odd, sc.x), qsa_k4(k_head.v[at.y], odd, sc.y))
+                QSA_MAT_FILL(k1m, qsa_k4(k_head.v[at.z], odd, sc.z), qsa_k4(k_head.v[at.w], odd, sc.w))
+#else
+                QSA_MAT_FILL(k0m, qsa_k4(k_head.v[at.x], odd), qsa_k4(k_head.v[at.y], odd))
+                QSA_MAT_FILL(k1m, qsa_k4(k_head.v[at.z], odd), qsa_k4(k_head.v[at.w], odd))
+#endif
+                s0 = coopMatMulAdd(k0m, qm, s0);
+                s1 = coopMatMulAdd(k1m, qm, s1);
+            }
+        }
+
+        // Sum the two head-dim halves: both subgroups read the same two
+        // partials in the same order, so they hold the same scores.
+        uint mine = (parity * 2 + sg) * (QSA_GQA_BK * 8) + row * 8 + quad * 2;
+        xs[mine] = vec2(s0[0], s0[1]);
+        xs[mine + 1] = vec2(s0[2], s0[3]);
+        xs[mine + 8] = vec2(s0[4], s0[5]);
+        xs[mine + 9] = vec2(s0[6], s0[7]);
+        xs[mine + 128] = vec2(s1[0], s1[1]);
+        xs[mine + 129] = vec2(s1[2], s1[3]);
+        xs[mine + 136] = vec2(s1[4], s1[5]);
+        xs[mine + 137] = vec2(s1[6], s1[7]);
+        barrier();
+        // s[4 * block + i]: the lane's two heads' scores of its i-th key of
+        // the block, key left_col + 2 * i.
+        vec2 s[8];
+        vec2 mx = m_run;
+        uint theirs = parity * 2 * (QSA_GQA_BK * 8) + left_col * 8 + (row >> 1);
+        for (uint i = 0; i < 8; ++i) {
+            uint col = 16 * (i >> 2) + left_col + 2 * (i & 3);
+            uint at = theirs + (16 * (i >> 2) + 2 * (i & 3)) * 8;
+            precise vec2 v = (xs[at] + xs[at + QSA_GQA_BK * 8]) * scale;
+            s[i] = k0 + col < total ? v : vec2(-INFINITY);
+            mx = max(mx, s[i]);
+        }
+        mx = max(mx, subgroupShuffleXor(mx, 1));
+        mx = max(mx, subgroupShuffleXor(mx, 8));
+        precise vec2 alpha = mix(exp(m_run - mx), vec2(1.0), equal(mx, vec2(-INFINITY)));
+        precise vec2 psum = vec2(0.0);
+        vec2 p[8];
+        for (uint i = 0; i < 8; ++i) {
+            p[i] = mix(exp(s[i] - mx), vec2(0.0), equal(s[i], vec2(-INFINITY)));
+            psum += p[i];
+        }
+        psum += subgroupShuffleXor(psum, 1);
+        psum += subgroupShuffleXor(psum, 8);
+        l_run = l_run * alpha + psum;
+        m_run = mx;
+        MatA p0m, p1m;
+        QSA_MAT_FILL(p0m, qsa_bf16(vec4(p[0].x, p[1].x, p[2].x, p[3].x)), qsa_bf16(vec4(p[0].y, p[1].y, p[2].y, p[3].y)))
+        QSA_MAT_FILL(p1m, qsa_bf16(vec4(p[4].x, p[5].x, p[6].x, p[7].x)), qsa_bf16(vec4(p[4].y, p[5].y, p[6].y, p[7].y)))
+        if (alpha.x != 1.0 || alpha.y != 1.0) {
+            QSA_RESCALE(o0) QSA_RESCALE(o1) QSA_RESCALE(o2) QSA_RESCALE(o3)
+            QSA_RESCALE(o4) QSA_RESCALE(o5) QSA_RESCALE(o6) QSA_RESCALE(o7)
+        }
+        // Each V chunk is loaded right before its products.
+        QSA_PV2(0, o0, o1)
+        QSA_PV2(1, o2, o3)
+        QSA_PV2(2, o4, o5)
+        QSA_PV2(3, o6, o7)
+        parity ^= 1u;
+    }
+    vec2 inv = 1.0 / l_run;
+    QSA_STORE(0, o0) QSA_STORE(1, o1) QSA_STORE(2, o2) QSA_STORE(3, o3)
+    QSA_STORE(4, o4) QSA_STORE(5, o5) QSA_STORE(6, o6) QSA_STORE(7, o7)
+}
+#endif
