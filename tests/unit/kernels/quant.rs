@@ -975,7 +975,9 @@ fn usage_counts(layer: usize, s: usize) -> Vec<usize> {
 /// Prints ms per layer and TFLOP/s for gate + up and for down, and checks
 /// the two bit for bit. `LILY_GROUPED_ARMS=kernel,kernel,...` times those
 /// 64x4 kernels instead (a name with no built-in shader loads from
-/// `LILY_VK_SHADER_DIR`) and prints how many outputs differ from the first's.
+/// `LILY_VK_SHADER_DIR`) and prints how many outputs differ from the first's;
+/// `LILY_GROUPED_TILE=32` times them on 32-row tiles (the route below 3 072
+/// tokens).
 /// `cargo test --release --lib -- --ignored --nocapture
 /// grouped_expert_gemm_timing`.
 #[test]
@@ -1000,7 +1002,10 @@ fn grouped_expert_gemm_timing() {
     let ea = random_act(s, inter);
     let zeros = |k: usize| Tensor::zeros(&ctx, &[s, k], DType::BF16).expect("out");
     let (eg, eu, ed) = (zeros(inter), zeros(inter), zeros(h));
-    let tile = MoeTile::T64Sg4;
+    let tile = match std::env::var("LILY_GROUPED_TILE").as_deref() {
+        Ok("32") => MoeTile::T32Sg4,
+        _ => MoeTile::T64Sg4,
+    };
     let layers = [0usize, 12, 24, 47];
     let upload = |v: &[u32]| {
         Tensor::from_bytes(&ctx, bytemuck::cast_slice(v), &[v.len()], DType::U32)
@@ -1121,18 +1126,10 @@ fn grouped_expert_gemm_timing() {
     }
 }
 
-/// Every fused dense tile.
+/// Every fused dense tile that keeps the staged route's bits.
 #[cfg(target_os = "linux")]
-const FUSED_TILES: [FusedTile; 8] = [
-    FusedTile { mb: 1, s: 0 },
-    FusedTile { mb: 2, s: 0 },
-    FusedTile { mb: 4, s: 0 },
-    FusedTile { mb: 1, s: 2 },
-    FusedTile { mb: 1, s: 5 },
-    FusedTile { mb: 2, s: 4 },
-    FusedTile { mb: 2, s: 6 },
-    FusedTile { mb: 4, s: 8 },
-];
+const FUSED_TILES: [FusedTile; 3] =
+    [FusedTile { mb: 1, k: 1 }, FusedTile { mb: 2, k: 1 }, FusedTile { mb: 4, k: 1 }];
 
 /// A random quantized weight at `bits` without its dequantized image, with
 /// scales and biases in the checkpoint's ranges.
@@ -1163,6 +1160,116 @@ fn random_weights(
         biases: upload(bytemuck::cast_slice(&biases), &[rows, groups], DType::BF16),
         group_size: GROUP_SIZE,
         bits: 8,
+    }
+}
+
+/// Split-K tiles of the fused dense GEMM: two to 32 subgroups over K, with
+/// one, two and four blocks of activation rows.
+#[cfg(target_os = "linux")]
+const SPLIT_TILES: [FusedTile; 7] = [
+    FusedTile { mb: 1, k: 2 },
+    FusedTile { mb: 1, k: 8 },
+    FusedTile { mb: 1, k: 32 },
+    FusedTile { mb: 2, k: 4 },
+    FusedTile { mb: 2, k: 16 },
+    FusedTile { mb: 4, k: 2 },
+    FusedTile { mb: 4, k: 8 },
+];
+
+/// The split-K tiles of the fused dense GEMM against an f64 product of the
+/// staged route's bf16 weights (read back from its scratch) and the bf16
+/// activations, at the model's long-K and short-N shapes and odd ones,
+/// sampled outputs of every row: each within the bf16 output's rounding
+/// (2^-8 of the result, twice its half ulp) plus an fp32 accumulation's
+/// error (1e-5 of the sum of the terms' magnitudes, as
+/// `gemv_model_shapes_match_f64_reference`), and a mean error over the
+/// sampled outputs within 1.1 times the staged route's.
+/// The split groups the products' sums differently, so the bits move; the
+/// precision must not.
+#[cfg(target_os = "linux")]
+#[test]
+fn gemm_quant_split_matches_reference() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(43);
+    let shapes = [
+        (8usize, 320usize, 10240usize),
+        (8, 4, 10240),
+        (4, 2560, 6144),
+        (8, 2560, 6144),
+        (8, 512, 2560),
+        (4, 48, 2560),
+        (8, 1, 2560),
+        (8, 10240, 320),
+        (4, 33, 64),
+        (8, 7, 128),
+    ];
+    for (bits, n, k) in shapes {
+        let w = random_weights(&ctx, &mut rng, bits, n, k);
+        let scratch = Tensor::zeros(&ctx, &[n, k], DType::BF16).expect("scratch");
+        let mut cols: Vec<usize> =
+            (0..n.min(24)).chain(n.saturating_sub(24)..n).collect();
+        cols.extend((0..n).step_by(97));
+        cols.sort_unstable();
+        cols.dedup();
+        for m in [17usize, 32, 45, 100] {
+            let av: Vec<f32> =
+                (0..(m + 1) * k).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+            let a_all = Tensor::from_f32_as_bf16(&ctx, &av, &[m + 1, k]).expect("a");
+            let a = a_all.view(k, &[m, k]).expect("a view");
+            let staged = Tensor::zeros(&ctx, &[m, n], DType::BF16).expect("c");
+            let split: Vec<Tensor> = SPLIT_TILES
+                .iter()
+                .map(|_| Tensor::zeros(&ctx, &[m + 2, n], DType::BF16).expect("c"))
+                .collect();
+            let pass = ctx.begin().expect("pass");
+            gemm_quant_bf16_nt(&ctx, &pass, &a, &w, &staged, &scratch).expect("staged");
+            for (tile, c) in SPLIT_TILES.iter().zip(&split) {
+                let c = c.view(2 * n, &[m, n]).expect("c view");
+                gemm_quant_fused_nt(&ctx, &pass, &a, &w, &c, *tile).expect("split");
+            }
+            pass.commit_wait().expect("commit");
+            let wv = scratch.to_f32().expect("weights");
+            let ar = a.to_f32().expect("a");
+            // (output, reference, sum of the terms' magnitudes)
+            let refs: Vec<(usize, f64, f64)> = (0..m)
+                .flat_map(|r| cols.iter().map(move |&col| (r, col)))
+                .map(|(r, col)| {
+                    let (mut sum, mut l1) = (0.0f64, 0.0f64);
+                    for e in 0..k {
+                        let t = ar[r * k + e] as f64 * wv[col * k + e] as f64;
+                        sum += t;
+                        l1 += t.abs();
+                    }
+                    (r * n + col, sum, l1)
+                })
+                .collect();
+            let mean_err = |got: &[f32]| -> f64 {
+                refs.iter()
+                    .map(|&(i, want, _)| (got[i] as f64 - want).abs())
+                    .sum::<f64>()
+                    / refs.len() as f64
+            };
+            let staged_err = mean_err(&staged.to_f32().expect("read"));
+            for (tile, c) in SPLIT_TILES.iter().zip(&split) {
+                let got =
+                    c.view(2 * n, &[m, n]).expect("c view").to_f32().expect("read");
+                for &(i, want, l1) in &refs {
+                    let tol = want.abs() / 256.0 + 1e-5 * l1;
+                    assert!(
+                        (got[i] as f64 - want).abs() <= tol,
+                        "{bits}-bit [{n} x {k}] m={m} tile {tile:?} output {i}: {} against \
+                         {want} (tolerance {tol})",
+                        got[i]
+                    );
+                }
+                let err = mean_err(&got);
+                assert!(
+                    err <= 1.1 * staged_err + 1e-9,
+                    "{bits}-bit [{n} x {k}] m={m} tile {tile:?}: mean error {err:e} against \
+                     the staged route's {staged_err:e}"
+                );
+            }
+        }
     }
 }
 
@@ -1229,14 +1336,14 @@ fn gemm_quant_fused_matches_staged() {
 
 #[cfg(target_os = "linux")]
 fn tile_label(t: &FusedTile) -> String {
-    if t.s > 0 { format!("p{}b{}", t.s, t.mb) } else { format!("b{}", t.mb) }
+    if t.k > 1 { format!("k{}b{}", t.k, t.mb) } else { format!("b{}", t.mb) }
 }
 
 /// The dense projections of a prefill chunk at the model's shapes, per call
 /// in a chain of barriered levels over four distinct weights each: the
 /// staged route (dequant, barrier, `gemm_bf16_nt_nax`, barrier) against the
 /// fused GEMM's tiles, us per call, best of several passes, at the row
-/// counts of `LILY_DENSE_M` (default 32,128,512). `LILY_DENSE_TILES=b2,p5b1,..`
+/// counts of `LILY_DENSE_M` (default 32,128,512). `LILY_DENSE_TILES=b2,k16b1,..`
 /// times those tiles only; `LILY_DENSE_SHAPES=bits:n:k,..` those shapes.
 /// `cargo test --release --lib -- --ignored --nocapture
 /// dense_quant_gemm_timing`.
@@ -1254,17 +1361,14 @@ fn dense_quant_gemm_timing() {
         .map(|v| {
             v.split(',')
                 .map(|t| {
-                    let b = t.as_bytes();
-                    // b<MB>, or p<S>b<MB>: the producer tile.
-                    if b[0] == b'p' {
-                        FusedTile { mb: (b[3] - b'0') as usize, s: (b[1] - b'0') as usize }
-                    } else {
-                        FusedTile { mb: (b[1] - b'0') as usize, s: 0 }
-                    }
+                    // b<MB>, or k<K>b<MB>: K split over K subgroups.
+                    let (head, mb) = t.split_once('b').expect("tile");
+                    let k = head.strip_prefix('k').map_or(1, |k| k.parse().expect("k"));
+                    FusedTile { mb: mb.parse().expect("mb"), k }
                 })
                 .collect()
         })
-        .unwrap_or(FUSED_TILES.to_vec());
+        .unwrap_or([&FUSED_TILES[..], &SPLIT_TILES[..]].concat());
     // (bits, N, K, calls per prefill pass)
     let shapes: Vec<(usize, usize, usize, usize)> = env_list("LILY_DENSE_SHAPES")
         .map(|v| {

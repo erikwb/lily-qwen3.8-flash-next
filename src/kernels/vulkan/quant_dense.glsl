@@ -15,22 +15,32 @@
 // product's operands trade sides, which the matrix units' sums do not see:
 // `gemm_quant_fused_matches_staged`), rounded by the same store.
 //
+// The bits hold with K split too (QD_SK, below) except for the order of
+// the partial sums: within an fp32 accumulation's error of them
+// (`gemm_quant_split_matches_reference`).
+//
 // Two layouts, both over 16-row blocks of W:
-// - direct (QD_PC undefined): a subgroup dequantizes its block and runs the
-//   chains of QD_MB (1, 2 or 4) 16-row blocks of A; the threadgroup's
-//   subgroups take consecutive blocks of W. For an N that fills the GPU.
-// - producer (QD_PC): a threadgroup per block of W and QD_MB blocks of A,
-//   its subgroups split between dequantizing and multiplying (below). For a
-//   short N, where the direct layout's few subgroups each run a long chain.
-// Define QD_BITS (4 or 8) and QD_MB before including; for QD_PC also
-// QD_PC_MAX_P. Buffers: 0 codes, 1 scales, 2 biases, 3 A, 4 C; params 5 K,
-// 6 N, 7 M, 8 GS. K is a multiple of 64, GS a power of two, at least 64; A's
-// and C's addresses are multiples of 4.
+// - direct: a subgroup dequantizes its block and runs the chains of QD_MB
+//   (1, 2 or 4) 16-row blocks of A; the threadgroup's subgroups take
+//   consecutive blocks of W. For an N that fills the GPU.
+// - split K (QD_SK): a threadgroup per block of W and QD_MB blocks of A,
+//   its subgroups each running a share of the groups (below). For a short
+//   N or a long K, where the direct layout's chains are long.
+// Define QD_BITS (4 or 8) and QD_MB before including. Buffers: 0 codes, 1
+// scales, 2 biases, 3 A, 4 C; params 5 K, 6 N, 7 M, 8 GS. K is a multiple
+// of 64, GS a power of two, at least 64; A's and C's addresses are
+// multiples of 4.
 //
 // What did not pay (2026-11-13, us per call at 32 rows): a subgroup taking
 // two blocks of W (more registers, fewer threads: q4 10 240 x 2 560 105
-// against 73), and the direct layout issuing a group's loads a group ahead
-// (q8 12 288 x 2 560 147 against 124).
+// against 73; with four blocks of A, the dense GEMM's 32 x 64 subgroup
+// tile, 99 registers spilled, at 512 rows 807 against 788), and the direct
+// layout issuing a group's loads a group ahead (q8 12 288 x 2 560 147
+// against 124). A producer layout (a threadgroup per block of W, some
+// subgroups dequantizing groups into threadgroup memory for the others to
+// multiply: q8 320 x 10 240 at 32 rows 83, the direct layout 158) ran the
+// same chain as the direct one, and the chain was its floor; split K is
+// faster at every shape measured.
 #include "matmul.glsl"
 
 // Weights k .. k + 4 of four codes' floats q: bf16(q * s + b), rounded as
@@ -121,92 +131,6 @@ void qd_store(uint64_t c, uint N, uint M, uint n, uint m, MatC acc) {
     }
 }
 
-#ifdef QD_PC
-// The producer layout. For a short N (the hyper-connection down and inject
-// projections: 320 and 4 rows of K 10 240) the direct layout's subgroups
-// are few and each runs a long chain of groups, a wait for the group's loads
-// and some 450 dependent instructions of dequantization before its four
-// multiplies: 1.2 us a group. Here a threadgroup takes one 16-row block of
-// W: of its S subgroups, P = S - QD_MB (at most QD_PC_MAX_P) produce, each
-// dequantizing a group per step into threadgroup memory (the lane's four
-// left operands as it holds them), and QD_MB consume, subgroup b running the
-// groups of the step before, in order, through the accumulator of rows
-// 16 b .. of A. Two buffers: one barrier per step, the producers a step
-// ahead. Each output is the direct layout's chain, so the bits stay.
-//
-// What bounds it: with the producers' work removed it takes as long (q8 320
-// x 10 240 at 16 rows, 2026-11-13: 107.6 us against 107.9), so it is the
-// consumer's chain. A 16x16x16 multiply waits for the one before on its
-// accumulator, about 115 ns, so a chain of 640 (K 10 240) takes about 75 us
-// whatever feeds it. Only splitting K, which changes the sums, would go
-// below. 84 us at 32 rows, the direct layout 207.
-shared uvec4 qd_ops[2 * QD_PC_MAX_P * 4 * 32];
-
-// A left operand's words: the four weights of the lane's first row, then
-// of its second, in element order (MAT_OF_WORDS).
-uvec4 qd_operand_words(uvec4 r0, uvec4 r1) {
-    return uvec4((r0.x >> 16) | (r0.y & 0xFFFF0000u), (r0.z >> 16) | (r0.w & 0xFFFF0000u),
-                 (r1.x >> 16) | (r1.y & 0xFFFF0000u), (r1.z >> 16) | (r1.w & 0xFFFF0000u));
-}
-#define QD_PC_STORE(t)                                                                        \
-    qd_ops[((buf * QD_PC_MAX_P + p) * 4 + (t)) * 32 + lane] = qd_operand_words(QD_W_ROW0(t), QD_W_ROW1(t));
-// Group j of a consumer's step: the lane's activation vectors, loaded with
-// the step's others (past G a group reads the last one's and multiplies
-// nothing), then its four operands from threadgroup memory and the four
-// multiplies.
-#define QD_PC_X_LOAD(j)                                                                       \
-    uint g8##j = 8 * min(first + (j), G - 1);                                                 \
-    uvec4 x##j##0 = xw.v[xv00 + g8##j], x##j##1 = xw.v[xv01 + g8##j];                         \
-    uvec4 x##j##2 = xw.v[xv02 + g8##j], x##j##3 = xw.v[xv03 + g8##j];
-#define QD_PC_STEP(j, t)                                                                      \
-    {                                                                                         \
-        MatA ma;                                                                              \
-        MAT_OF_WORDS(ma, o##t)                                                                \
-        MatB mb;                                                                              \
-        MAT_K64_B(mb, t, x##j##0, x##j##1, x##j##2, x##j##3)                                  \
-        acc = coopMatMulAdd(ma, mb, acc);                                                     \
-    }
-#define QD_PC_GROUP(j)                                                                        \
-    if ((j) < count) {                                                                        \
-        uint at = (rbuf * QD_PC_MAX_P + (j)) * 128 + lane;                                    \
-        uvec4 o0 = qd_ops[at], o1 = qd_ops[at + 32], o2 = qd_ops[at + 64], o3 = qd_ops[at + 96]; \
-        QD_PC_STEP(j, 0) QD_PC_STEP(j, 1) QD_PC_STEP(j, 2) QD_PC_STEP(j, 3)                   \
-    }
-
-void main() {
-    QD_SETUP
-    uint n0 = threadgroup_position_in_grid.x * 16, m0 = threadgroup_position_in_grid.y * (16 * QD_MB);
-    uint sg = gl_SubgroupID, lane = gl_SubgroupInvocationID;
-    uint P = gl_NumSubgroups - QD_MB, p = sg - QD_MB, G = K / 64, steps = (G + P - 1) / P;
-    QD_W_ROWS
-    // A consumer's rows of A: block sg of the tile.
-    uint m = m0 + 16 * sg + lane_col;
-    QD_X_ROWS(0, m)
-    bool consumer = sg < QD_MB, working = consumer && m0 + 16 * sg < M;
-    MatC acc = MatC(0.0);
-
-    [[dont_unroll]] for (uint i = 0; i <= steps; ++i) {
-        uint buf = i & 1, rbuf = buf ^ 1;
-        uint g = i * P + p;
-        if (!consumer && g < G) {
-            QD_W_LOAD(8 * g)
-            QD_SB_LOAD
-            QD_PC_STORE(0) QD_PC_STORE(1) QD_PC_STORE(2) QD_PC_STORE(3)
-        } else if (working && i > 0) {
-            // Step i - 1. A thread waits for its loads where it first uses
-            // one: the step's activations are loaded together, one wait a
-            // step (107 us for 320 x 10 240 with each group's loaded a group
-            // ahead, 74 with no activation loads at all, 84 this way).
-            uint first = (i - 1) * P, count = min(P, G - first);
-            QD_PC_X_LOAD(0) QD_PC_X_LOAD(1) QD_PC_X_LOAD(2) QD_PC_X_LOAD(3)
-            QD_PC_GROUP(0) QD_PC_GROUP(1) QD_PC_GROUP(2) QD_PC_GROUP(3)
-        }
-        barrier();
-    }
-
-    if (working) qd_store(c, N, M, n0 + lane_row, m, acc);
-}
-#else
 #if QD_MB == 1
 #define QD_EACH_B(X) X(0)
 #elif QD_MB == 2
@@ -242,7 +166,103 @@ void main() {
         QD_EACH_B(QD_MUL_##t)                                                                 \
     }
 #define QD_STORE(b) qd_store(c, N, M, n0 + lane_row, m0 + 16 * (b) + lane_col, acc##b);
+// A group: with four blocks of A, block by block (the four left operands
+// first, then each block's four multiplies, its loads issued while the
+// block before it multiplies); with one or two, multiply by multiply with
+// every load issued at the group's start (QD_STEP). The same chain per
+// output either way. Block by block keeps fewer loaded vectors live: q4
+// b4 spills 19 registers where it spilled 50, and at 512 rows q4 10 240 x
+// 2 560 takes 750 us against 784, q8 12 288 x 2 560 946 against 1 032 (a
+// split b4 at 256 rows, the five big projections' pass 1.29 ms against
+// 1.42); with two blocks it lost (b2, q4 10 240 x 2 560 at 32 rows 98
+// against 70), 2026-11-13.
+#define QD_MA(name, row0, row1)                                                               \
+    MatA name;                                                                                \
+    {                                                                                         \
+        uvec4 r0 = row0, r1 = row1;                                                           \
+        name[0] = MAT_HI(r0.x); name[1] = MAT_HI(r0.y); name[2] = MAT_HI(r0.z); name[3] = MAT_HI(r0.w); \
+        name[4] = MAT_HI(r1.x); name[5] = MAT_HI(r1.y); name[6] = MAT_HI(r1.z); name[7] = MAT_HI(r1.w); \
+    }
+#define QD_MUL1(b, t)                                                                         \
+    {                                                                                         \
+        MatB mb;                                                                              \
+        MAT_K64_B(mb, t, x##b##0, x##b##1, x##b##2, x##b##3)                                  \
+        acc##b = coopMatMulAdd(ma##t, mb, acc##b);                                            \
+    }
+#define QD_BLOCK1(b) QD_MUL1(b, 0) QD_MUL1(b, 1) QD_MUL1(b, 2) QD_MUL1(b, 3)
+#define QD_MAS                                                                                \
+    QD_MA(ma0, QD_W_ROW0(0), QD_W_ROW1(0)) QD_MA(ma1, QD_W_ROW0(1), QD_W_ROW1(1))             \
+    QD_MA(ma2, QD_W_ROW0(2), QD_W_ROW1(2)) QD_MA(ma3, QD_W_ROW0(3), QD_W_ROW1(3))
+#if QD_MB == 4
+#define QD_GROUP(g8)                                                                          \
+    QD_W_LOAD(g8) QD_SB_LOAD                                                                  \
+    QD_X_LOAD(0) QD_MAS QD_X_LOAD(1) QD_BLOCK1(0) QD_X_LOAD(2) QD_BLOCK1(1) QD_X_LOAD(3)      \
+    QD_BLOCK1(2) QD_BLOCK1(3)
+#else
+#define QD_GROUP(g8)                                                                          \
+    QD_W_LOAD(g8)                                                                             \
+    QD_EACH_B(QD_X_LOAD)                                                                      \
+    QD_SB_LOAD                                                                                \
+    QD_STEP(0) QD_STEP(1) QD_STEP(2) QD_STEP(3)
+#endif
 
+#ifdef QD_SK
+// Split K (QD_SK): a threadgroup per 16-row block of W and QD_MB blocks of
+// A, its KS subgroups (a power of two, KS * QD_MB <= 32) each running the
+// direct layout's chain over every KS-th group, then summing their fp32
+// partial accumulators in a fixed tree through threadgroup memory
+// (subgroup s adds s + KS / 2, then s + KS / 4, ...). For a short N with a
+// long K, where the bit-exact chain is the floor (a 16x16x16 multiply waits
+// about 115 ns for the one before on its accumulator: q8 320 x 10 240, 640
+// multiplies, 84 us at 32 rows in the producer layout). The sums group the
+// products differently from the staged route, so the bits move within the
+// fp32 accumulation's error (`gemm_quant_split_matches_reference`).
+shared vec4 qd_part[16 * 2 * 32];
+#define QD_PART_AT(slot, i) (((slot) * 2 + (i)) * 32 + lane)
+#define QD_PART_PUT(b)                                                                        \
+    {                                                                                         \
+        uint at = (s - span) * QD_MB + (b);                                                   \
+        qd_part[QD_PART_AT(at, 0)] = vec4(acc##b[0], acc##b[1], acc##b[2], acc##b[3]);        \
+        qd_part[QD_PART_AT(at, 1)] = vec4(acc##b[4], acc##b[5], acc##b[6], acc##b[7]);        \
+    }
+#define QD_PART_ADD(b)                                                                        \
+    {                                                                                         \
+        uint at = s * QD_MB + (b);                                                            \
+        vec4 p0 = qd_part[QD_PART_AT(at, 0)], p1 = qd_part[QD_PART_AT(at, 1)];                \
+        acc##b[0] += p0.x; acc##b[1] += p0.y; acc##b[2] += p0.z; acc##b[3] += p0.w;           \
+        acc##b[4] += p1.x; acc##b[5] += p1.y; acc##b[6] += p1.z; acc##b[7] += p1.w;           \
+    }
+
+void main() {
+    QD_SETUP
+    uint s = gl_SubgroupID, KS = gl_NumSubgroups, lane = gl_SubgroupInvocationID;
+    uint n0 = threadgroup_position_in_grid.x * 16;
+    uint m0 = threadgroup_position_in_grid.y * (16 * QD_MB);
+    QD_W_ROWS
+    QD_EACH_B(QD_X_ROWS_B)
+    QD_EACH_B(QD_ACC)
+
+    [[dont_unroll]] for (uint g8 = 8 * s; g8 < K8; g8 += 8 * KS) {
+        QD_GROUP(g8)
+    }
+
+    // Partial sums of subgroups s in [span, 2 span) into subgroup s - span.
+    [[dont_unroll]] for (uint span = KS >> 1; span > 0; span >>= 1) {
+        if (s >= span && s < 2 * span) {
+            QD_EACH_B(QD_PART_PUT)
+        }
+        barrier();
+        if (s < span) {
+            QD_EACH_B(QD_PART_ADD)
+        }
+        barrier();
+    }
+
+    if (s == 0) {
+        QD_EACH_B(QD_STORE)
+    }
+}
+#else
 void main() {
     QD_SETUP
     uint n0 = (threadgroup_position_in_grid.x * gl_NumSubgroups + gl_SubgroupID) * 16;
@@ -252,12 +272,8 @@ void main() {
     QD_EACH_B(QD_X_ROWS_B)
     QD_EACH_B(QD_ACC)
 
-    // A group's loads are issued together, at its start.
     [[dont_unroll]] for (uint g8 = 0; g8 < K8; g8 += 8) {
-        QD_W_LOAD(g8)
-        QD_EACH_B(QD_X_LOAD)
-        QD_SB_LOAD
-        QD_STEP(0) QD_STEP(1) QD_STEP(2) QD_STEP(3)
+        QD_GROUP(g8)
     }
 
     QD_EACH_B(QD_STORE)
