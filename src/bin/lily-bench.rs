@@ -104,6 +104,17 @@ struct Cli {
     /// token) and `STEM.json` (one request, decoded from the prompt's end).
     #[arg(long, value_name = "STEM")]
     tokens_out: Option<PathBuf>,
+    /// Measures the prefill of a short chunk after a long context instead
+    /// (the server's turn: a few hundred new tokens on a cached prompt):
+    /// prefills `--prompt-len` tokens, then `--tails` + 1 chunks of this many
+    /// tokens (the text's next ones), each with its draw, and prints each
+    /// chunk's wall time and their median, the first left out (it compiles
+    /// the chunk's shapes). No decode.
+    #[arg(long)]
+    tail_len: Option<usize>,
+    /// With `--tail-len`: the chunks measured.
+    #[arg(long, default_value_t = 5)]
+    tails: usize,
     #[arg(long)]
     json_out: PathBuf,
 }
@@ -197,6 +208,10 @@ fn main() -> std::process::ExitCode {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    if let Some(tail) = cli.tail_len {
+        // Before the model loads: a bad length fails as an argument error.
+        tail_total(&cli, tail)?;
+    }
     let _activity = lily::activity::Activity::begin("lily-bench");
     let params =
         if cli.sample { server_sampling(cli.seed) } else { SamplingParams::greedy() };
@@ -477,6 +492,9 @@ fn bench<M: LanguageModel>(cli: &Cli) -> Result<()> {
     if let Some(rows) = cli.batch_rows {
         return bench_batched(cli, &ctx, &model, rows);
     }
+    if let Some(tail) = cli.tail_len {
+        return bench_tail(cli, &ctx, &model, tail);
+    }
     if cli.drafts > 0 {
         return bench_speculative(cli, &ctx, &model);
     }
@@ -739,6 +757,76 @@ fn bench<M: LanguageModel>(cli: &Cli) -> Result<()> {
         decode_secs,
         cli.decode_steps as f64 / decode_secs,
     );
+    Ok(())
+}
+
+/// The tokens a `--tail-len` run prefills: the context and `--tails` + 1
+/// chunks (the first is not measured), within the model window.
+fn tail_total(cli: &Cli, tail: usize) -> Result<usize> {
+    ensure!(tail > 0, "--tail-len must be positive");
+    ensure!(cli.tails > 0, "--tails must be positive");
+    let total = cli
+        .tails
+        .checked_add(1)
+        .and_then(|chunks| chunks.checked_mul(tail))
+        .and_then(|chunks| chunks.checked_add(cli.prompt_len))
+        .filter(|&total| total < MAX_SEQ);
+    total.ok_or_else(|| anyhow::anyhow!("context and tails exceed the model window {MAX_SEQ}"))
+}
+
+/// [`Cli::tail_len`]: the prefill of `tail`-token chunks after a
+/// `--prompt-len` context.
+fn bench_tail<M: LanguageModel>(
+    cli: &Cli,
+    ctx: &MetalContext,
+    model: &M,
+    tail: usize,
+) -> Result<()> {
+    let total = tail_total(cli, tail)?;
+    let chunks = cli.tails + 1;
+    let vocab = u32::try_from(model.vocab_size())?;
+    let tokens = prompt_tokens_of(cli, vocab, total)?;
+    let mut scratch = model.new_scratch_with_capacity(ctx, total + 1)?;
+    let mut state = model.new_state(ctx, total + 1)?;
+    let started = Instant::now();
+    model.prefill(ctx, &mut state, &mut scratch, &tokens[..cli.prompt_len], Some(draw(0)))?;
+    let context_secs = started.elapsed().as_secs_f64();
+    if ctx.profiling() {
+        profile::take();
+    }
+    let mut secs = Vec::with_capacity(chunks);
+    for (i, chunk) in tokens[cli.prompt_len..].chunks(tail).enumerate() {
+        if i == 1 && ctx.profiling() {
+            // The tables cover the measured chunks only.
+            profile::take();
+        }
+        let started = Instant::now();
+        model.prefill(ctx, &mut state, &mut scratch, chunk, Some(draw(i + 1)))?;
+        secs.push(started.elapsed().as_secs_f64());
+    }
+    if ctx.profiling() {
+        kernel_profile_report(&profile::take());
+    }
+    let mut measured = secs[1..].to_vec();
+    measured.sort_by(f64::total_cmp);
+    let median = measured[measured.len() / 2];
+    let list: Vec<String> = secs.iter().map(|s| format!("{:.1}", s * 1e3)).collect();
+    println!(
+        "tail prefill: context {} tok in {:.3}s; {} x {tail} tok after it: {} ms (first left out) | median {:.1} ms ({:.1} tok/s)",
+        cli.prompt_len,
+        context_secs,
+        chunks,
+        list.join(" "),
+        median * 1e3,
+        tail as f64 / median
+    );
+    let report = serde_json::json!({
+        "context_tokens": cli.prompt_len,
+        "tail_tokens": tail,
+        "tail_ms": secs.iter().map(|s| s * 1e3).collect::<Vec<_>>(),
+        "median_ms": median * 1e3,
+    });
+    std::fs::write(&cli.json_out, serde_json::to_vec_pretty(&report)?)?;
     Ok(())
 }
 

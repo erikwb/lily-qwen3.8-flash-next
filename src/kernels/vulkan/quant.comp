@@ -200,3 +200,66 @@ void qg_fill(uint64_t codes, BF16 scales, BF16 biases, uint words, uint groups, 
     }
 }
 #endif
+
+// The dense quantized GEMM that dequantizes in its multiply loop
+// (quant_dense.glsl), for prefill chunks short of the staged route's
+// crossover: gemm_q<bits>_nt_dense_b<MB>, a subgroup per 16 rows of the
+// weight and MB 16-row blocks of the activations; _sk_b<MB>, a threadgroup
+// per 16 rows of the weight whose subgroups split K.
+#ifdef KERNEL_gemm_q4_nt_dense_b1
+#define QD_BITS 4
+#define QD_MB 1
+#endif
+#ifdef KERNEL_gemm_q4_nt_dense_b2
+#define QD_BITS 4
+#define QD_MB 2
+#endif
+#ifdef KERNEL_gemm_q4_nt_dense_b4
+#define QD_BITS 4
+#define QD_MB 4
+#endif
+#ifdef KERNEL_gemm_q8_nt_dense_b1
+#define QD_BITS 8
+#define QD_MB 1
+#endif
+#ifdef KERNEL_gemm_q8_nt_dense_b2
+#define QD_BITS 8
+#define QD_MB 2
+#endif
+#ifdef KERNEL_gemm_q8_nt_dense_b4
+#define QD_BITS 8
+#define QD_MB 4
+#endif
+#ifdef KERNEL_gemm_q4_nt_dense_sk_b1
+#define QD_BITS 4
+#define QD_MB 1
+#define QD_SK
+#endif
+#ifdef KERNEL_gemm_q4_nt_dense_sk_b2
+#define QD_BITS 4
+#define QD_MB 2
+#define QD_SK
+#endif
+#ifdef KERNEL_gemm_q4_nt_dense_sk_b4
+#define QD_BITS 4
+#define QD_MB 4
+#define QD_SK
+#endif
+#ifdef KERNEL_gemm_q8_nt_dense_sk_b1
+#define QD_BITS 8
+#define QD_MB 1
+#define QD_SK
+#endif
+#ifdef KERNEL_gemm_q8_nt_dense_sk_b2
+#define QD_BITS 8
+#define QD_MB 2
+#define QD_SK
+#endif
+#ifdef KERNEL_gemm_q8_nt_dense_sk_b4
+#define QD_BITS 8
+#define QD_MB 4
+#define QD_SK
+#endif
+#ifdef QD_BITS
+#include "quant_dense.glsl"
+#endif
