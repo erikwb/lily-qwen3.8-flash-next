@@ -538,6 +538,35 @@ impl Dev {
             features.features = vk::PhysicalDeviceFeatures::default()
                 .shader_int64(true)
                 .shader_int16(true);
+            // Nor capture/replay of buffer addresses, which lily never uses:
+            // with it a driver must assume memory can have a second GPU
+            // address, and Honeykrisp on M5 then flushes with memory scope
+            // at every barrier.
+            // SAFETY: walks the chain built above through the pointers it
+            // holds: `push_next` stored the borrows of v11, v12, v13 and
+            // `cooperative`, and the tail linked by hand (bfloat and the
+            // optional structures) holds `&raw mut` pointers. Every entry is
+            // a live feature structure on this stack frame. Until
+            // `create_device` reads the chain, v11/v12/v13/`cooperative` get
+            // no direct access or fresh reference; the hand-linked tail only
+            // gets the field reads and link pruning below, which do not touch
+            // v12.
+            // Raw place accesses only, so the header reads do not narrow the
+            // pointers to the header's size.
+            let mut found = false;
+            unsafe {
+                let mut next = features.p_next.cast::<vk::BaseOutStructure>();
+                while !next.is_null() {
+                    if (*next).s_type == vk::StructureType::PHYSICAL_DEVICE_VULKAN_1_2_FEATURES {
+                        let v12 = next.cast::<vk::PhysicalDeviceVulkan12Features>();
+                        (*v12).buffer_device_address_capture_replay = vk::FALSE;
+                        (*v12).buffer_device_address_multi_device = vk::FALSE;
+                        found = true;
+                    }
+                    next = (*next).p_next;
+                }
+            }
+            ensure!(found, "the Vulkan 1.2 features are not in the device feature chain");
             let prioritize = can_prioritize
                 && priority.memory_priority == vk::TRUE
                 && pageable.pageable_device_local_memory == vk::TRUE;
