@@ -661,9 +661,37 @@ pub fn hc_read_up_mix_q8(
         8 => "hc_read_up_mix_q8_g8",
         _ => anyhow::bail!("streams {groups} outside 1..={HC_MAX_G}"),
     };
+    let name = up_mix_shape_kernel(name, groups, down.numel(), up.group_size);
     dispatch_read_up_mix(
         ctx, pass, name, up, down, hyper, w, inv_rms, mixed, h, groups, 1, true, w_bias,
     )
+}
+
+/// The up kernel specialized for the model's shape where one is built: on
+/// Vulkan, 4 streams at low rank 320 in quant groups of 64 (five turns, a
+/// row's five scales in one window) take hc.comp's `_r5w` kernels,
+/// whose turns are straight-line code (three rows 13.5 to 12.4 us a level,
+/// one row 11.6 to 10.8; the same bits). `r` is the low rank, `gs` the up
+/// weight's group size.
+fn up_mix_shape_kernel(
+    name: &'static str,
+    groups: usize,
+    r: usize,
+    gs: usize,
+) -> &'static str {
+    #[cfg(target_os = "linux")]
+    if groups == 4 && r == 320 && gs == 64 {
+        return match name {
+            "hc_read_up_mix_q8_g4" => "hc_read_up_mix_q8_g4_r5w",
+            "hc_read_up_mix_q8_g4_m1" => "hc_read_up_mix_q8_g4_m1_r5w",
+            "hc_read_up_mix_q8_g4_m2" => "hc_read_up_mix_q8_g4_m2_r5w",
+            "hc_read_up_mix_q8_g4_m3" => "hc_read_up_mix_q8_g4_m3_r5w",
+            "hc_read_up_mix_q8_g4_m4" => "hc_read_up_mix_q8_g4_m4_r5w",
+            _ => name,
+        };
+    }
+    let _ = (groups, r, gs);
+    name
 }
 
 /// [`hc_read_up_mix_q8`] over `rows <= HC_FUSED_MAX_ROWS` rows at once, on
@@ -701,7 +729,12 @@ pub fn hc_read_up_mix_q8_rows(
         (1..=HC_MAX_G).contains(&groups),
         "streams {groups} outside 1..={HC_MAX_G}"
     );
-    let name = HC_UP_MIX_ROWS_FNS[groups - 1][rows - 1];
+    let name = up_mix_shape_kernel(
+        HC_UP_MIX_ROWS_FNS[groups - 1][rows - 1],
+        groups,
+        act.numel() / rows,
+        up.group_size,
+    );
     dispatch_read_up_mix(
         ctx, pass, name, up, act, hyper, w, inv_rms, mixed, h, groups, rows, false,
         w_bias,
