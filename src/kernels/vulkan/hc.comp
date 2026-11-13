@@ -54,11 +54,15 @@ void main() {
     uint H = arg_u32(3), G = arg_u32(4);
     uint i = thread_position_in_grid.x, r = thread_position_in_grid.y;
     BF16 up = BF16(arg(0) + 2 * uint64_t(r) * G * H), hn = BF16(arg(1) + 2 * uint64_t(r) * G * H);
-    float acc = 0.0;
+    // `precise` and an explicit fma: the order the fused up kernels' gate
+    // epilogue writes out too, so that both give the same bits (this is
+    // how the compiler built this loop already; it built the fused
+    // epilogue with a separate multiply and add in some instantiations).
+    precise float acc = 0.0;
     for (uint g = 0; g < G; ++g) {
         float logit = float(up.v[g * H + i]);
         float gate = 1.0 / (1.0 + exp(-logit));
-        acc += gate * float(hn.v[g * H + i]);
+        acc = fma(gate, float(hn.v[g * H + i]), acc);
     }
     BF16(arg(2) + 2 * uint64_t(r) * H).v[i] = bf16_rne(acc / float(G));
 }
@@ -130,15 +134,13 @@ float hc_half(uvec4 w, uint at) {
     return uintBitsToFloat((at & 1u) != 0u ? word & 0xFFFF0000u : word << 16);
 }
 
-// The quant group of the block a lane loads, i / bpg, for a loop over
-// i = i0, i0 + 32, ...: Metal divides on every iteration, the port steps
-// the quotient (exact for every bpg).
-#define HC_GROUP_INIT(i0, bpg) \
-    uint q = (i0) / (bpg), q_rem = (i0) - q * (bpg); \
-    uint q_step = 32 / (bpg), q_rem_step = 32 - q_step * (bpg);
-#define HC_GROUP_NEXT(bpg) \
-    q += q_step; q_rem += q_rem_step; \
-    if (q_rem >= (bpg)) { q_rem -= (bpg); ++q; }
+// The quant group of the block a lane loads, i / bpg: Metal divides on
+// every iteration, the port shifts (hc.rs only routes power-of-two quant
+// groups here). An earlier stepped quotient kept a branch in the loop, and
+// on this GPU a branch is a wait for every load before it: the shift took
+// the three-row down kernel from 14.0 to 13.7 us a level in
+// `hc_read_rows_chain_timing` (2026-11-13).
+#define HC_GROUP_SHIFT(bpg) uint bsh = uint(findLSB(bpg));
 
 #ifdef KERNEL_hc_read_down_q8
 shared float part[HC_MAX_G];
@@ -163,8 +165,9 @@ void main() {
     float acc_w = 0.0;
     float acc_x2 = 0.0;
     uint i_end = (g + 1) * stream_blocks;
-    HC_GROUP_INIT(g * stream_blocks + lane, bpg)
+    HC_GROUP_SHIFT(bpg)
     for (uint i = g * stream_blocks + lane; i < i_end; i += 32) {
+        uint q = i >> bsh;
         float s = float(scales.v[q]);
         float b = float(biases.v[q]);
         uvec4 w4 = wrow.v[i];
@@ -177,7 +180,6 @@ void main() {
             acc_w += hc_dot_q8(hc_unpack_q8(w4[j]), s, b, xn);
             acc_x2 += dot(x, x);
         }
-        HC_GROUP_NEXT(bpg)
     }
     acc_w = subgroupAdd(acc_w);
     acc_x2 = subgroupAdd(acc_x2);
@@ -268,8 +270,9 @@ void main() {
         [[unroll]] for (uint t = 0; t < RPT; ++t) acc_w[t * MB + m] = 0.0;
     }
     uint i_end = (g + 1) * stream_blocks;
-    HC_GROUP_INIT(g * stream_blocks + lane, bpg)
+    HC_GROUP_SHIFT(bpg)
     for (uint i = g * stream_blocks + lane; i < i_end; i += 32) {
+        uint q = i >> bsh;
         float s[RPT], b[RPT];
         uvec4 w4[RPT];
         [[unroll]] for (uint t = 0; t < RPT; ++t) {
@@ -294,7 +297,6 @@ void main() {
                 acc_x2[m] += dot(x, x);
             }
         }
-        HC_GROUP_NEXT(bpg)
     }
     [[unroll]] for (uint m = 0; m < MB; ++m) {
         acc_x2[m] = subgroupAdd(acc_x2[m]);
@@ -447,6 +449,46 @@ void main() {
 #elif defined(KERNEL_hc_read_up_mix_q8_g8_m4)
 #define GG 8
 #define MB 4
+// Test builds (hc.rs tests, `up_mix_logits_are_the_gemv_bits`): the f32
+// logits, before rounding, stored to `mixed` as [rows, G*H] floats.
+#elif defined(KERNEL_hc_read_up_mix_q8_g4_dbg)
+#define GG 4
+#define UP_DEBUG_TOTAL
+#elif defined(KERNEL_hc_read_up_mix_q8_g4_m3_dbg)
+#define GG 4
+#define MB 3
+#define UP_DEBUG_TOTAL
+#elif defined(KERNEL_hc_read_up_mix_q8_g4_m3_r5w_dbg)
+#define GG 4
+#define MB 3
+#define UP_TURNS 5
+#define UP_DEBUG_TOTAL
+#elif defined(KERNEL_hc_read_up_mix_q8_g4_r5w_dbg)
+#define GG 4
+#define UP_TURNS 5
+#define UP_DEBUG_TOTAL
+// The model's shape (4 streams, low rank 320 in 64-code groups: five turns,
+// five quant groups a row): the turn count and the scale window as
+// constants (hc.rs: `up_mix_shape_kernel`).
+#elif defined(KERNEL_hc_read_up_mix_q8_g4_r5w)
+#define GG 4
+#define UP_TURNS 5
+#elif defined(KERNEL_hc_read_up_mix_q8_g4_m1_r5w)
+#define GG 4
+#define MB 1
+#define UP_TURNS 5
+#elif defined(KERNEL_hc_read_up_mix_q8_g4_m2_r5w)
+#define GG 4
+#define MB 2
+#define UP_TURNS 5
+#elif defined(KERNEL_hc_read_up_mix_q8_g4_m3_r5w)
+#define GG 4
+#define MB 3
+#define UP_TURNS 5
+#elif defined(KERNEL_hc_read_up_mix_q8_g4_m4_r5w)
+#define GG 4
+#define MB 4
+#define UP_TURNS 5
 #endif
 
 
@@ -479,6 +521,15 @@ void main() {
 // to 13.2 (Metal 7.7), three rows 31.0 to 15.0, four rows 40.8 to 18.2. What
 // is left of the one-row kernel is its 3.3 MB of weights and a floor: with
 // no weight load it takes 9.8, with no load at all 7.7.
+// - Each turn and the scale-window choice inside it are branches, and on
+//   this GPU every branch waits for all loads issued before it. With both
+//   known at compile time (the `_r5w` kernels) the turns are straight-line
+//   code: three rows 13.5 to 12.4 us a level, one row 11.6 to 10.8
+//   (`hc_read_rows_chain_timing`, 2026-11-13; with `hc_turn_sum` below
+//   both give the same bits). Loading every turn's codes
+//   up front (17.3), reading the activation from device memory instead of
+//   staging it (16.1), 4, 2 or 1 subgroups a threadgroup (15.9-18.3) and
+//   staging the activation's sums (no change) all lost or tied.
 #ifdef GG
 #extension GL_KHR_shader_subgroup_clustered : require
 #ifdef MB
@@ -490,6 +541,51 @@ void main() {
 #define UP_CPS (8 / GG)  // columns of a subgroup
 #define UP_ACT 1024      // vec4s of staged activation (hc.rs: `HC_UP_ACT_MAX`)
 shared vec4 up_act[UP_ACT];
+
+// A turn's sum for one row: the quad lane's block of 16 codes (q0..q3, one
+// word each) times the activation (x0..x3), with the scale s and bias bi
+// of its quant group. Written out, in the order and with the fused
+// multiply-adds the compiler gives `gemv_q8_bf16`'s block (quant.comp, its
+// assembly read 2026-11-13), and `precise`, so that on the Honeykrisp build
+// it was written against the read gate's logits are that GEMV's bit for bit
+// in f32 (`up_mix_logits_are_the_gemv_bits` checks the single-row and
+// three-row bodies). That is matched code generation, not a portable
+// guarantee: glslc leaves `fma()` without NoContraction and the GEMV is left
+// to fast math, so a compiler change on either side can break it; that test
+// is what catches it. Left to fast math, the compiler ordered
+// this sum differently in different instantiations: before 2026-11-13 the
+// generic kernels' f32 logits already differed from the GEMV's (the bf16
+// tests passed by rounding), and the `_r5w` kernels' straight-line turns
+// came out with 18% of the logits different again and their single-row and
+// rows kernels disagreeing (the tokens changed; every bf16 test passed).
+float hc_dot_rev(vec4 q, vec4 x) {
+    precise float d = q.w * x.w;
+    d = fma(q.z, x.z, d);
+    d = fma(q.y, x.y, d);
+    d = fma(q.x, x.x, d);
+    return d;
+}
+float hc_sum_rev(vec4 x) {
+    precise float t = x.z + x.w;
+    t = x.y + t;
+    t = x.x + t;
+    return t;
+}
+float hc_turn_sum(vec4 q0, vec4 q1, vec4 q2, vec4 q3, float s, float bi,
+                  vec4 x0, vec4 x1, vec4 x2, vec4 x3) {
+    precise float c = bi * hc_sum_rev(x1);
+    c = fma(s, hc_dot_rev(q1, x1), c);
+    c = fma(s, hc_dot_rev(q0, x0), c);
+    c = fma(bi, hc_sum_rev(x0), c);
+    c = fma(s, hc_dot_rev(q2, x2), c);
+    c = fma(bi, hc_sum_rev(x2), c);
+    c = fma(s, hc_dot_rev(q3, x3), c);
+    c = fma(bi, hc_sum_rev(x3), c);
+    // The GEMV adds the block to its zeroed accumulator.
+    precise float a = 0.0 + c;
+    return a;
+}
+
 void main() {
     // The params are one struct (hc.rs: `dispatch_read_up_mix`), two loads.
     uvec4 p0 = U32x4(arg(8)).v[0], p1 = U32x4(arg(8)).v[1];
@@ -525,9 +621,18 @@ void main() {
     // biases (up to seven groups fit a 16-byte window on a 4-byte boundary
     // that stays inside the tensor; more are loaded per turn) and the
     // normalized stream value of its column.
+#ifdef UP_TURNS
+    // Specialized kernels: R = 64 * UP_TURNS, at most seven groups a row.
+    // The window is loaded after the barrier: without the branch, nothing
+    // would use these loads before it, and a device load still in flight
+    // when a workgroup barrier executes can return wrong data on this GPU.
+    const bool window = true;
+#else
     bool window = groups <= 7u;
+#endif
     uvec4 sw = uvec4(0), bw = uvec4(0);
     uint sh = 0;
+#ifndef UP_TURNS
     if (window) {
         uint e = wrow * groups;
         uint e0 = min(e & ~1u, K * groups - 8u);
@@ -535,11 +640,21 @@ void main() {
         sw = U32x4(arg(1) + 2 * uint64_t(e0)).v[0];
         bw = U32x4(arg(2) + 2 * uint64_t(e0)).v[0];
     }
+#endif
     float hn[UP_MB];
     float gain = w_bias + float(BF16(arg(5)).v[wrow]);
     [[unroll]] for (uint m = 0; m < UP_MB; ++m)
         hn[m] = float(bf16_rne(float(BF16(arg(4)).v[m * K + wrow]) * F32(arg(6)).v[m * GG + g] * gain));
     barrier();
+#ifdef UP_TURNS
+    {
+        uint e = wrow * groups;
+        uint e0 = min(e & ~1u, K * groups - 8u);
+        sh = e - e0;
+        sw = U32x4(arg(1) + 2 * uint64_t(e0)).v[0];
+        bw = U32x4(arg(2) + 2 * uint64_t(e0)).v[0];
+    }
+#endif
 
     // Turn j: block 4j + p of the row (hc.rs keeps R to the eight turns of
     // one subgroup sum).
@@ -549,7 +664,11 @@ void main() {
     [[unroll]] for (uint j = 0; j < 8; ++j) {
         float a[UP_MB];
         [[unroll]] for (uint m = 0; m < UP_MB; ++m) a[m] = 0.0;
+#ifdef UP_TURNS
+        if (j < UP_TURNS) {
+#else
         if (j < turns) {
+#endif
             uint b = 4 * j + p;
             uvec4 w4 = codes.v[co + b];
             uint q = b >> bshift;
@@ -567,31 +686,35 @@ void main() {
             vec4 q3 = hc_unpack_q8(w4.w);
             [[unroll]] for (uint m = 0; m < UP_MB; ++m) {
                 uint at = m * (R >> 2) + 4 * b;
-                a[m] = hc_dot_q8(q0, s, bi, up_act[at])
-                    + hc_dot_q8(q1, s, bi, up_act[at + 1])
-                    + hc_dot_q8(q2, s, bi, up_act[at + 2])
-                    + hc_dot_q8(q3, s, bi, up_act[at + 3]);
+                a[m] = hc_turn_sum(q0, q1, q2, q3, s, bi, up_act[at], up_act[at + 1],
+                                   up_act[at + 2], up_act[at + 3]);
             }
         }
         [[unroll]] for (uint m = 0; m < UP_MB; ++m) qs[j * UP_MB + m] = subgroupClusteredAdd(a[m], 4);
     }
     [[unroll]] for (uint m = 0; m < UP_MB; ++m) {
-        float total = ((qs[m] + qs[UP_MB + m]) + (qs[2 * UP_MB + m] + qs[3 * UP_MB + m]))
+        precise float total = ((qs[m] + qs[UP_MB + m]) + (qs[2 * UP_MB + m] + qs[3 * UP_MB + m]))
             + ((qs[4 * UP_MB + m] + qs[5 * UP_MB + m]) + (qs[6 * UP_MB + m] + qs[7 * UP_MB + m]));
+#ifdef UP_DEBUG_TOTAL
+        if (live && p == 0u) F32(arg(7)).v[m * K + wrow] = total;
+#endif
         float logit = float(bf16_rne(total));
         float gate = 1.0 / (1.0 + exp(-logit));
         // hc_mix_bf16 over the column's streams, whose quads' first lanes
         // are 4 * (c * GG + s).
-        float acc = 0.0;
+        // hc_mix_bf16's sum, written out the same way (`precise`, fma).
+        precise float acc = 0.0;
         [[unroll]] for (uint s = 0; s < GG; ++s) {
             float gv = 0.0, hv = 0.0;
             [[unroll]] for (uint cc = 0; cc < UP_CPS; ++cc) {
                 gv = c == cc ? subgroupBroadcast(gate, 4 * (cc * GG + s)) : gv;
                 hv = c == cc ? subgroupBroadcast(hn[m], 4 * (cc * GG + s)) : hv;
             }
-            acc += gv * hv;
+            acc = fma(gv, hv, acc);
         }
+#ifndef UP_DEBUG_TOTAL
         if (live && p == 0u && g == 0u) BF16(arg(7)).v[m * H + col] = bf16_rne(acc / float(GG));
+#endif
     }
 }
 #endif

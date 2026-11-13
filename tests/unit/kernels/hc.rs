@@ -698,7 +698,9 @@ fn batched_fused_read_is_bit_identical_to_decode_fused_kernels_per_row() {
 /// about 1e-5 of the elements (a 24-seed sweep at the model's shape found 5
 /// in 184K for MB = 3 and 1 in 246K for MB = 4, none for MB = 1 and 2). This
 /// asserts exactly that: every element within one bf16 ulp, at most 5e-4 of
-/// them differing, none for MB = 1 and 2.
+/// them differing, none for MB = 1 and 2. On Vulkan hc.comp writes out the
+/// block sums and the gate epilogue (`precise`, the GEMV's and
+/// `hc_mix_bf16`'s orders, 2026-11-13), and every row count is exact.
 #[test]
 fn batched_fused_up_mix_matches_unfused_kernels() {
     let ctx = MetalContext::new().expect("metal context");
@@ -775,7 +777,7 @@ fn batched_fused_up_mix_matches_unfused_kernels() {
                 mismatches.len(),
                 got.len()
             );
-            if m <= 2 {
+            if m <= 2 || cfg!(target_os = "linux") {
                 assert!(
                     mismatches.is_empty(),
                     "h={h} g={g} r={r} m={m}: {mismatches:?}"
@@ -1452,13 +1454,20 @@ fn hc_read_rows_chain_timing() {
             .collect();
         let modes = [("pair", true, true), ("down", true, false), ("up", false, true)];
         let mut best = vec![[f64::INFINITY; 3]; names.len()];
-        for round in 0..7 {
+        // Passes of `LILY_HC_REPEAT` (default 1) times the 64 sets, over
+        // `LILY_HC_ROUNDS` (default 7) rounds: short passes do not hold the
+        // GPU's clock.
+        let env = |k: &str, d: usize| -> usize {
+            std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+        };
+        let (repeat, rounds) = (env("LILY_HC_REPEAT", 1), env("LILY_HC_ROUNDS", 7));
+        for round in 0..rounds {
             for k_pair in 0..names.len() {
                 let which = (round + k_pair) % names.len();
                 let (dname, uname) = names[which];
                 for (mode, &(_, run_down, run_up)) in modes.iter().enumerate() {
                     let pass = ctx.begin_concurrent().expect("pass");
-                    for (d, u, j) in &weights {
+                    for (d, u, j) in weights.iter().cycle().take(repeat * sets) {
                         if run_down {
                             let dims = check_read_down(
                                 &t_hyper, &t_norm, d, Some(j), &down, &inj, &inv_rms, h,
@@ -1499,7 +1508,7 @@ fn hc_read_rows_chain_timing() {
                     let t = done.timing().expect("timing");
                     if round > 0 {
                         best[which][mode] = best[which][mode]
-                            .min((t.gpu_end_secs - t.gpu_start_secs) / sets as f64);
+                            .min((t.gpu_end_secs - t.gpu_start_secs) / (repeat * sets) as f64);
                     }
                 }
             }
@@ -1727,5 +1736,189 @@ fn inject_chain_timing() {
     }
     for (name, secs) in names.iter().zip(&best) {
         eprintln!("{name}: {:.2} us per level", secs * 1e6);
+    }
+}
+
+/// The up kernels specialized for the model's shape (`_r5w`: 4 streams, low
+/// rank 320, five turns) against the generic kernels, bit for bit, for the
+/// single-row kernel (which applies the SiLU itself) and every row count,
+/// on weights and activations of a wide range. The public wrappers route
+/// this shape to the specialized kernels, so the other tests at the model's
+/// shape cover them against the unfused kernels too.
+#[cfg(target_os = "linux")]
+#[test]
+fn up_mix_shape_kernels_match_generic() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(1113);
+    let (h, g, r) = (2560usize, 4usize, 320usize);
+    let k = g * h;
+    let norm_w = cpu_ref::round_bf16(&random(&mut rng, k, -0.5, 0.5));
+    let t_norm = Tensor::from_f32_as_bf16(&ctx, &norm_w, &[k]).expect("norm");
+    let up = random_q8(&ctx, &mut rng, k, r).0;
+    let bits = |t: &Tensor| -> Vec<u32> {
+        t.to_f32().expect("read").iter().map(|v| v.to_bits()).collect()
+    };
+    for m in 0..=HC_FUSED_MAX_ROWS {
+        // m = 0: the single-row kernel on logits.
+        let rows = m.max(1);
+        let hyper = cpu_ref::round_bf16(&random(&mut rng, rows * k, -3.0, 3.0));
+        let t_hyper =
+            Tensor::from_f32_as_bf16(&ctx, &hyper, &[rows, k]).expect("hyper");
+        let act = cpu_ref::round_bf16(&random(&mut rng, rows * r, -12.0, 12.0));
+        let t_act = Tensor::from_f32_as_bf16(&ctx, &act, &[rows, r]).expect("act");
+        let inv: Vec<f32> = random(&mut rng, rows * g, 0.05, 4.0);
+        let t_inv = Tensor::from_f32(&ctx, &inv, &[rows, g]).expect("inv_rms");
+        let run = |name: &'static str| -> Vec<u32> {
+            let mixed = Tensor::zeros(&ctx, &[rows, h], DType::BF16).expect("mixed");
+            let pass = ctx.begin_concurrent().expect("pass");
+            dispatch_read_up_mix(
+                &ctx,
+                &pass,
+                name,
+                &up,
+                &t_act,
+                &t_hyper,
+                &t_norm,
+                &t_inv,
+                &mixed,
+                h,
+                g,
+                rows,
+                m == 0,
+                1.0,
+            )
+            .expect("dispatch");
+            pass.level_barrier(&[&mixed]).expect("barrier");
+            pass.commit().expect("commit").wait_retain().expect("wait");
+            bits(&mixed)
+        };
+        let generic = if m == 0 {
+            "hc_read_up_mix_q8_g4"
+        } else {
+            HC_UP_MIX_ROWS_FNS[g - 1][m - 1]
+        };
+        let special = up_mix_shape_kernel(generic, g, r, up.group_size);
+        assert_ne!(special, generic, "no specialized kernel for {generic}");
+        let (a, b) = (run(generic), run(special));
+        let diff = a.iter().zip(&b).filter(|(x, y)| x != y).count();
+        assert_eq!(diff, 0, "{special}: {diff} of {} differ from {generic}", a.len());
+    }
+}
+
+/// The up kernels' f32 logits, before rounding (the `_dbg` builds store
+/// them), are the Q8 GEMV's (`gemv_quant` with an f32 output) bit for bit:
+/// the generic and the `_r5w` kernels, single-row and three-row. The bf16
+/// outputs hide most differences in summation order (a turn's sum in
+/// another order changed 18% of these logits, and the tokens, while every
+/// bf16 comparison passed), so the order is checked here. hc.comp writes it
+/// out (`hc_turn_sum`).
+#[cfg(target_os = "linux")]
+#[test]
+fn up_mix_logits_are_the_gemv_bits() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(77);
+    let (h, g, r, m) = (2560usize, 4usize, 320usize, 3usize);
+    let k = g * h;
+    for _ in 0..4 {
+        let up = random_q8(&ctx, &mut rng, k, r).0;
+        let norm_w = cpu_ref::round_bf16(&random(&mut rng, k, -0.5, 0.5));
+        let t_norm = Tensor::from_f32_as_bf16(&ctx, &norm_w, &[k]).expect("norm");
+        let down = cpu_ref::round_bf16(&random(&mut rng, m * r, -8.0, 8.0));
+        let t_down = Tensor::from_f32_as_bf16(&ctx, &down, &[m, r]).expect("down");
+        let t_act = Tensor::zeros(&ctx, &[m, r], DType::BF16).expect("act");
+        let hyper = cpu_ref::round_bf16(&random(&mut rng, m * k, -3.0, 3.0));
+        let t_hyper = Tensor::from_f32_as_bf16(&ctx, &hyper, &[m, k]).expect("hyper");
+        let inv: Vec<f32> = (0..m * g).map(|_| rng.gen_range(0.3f32..2.0)).collect();
+        let t_inv = Tensor::from_f32(&ctx, &inv, &[m, g]).expect("inv");
+        let pass = ctx.begin().expect("pass");
+        silu_scaled_bf16(&ctx, &pass, &t_down, &t_act, 1.0 / g as f32).expect("silu");
+        pass.commit_wait().expect("commit");
+        // The single-row kernels take each row's logits (and apply the
+        // SiLU), the three-row ones the activation.
+        let run = |name: &'static str, single: bool| -> Vec<f32> {
+            let out = Tensor::zeros(&ctx, &[m, k], DType::F32).expect("out");
+            let pipeline =
+                ctx.pipeline(name, SOURCE, MslVersion::V3_1).expect("pipeline");
+            let words: [[u8; 4]; 8] = [
+                u32_bytes(h),
+                u32_bytes(r),
+                u32_bytes(2),
+                u32_bytes(r / 64),
+                1.0f32.to_ne_bytes(),
+                (1.0f32 / g as f32).to_ne_bytes(),
+                u32_bytes(0),
+                u32_bytes(0),
+            ];
+            let grid = Grid::Threadgroups {
+                groups: (h.div_ceil(HC_UP_COLS * 2), 1, 1),
+                threadgroup: (HC_UP_COLS * 32, 1, 1),
+            };
+            let pass = ctx.begin().expect("pass");
+            let calls: Vec<[Tensor; 4]> = if single {
+                let v =
+                    |t: &Tensor, row: usize, n: usize| t.view(row * n, &[n]).unwrap();
+                (0..m)
+                    .map(|row| {
+                        [
+                            v(&t_down, row, r),
+                            v(&t_hyper, row, k),
+                            v(&t_inv, row, g),
+                            v(&out, row, k),
+                        ]
+                    })
+                    .collect()
+            } else {
+                vec![[t_act.clone(), t_hyper.clone(), t_inv.clone(), out.clone()]]
+            };
+            for [act, hy, iv, o] in &calls {
+                pass.dispatch_at(
+                    &pipeline,
+                    &[
+                        up.codes.binding(),
+                        up.scales.binding(),
+                        up.biases.binding(),
+                        act.binding(),
+                        hy.binding(),
+                        t_norm.binding(),
+                        iv.binding(),
+                        o.binding(),
+                    ],
+                    &[words.as_flattened()],
+                    grid,
+                )
+                .expect("dispatch");
+            }
+            pass.commit_wait().expect("commit");
+            out.to_f32().expect("read")
+        };
+        // The GEMV on each row's activation.
+        let gemv = Tensor::zeros(&ctx, &[m, k], DType::F32).expect("gemv");
+        let pass = ctx.begin().expect("pass");
+        for row in 0..m {
+            gemv_quant(
+                &ctx,
+                &pass,
+                &up,
+                &t_act.view(row * r, &[r]).expect("row"),
+                &gemv.view(row * k, &[k]).expect("row"),
+            )
+            .expect("gemv");
+        }
+        pass.commit_wait().expect("commit");
+        let base = gemv.to_f32().expect("read");
+        for (name, single) in [
+            ("hc_read_up_mix_q8_g4_dbg", true),
+            ("hc_read_up_mix_q8_g4_m3_dbg", false),
+            ("hc_read_up_mix_q8_g4_r5w_dbg", true),
+            ("hc_read_up_mix_q8_g4_m3_r5w_dbg", false),
+        ] {
+            let got = run(name, single);
+            let diff = base
+                .iter()
+                .zip(&got)
+                .filter(|(x, y)| x.to_bits() != y.to_bits())
+                .count();
+            assert_eq!(diff, 0, "{name}: {diff} of {} logits differ", base.len());
+        }
     }
 }
