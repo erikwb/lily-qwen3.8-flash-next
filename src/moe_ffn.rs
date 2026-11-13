@@ -135,9 +135,10 @@ pub(crate) fn project_stack_or_slices<const N: usize>(
 /// stage a bf16 dequant into `scratch` first (see `quant::gemm_q4_bf16_nt`),
 /// unless the site routes to a skinny small-m kernel (4- and 8-bit) or, on
 /// Vulkan, to the GEMM that dequantizes in its loop (`quant::fused_route`:
-/// the staged route's bits, for the chunks where it is the faster). Every
-/// route ends with one dispatch writing `c`; ordering after it is the
-/// caller's (the dequant staging carries its own internal barrier).
+/// the staged route's weights, K split where that is faster, for the chunks
+/// where it is the faster). Every route ends with one dispatch writing `c`;
+/// ordering after it is the caller's (the dequant staging carries its own
+/// internal barrier).
 pub(crate) fn project_mat(
     ctx: &MetalContext,
     pass: &ComputePass<'_>,
