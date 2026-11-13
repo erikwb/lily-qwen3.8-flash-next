@@ -482,6 +482,158 @@ pub fn gemm_quant_bf16_nt(
     pass.level_barrier(&[c])
 }
 
+/// A layout of the Vulkan dense quantized GEMM that dequantizes in its
+/// multiply loop (`vulkan/quant_dense.glsl`), over 16-row blocks of the
+/// weight: with `s` 0 a subgroup per block, running `mb` 16-row blocks of
+/// the activations; with `s` > 0 a threadgroup of `s` subgroups per block,
+/// `s - mb` (1 to 4) of them dequantizing it for `mb` that multiply.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct FusedTile {
+    pub mb: usize,
+    pub s: usize,
+}
+
+#[cfg(target_os = "linux")]
+impl FusedTile {
+    pub fn kernel(self, bits: usize) -> Result<&'static str> {
+        ensure!(
+            self.s == 0 || (self.s > self.mb && self.s - self.mb <= 4),
+            "no fused dense GEMM tile {self:?}"
+        );
+        Ok(match (bits, self.s > 0, self.mb) {
+            (4, false, 1) => "gemm_q4_nt_dense_b1",
+            (4, false, 2) => "gemm_q4_nt_dense_b2",
+            (4, false, 4) => "gemm_q4_nt_dense_b4",
+            (8, false, 1) => "gemm_q8_nt_dense_b1",
+            (8, false, 2) => "gemm_q8_nt_dense_b2",
+            (8, false, 4) => "gemm_q8_nt_dense_b4",
+            (4, true, 1) => "gemm_q4_nt_dense_pc_b1",
+            (4, true, 2) => "gemm_q4_nt_dense_pc_b2",
+            (4, true, 4) => "gemm_q4_nt_dense_pc_b4",
+            (8, true, 1) => "gemm_q8_nt_dense_pc_b1",
+            (8, true, 2) => "gemm_q8_nt_dense_pc_b2",
+            (8, true, 4) => "gemm_q8_nt_dense_pc_b4",
+            _ => anyhow::bail!("no fused dense GEMM for {bits} bits, tile {self:?}"),
+        })
+    }
+}
+
+/// Subgroups per threadgroup of the fused dense GEMM (each its own tile).
+#[cfg(target_os = "linux")]
+const FUSED_SUBGROUPS: usize = 2;
+
+/// Whether the fused dense GEMM takes this weight and these tensors: 4 or 8
+/// bits, K a multiple of 64, quant groups at least 64 deep, A `[M, K]` and
+/// C of M x N elements, both bf16 at word-aligned addresses.
+#[cfg(target_os = "linux")]
+pub fn fused_takes(a: &Tensor, w: &QuantWeights, c: &Tensor) -> bool {
+    a.shape().len() == 2
+        && a.shape()[1] == w.in_features()
+        && c.numel() == a.shape()[0] * w.out_features()
+        && matches!(w.bits, 4 | 8)
+        && w.in_features().is_multiple_of(64)
+        && w.group_size >= 64
+        && w.group_size.is_power_of_two()
+        && a.dtype() == DType::BF16
+        && c.dtype() == DType::BF16
+        && a.binding().1.is_multiple_of(4)
+        && c.binding().1.is_multiple_of(4)
+}
+
+/// The fused dense GEMM's tile for an `m`-row chunk through this weight, or
+/// `None` where the staged route (dequant to bf16, `gemm_bf16_nt_nax`) is
+/// the faster. Measured 2026-11-13 on the M5 Max at the model's shapes, us
+/// per call in a chain of barriered calls (`dense_quant_gemm_timing`; a
+/// prefill pass's dense projections at 32 rows: staged 160 ms, fused 38):
+///
+/// - Where N is a few hundred rows or fewer the direct tiles have few
+///   subgroups, each a long chain of groups, and the producer tile (`s` > 0)
+///   is the fast one: q8 320 x 10 240 at 32 rows 83 (direct 162, staged
+///   420), 512 x 2 560 23 (42, 121); at up to 256 rows with four blocks of
+///   activation rows, 99 and 28 at 128 rows.
+/// - Where N fills the GPU, the direct tile with as many blocks of
+///   activation rows as keep 512 subgroups in the grid: q4 10 240 x 2 560
+///   at 128 rows 209 (staged 315), 2 560 x 6 144 145 (376). At up to 32
+///   rows an N under 8 192 takes the producer tile with two multiplying
+///   subgroups: 2 560 x 6 144 69 (direct 90).
+/// - The staged route ties from 384 rows where N and K are both large (q4
+///   10 240 x 2 560 618 against 601) and wins from 512; where N is a few
+///   hundred, from 2 048 (q8 512 x 2 560 218 against 161); never where it is
+///   tiny (4 x 10 240 at 4 096 rows 199 against 422).
+#[cfg(target_os = "linux")]
+pub fn fused_route(a: &Tensor, w: &QuantWeights, c: &Tensor) -> Option<FusedTile> {
+    let (m, n, k) = (a.shape()[0], w.out_features(), w.in_features());
+    if !fused_takes(a, w, c) {
+        return None;
+    }
+    let max_m = match (n, k) {
+        (..=64, _) => usize::MAX,
+        (_, ..=1024) | (..=640, ..=4096) => 1024,
+        (..=640, _) => 2048,
+        _ => 256,
+    };
+    if m > max_m {
+        return None;
+    }
+    if n <= 64 || (n <= 640 && m <= 64) {
+        return Some(FusedTile { mb: 1, s: 5 });
+    }
+    if n <= 640 && m <= 256 {
+        return Some(FusedTile { mb: 4, s: 8 });
+    }
+    if m <= 32 && n < 8192 {
+        return Some(FusedTile { mb: 2, s: 4 });
+    }
+    let mb = [4, 2]
+        .into_iter()
+        .find(|&mb| n.div_ceil(16) * m.div_ceil(16 * mb) >= 512)
+        .unwrap_or(1);
+    Some(FusedTile { mb, s: 0 })
+}
+
+/// `C[M, N] = A[M, K] . dequant(W)^T` in one dispatch that dequantizes in
+/// its multiply loop: the staged route's result bit for bit
+/// (`gemm_quant_fused_matches_staged`), without its bf16 copy of W.
+#[cfg(target_os = "linux")]
+pub fn gemm_quant_fused_nt(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    a: &Tensor,
+    w: &QuantWeights,
+    c: &Tensor,
+    tile: FusedTile,
+) -> Result<()> {
+    let (n, k) = check_quant(w)?;
+    ensure!(fused_takes(a, w, c), "the fused dense GEMM does not take this weight");
+    let m = a.shape()[0];
+    ensure!(a.shape() == [m, k], "A shape {:?} != [{m}, {k}]", a.shape());
+    ensure!(c.numel() == m * n, "C numel {} != {m}x{n}", c.numel());
+    let pipeline = ctx.pipeline(tile.kernel(w.bits)?, SOURCE, MslVersion::V4_0)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[
+            w.codes.binding(),
+            w.scales.binding(),
+            w.biases.binding(),
+            a.binding(),
+            c.binding(),
+        ],
+        &[&u32_bytes(k), &u32_bytes(n), &u32_bytes(m), &u32_bytes(w.group_size)],
+        if tile.s > 0 {
+            Grid::Threadgroups {
+                groups: (n.div_ceil(16), m.div_ceil(16 * tile.mb), 1),
+                threadgroup: (32 * tile.s, 1, 1),
+            }
+        } else {
+            Grid::Threadgroups {
+                groups: (n.div_ceil(16 * FUSED_SUBGROUPS), m.div_ceil(16 * tile.mb), 1),
+                threadgroup: (32 * FUSED_SUBGROUPS, 1, 1),
+            }
+        },
+    )
+}
+
 /// Block-mapped grouped GEMM with Q4 dequantization fused into B-tile staging.
 /// `tile` must match the configuration used to build the block map.
 #[allow(clippy::too_many_arguments)]
