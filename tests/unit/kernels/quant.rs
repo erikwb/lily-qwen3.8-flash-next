@@ -1334,6 +1334,328 @@ fn gemm_quant_fused_matches_staged() {
     }
 }
 
+/// A random quantized weight at `bits` with `gs`-deep quant groups, as
+/// [`random_weights`] (which takes 64).
+#[cfg(target_os = "linux")]
+fn random_weights_gs(
+    ctx: &MetalContext,
+    rng: &mut StdRng,
+    bits: usize,
+    rows: usize,
+    k: usize,
+    gs: usize,
+) -> QuantWeights {
+    let (words, groups) = (k * bits / 32, k / gs);
+    let mut codes = vec![0u32; rows * words];
+    rng.fill(&mut codes[..]);
+    let (lo, hi) = if bits == 4 { (0.002, 0.02) } else { (0.0002, 0.002) };
+    let mut params = |lo: f32, hi: f32| -> Vec<bf16> {
+        (0..rows * groups).map(|_| bf16::from_f32(rng.gen_range(lo..hi))).collect()
+    };
+    let scales = params(lo, hi);
+    let biases = params(-0.15, 0.0);
+    let upload = |v: &[u8], shape: &[usize], dtype| {
+        Tensor::from_bytes(ctx, v, shape, dtype).expect("weight upload")
+    };
+    QuantWeights {
+        codes: upload(bytemuck::cast_slice(&codes), &[rows, words], DType::U32),
+        scales: upload(bytemuck::cast_slice(&scales), &[rows, groups], DType::BF16),
+        biases: upload(bytemuck::cast_slice(&biases), &[rows, groups], DType::BF16),
+        group_size: gs,
+        bits,
+    }
+}
+
+/// The model's dense projections (bits, N, K) and the most rows of a chunk
+/// `fused_route` sends to the fused GEMM through them (`None`: every chunk).
+#[cfg(target_os = "linux")]
+const ROUTE_SHAPES: [(usize, usize, usize, Option<usize>); 13] = [
+    (4, 10240, 2560, Some(256)),
+    (4, 6144, 2560, Some(256)),
+    (4, 2560, 6144, Some(256)),
+    (4, 48, 2560, None),
+    (8, 12288, 2560, Some(256)),
+    (8, 2560, 6144, Some(256)),
+    (8, 512, 2560, Some(1024)),
+    (8, 640, 2560, Some(1024)),
+    (8, 2560, 640, Some(1024)),
+    (8, 320, 10240, Some(2048)),
+    (8, 10240, 320, Some(1024)),
+    (8, 4, 10240, None),
+    (8, 1, 2560, None),
+];
+
+/// The fused dense GEMM's route on the host: `fused_route` at the model's
+/// shapes on both sides of their row limits (256/257, 1024/1025,
+/// 2048/2049; none for N of 64 or fewer) and of the skinny kernels' (16/17,
+/// `project_mat` takes those first); it rejects K not a multiple of 64,
+/// quant groups under 64 deep or not a power of two, other bit widths, and
+/// A or C of another type or shape, and takes 128- and 256-deep groups;
+/// every tile `fused_tile` returns at those shapes up to 4 096 rows has a
+/// kernel and runs at least two groups per split subgroup; `FusedTile`
+/// names no kernel for an illegal tile, and `gemm_quant_fused_nt` refuses
+/// an illegal tile or a weight the route rejects. The route's tensors are
+/// views of two zeroed pools (it reads shapes, types and offsets only).
+#[cfg(target_os = "linux")]
+#[test]
+fn fused_route_limits_and_rejections() {
+    let ctx = MetalContext::new().expect("metal context");
+    let pool = Tensor::zeros(&ctx, &[2049 * 10240], DType::BF16).expect("pool");
+    let code_pool = Tensor::zeros(&ctx, &[12288 * 640], DType::U32).expect("code pool");
+    let weights = |bits: usize, n: usize, k: usize, gs: usize| QuantWeights {
+        codes: code_pool.view(0, &[n, k * bits / 32]).expect("codes"),
+        scales: pool.view(0, &[n, k / gs]).expect("scales"),
+        biases: pool.view(0, &[n, k / gs]).expect("biases"),
+        group_size: gs,
+        bits,
+    };
+    let route = |w: &QuantWeights, m: usize| {
+        let (n, k) = (w.out_features(), w.in_features());
+        let a = pool.view(0, &[m, k]).expect("a");
+        let c = pool.view(0, &[m, n]).expect("c");
+        fused_route(&a, w, &c)
+    };
+
+    use crate::kernels::skinny::dense_smallm_routes;
+    assert!(dense_smallm_routes(16) && !dense_smallm_routes(17));
+    for &(bits, n, k, limit) in &ROUTE_SHAPES {
+        let w = weights(bits, n, k, 64);
+        let label = format!("{bits}-bit [{n} x {k}]");
+        assert_eq!(route(&w, 17), Some(fused_tile(17, n, k)), "{label} m=17");
+        match limit {
+            Some(limit) => {
+                assert_eq!(
+                    route(&w, limit),
+                    Some(fused_tile(limit, n, k)),
+                    "{label} m={limit}"
+                );
+                assert_eq!(route(&w, limit + 1), None, "{label} m={}", limit + 1);
+            }
+            None => assert!(route(&w, 2049).is_some(), "{label} m=2049"),
+        }
+        for m in 1..=4096 {
+            let t = fused_tile(m, n, k);
+            assert!(
+                t.kernel(bits).is_ok()
+                    && (t.k == 1 || k / 64 >= 2 * t.k)
+                    && 8 * t.mb < m.max(9),
+                "{label} m={m}: tile {t:?}"
+            );
+        }
+    }
+
+    // (bits, N, K, group size, taken)
+    for (bits, n, k, gs, taken) in [
+        (4, 48, 2560, 128, true),
+        (8, 320, 10240, 256, true),
+        (4, 40, 96, 32, false),
+        (8, 24, 96, 64, false),
+        (4, 33, 128, 32, false),
+        (8, 64, 192, 96, false),
+        (2, 48, 2560, 64, false),
+    ] {
+        let w = weights(bits, n, k, gs);
+        assert_eq!(route(&w, 32).is_some(), taken, "{bits}-bit [{n} x {k}] gs={gs}");
+    }
+    let w = weights(8, 320, 2560, 64);
+    let a = pool.view(0, &[32, 2560]).expect("a");
+    let c = pool.view(0, &[32, 320]).expect("c");
+    assert!(fused_route(&a, &w, &c).is_some());
+    let a32 = Tensor::zeros(&ctx, &[32, 2560], DType::F32).expect("a f32");
+    let c32 = Tensor::zeros(&ctx, &[32, 320], DType::F32).expect("c f32");
+    for (what, a, c) in [
+        ("A f32", &a32, &c),
+        ("C f32", &a, &c32),
+        ("A of another K", &pool.view(0, &[32, 2496]).expect("a"), &c),
+        ("A flat", &pool.view(0, &[32 * 2560]).expect("a"), &c),
+        ("C short a row", &a, &pool.view(0, &[31, 320]).expect("c")),
+    ] {
+        assert_eq!(fused_route(a, &w, c), None, "{what}");
+    }
+
+    for t in [(3, 1), (8, 1), (0, 1), (1, 0), (1, 3), (1, 6), (1, 64), (2, 32), (4, 16)]
+    {
+        let t = FusedTile { mb: t.0, k: t.1 };
+        for bits in [4, 8] {
+            assert!(t.kernel(bits).is_err(), "{bits}-bit tile {t:?}");
+        }
+    }
+    for k in [1, 2, 4, 8, 16, 32] {
+        for mb in [1, 2, 4] {
+            let t = FusedTile { mb, k };
+            assert_eq!(t.kernel(4).is_ok(), k * mb <= 32 || k == 1, "tile {t:?}");
+            assert_eq!(t.kernel(8).is_ok(), k * mb <= 32 || k == 1, "tile {t:?}");
+            assert!(t.kernel(2).is_err() && t.kernel(6).is_err(), "tile {t:?}");
+        }
+    }
+
+    let pass = ctx.begin().expect("pass");
+    let tile = FusedTile { mb: 1, k: 1 };
+    let out = Tensor::zeros(&ctx, &[32, 320], DType::BF16).expect("c");
+    assert!(gemm_quant_fused_nt(&ctx, &pass, &a, &w, &out, tile).is_ok());
+    for t in [(3, 1), (1, 64), (4, 16)] {
+        let t = FusedTile { mb: t.0, k: t.1 };
+        assert!(
+            gemm_quant_fused_nt(&ctx, &pass, &a, &w, &out, t).is_err(),
+            "tile {t:?}"
+        );
+    }
+    let (a, c) =
+        (pool.view(0, &[32, 128]).expect("a"), pool.view(0, &[32, 40]).expect("c"));
+    assert!(
+        gemm_quant_fused_nt(&ctx, &pass, &a, &weights(4, 40, 128, 32), &c, tile)
+            .is_err()
+    );
+    pass.commit_wait().expect("commit");
+}
+
+/// `project_mat`, the route of a prefill chunk's dense projections, against
+/// the staged route: every tile `fused_route` takes at the model's shapes
+/// (at its cheapest point there; the split ones k4b1, k4b4, k8b2 and k16b1
+/// among them), the final M tile of 15 rows at the 256- and 1 024-row
+/// limits, 128- and 256-deep quant groups, and K not a multiple of 64 or
+/// 32-deep groups, which must take the staged route. A starts 4 bytes into
+/// its buffer (a row in, 16-byte aligned, for one 128-deep group case and
+/// the staged ones), C 4 bytes past two rows filled with a sentinel, as are
+/// two rows after it, which must all stay.
+/// Unsplit tiles and the staged route must match it bit for bit, split
+/// ones as `gemm_quant_split_matches_reference` (here at sampled rows).
+#[cfg(target_os = "linux")]
+#[test]
+fn project_mat_routes_match_staged() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(44);
+    // (bits, N, K, group size, rows, A's offset in elements)
+    let mut cases = vec![
+        (8usize, 640usize, 2560usize, 64usize, 1023usize, 2usize),
+        (4, 2560, 6144, 64, 255, 2),
+        (4, 48, 2560, 128, 45, 2),
+        (8, 320, 10240, 128, 100, 10240),
+        (8, 512, 2560, 256, 33, 2),
+        (4, 2560, 6144, 256, 64, 2),
+        (4, 40, 96, 32, 33, 96),
+        (8, 24, 160, 32, 20, 160),
+        (4, 33, 128, 32, 45, 128),
+    ];
+    let mut routed: Vec<(FusedTile, (usize, usize, usize, usize))> = Vec::new();
+    for &(bits, n, k, limit) in &ROUTE_SHAPES {
+        for m in 17..=limit.unwrap_or(4096) {
+            let tile = fused_tile(m, n, k);
+            match routed.iter_mut().find(|(t, _)| *t == tile) {
+                Some((_, at)) if n * k * m < at.1 * at.2 * at.3 => {
+                    *at = (bits, n, k, m)
+                }
+                Some(_) => {}
+                None => routed.push((tile, (bits, n, k, m))),
+            }
+        }
+    }
+    cases.extend(routed.iter().map(|&(_, (bits, n, k, m))| (bits, n, k, 64, m, 2)));
+    let sentinel = bf16::from_f32(1.0e30);
+    for (bits, n, k, gs, m, off) in cases {
+        let label = format!("{bits}-bit [{n} x {k}] gs={gs} m={m} A at {off}");
+        let w = random_weights_gs(&ctx, &mut rng, bits, n, k, gs);
+        let av: Vec<f32> =
+            (0..off + m * k).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+        let a_all = Tensor::from_f32_as_bf16(&ctx, &av, &[off + m * k]).expect("a");
+        let a = a_all.view(off, &[m, k]).expect("a view");
+        let a_ref = Tensor::from_f32_as_bf16(&ctx, &av[off..], &[m, k]).expect("a");
+        let c_all = Tensor::from_bytes(
+            &ctx,
+            bytemuck::cast_slice(&vec![sentinel; (m + 4) * n + 2]),
+            &[(m + 4) * n + 2],
+            DType::BF16,
+        )
+        .expect("c");
+        let c_at = 2 * n + 2;
+        let c = c_all.view(c_at, &[m, n]).expect("c view");
+        let staged = Tensor::zeros(&ctx, &[m, n], DType::BF16).expect("c");
+        let scratch_ref = Tensor::zeros(&ctx, &[n, k], DType::BF16).expect("scratch");
+        let scratch = Tensor::zeros(&ctx, &[n, k], DType::BF16).expect("scratch");
+        let route = fused_route(&a, &w, &c);
+        assert_eq!(
+            route.is_some(),
+            k % 64 == 0 && gs >= 64,
+            "{label}: route {route:?}"
+        );
+        let pass = ctx.begin().expect("pass");
+        gemm_quant_bf16_nt(&ctx, &pass, &a_ref, &w, &staged, &scratch_ref)
+            .expect("staged");
+        crate::moe_ffn::project_mat(&ctx, &pass, &a, &w, &c, &scratch).expect("routed");
+        pass.commit_wait().expect("commit");
+
+        let all = c_all.to_f32().expect("read");
+        let outside = all[..c_at]
+            .iter()
+            .chain(&all[c_at + m * n..])
+            .filter(|v| v.to_bits() != sentinel.to_f32().to_bits())
+            .count();
+        assert_eq!(
+            outside, 0,
+            "{label}: route {route:?} wrote {outside} outputs outside C"
+        );
+        let got = &all[c_at..c_at + m * n];
+        let want = staged.to_f32().expect("read");
+        assert!(want.iter().any(|&v| v != 0.0), "{label}: empty output");
+        match route {
+            Some(tile) if tile.k > 1 => {
+                let wv = scratch_ref.to_f32().expect("weights");
+                let ar = a_ref.to_f32().expect("a");
+                let mut rows: Vec<usize> = (0..m.min(16))
+                    .chain(m.saturating_sub(24)..m)
+                    .chain((0..m).step_by(37))
+                    .collect();
+                rows.sort_unstable();
+                rows.dedup();
+                let mut cols: Vec<usize> = (0..n.min(24))
+                    .chain(n.saturating_sub(24)..n)
+                    .chain((0..n).step_by(97))
+                    .collect();
+                cols.sort_unstable();
+                cols.dedup();
+                let (mut err, mut staged_err) = (0.0f64, 0.0f64);
+                for &r in &rows {
+                    for &col in &cols {
+                        let (mut sum, mut l1) = (0.0f64, 0.0f64);
+                        for e in 0..k {
+                            let t = ar[r * k + e] as f64 * wv[col * k + e] as f64;
+                            sum += t;
+                            l1 += t.abs();
+                        }
+                        let (i, tol) = (r * n + col, sum.abs() / 256.0 + 1e-5 * l1);
+                        assert!(
+                            (got[i] as f64 - sum).abs() <= tol,
+                            "{label} tile {tile:?} output {i}: {} against {sum} \
+                             (tolerance {tol})",
+                            got[i]
+                        );
+                        err += (got[i] as f64 - sum).abs();
+                        staged_err += (want[i] as f64 - sum).abs();
+                    }
+                }
+                assert!(
+                    err <= 1.1 * staged_err + 1e-9 * (rows.len() * cols.len()) as f64,
+                    "{label} tile {tile:?}: summed error {err:e}, the staged \
+                     route's {staged_err:e}"
+                );
+            }
+            _ => {
+                let differ = got
+                    .iter()
+                    .zip(&want)
+                    .filter(|(g, w)| g.to_bits() != w.to_bits())
+                    .count();
+                assert_eq!(
+                    differ,
+                    0,
+                    "{label} route {route:?}: {differ} of {} outputs differ",
+                    m * n
+                );
+            }
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn tile_label(t: &FusedTile) -> String {
     if t.k > 1 { format!("k{}b{}", t.k, t.mb) } else { format!("b{}", t.mb) }
