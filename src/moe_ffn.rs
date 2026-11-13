@@ -133,7 +133,9 @@ pub(crate) fn project_stack_or_slices<const N: usize>(
 
 /// Dispatches a GEMM on the projection's storage precision; quantized weights
 /// stage a bf16 dequant into `scratch` first (see `quant::gemm_q4_bf16_nt`),
-/// unless the site routes to a skinny small-m kernel (4- and 8-bit). Every
+/// unless the site routes to a skinny small-m kernel (4- and 8-bit) or, on
+/// Vulkan, to the GEMM that dequantizes in its loop (`quant::fused_route`:
+/// the staged route's bits, for the chunks where it is the faster). Every
 /// route ends with one dispatch writing `c`; ordering after it is the
 /// caller's (the dequant staging carries its own internal barrier).
 pub(crate) fn project_mat(
@@ -155,6 +157,10 @@ pub(crate) fn project_mat(
         {
             return skinny::gemm_skinny_q8_nt(ctx, pass, a, w, c);
         }
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(tile) = quant::fused_route(a, w, c) {
+        return quant::gemm_quant_fused_nt(ctx, pass, a, w, c, tile);
     }
     quant::gemm_quant_bf16_nt(ctx, pass, a, w, c, scratch)
 }

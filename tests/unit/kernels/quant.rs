@@ -1120,3 +1120,230 @@ fn grouped_expert_gemm_timing() {
         eprintln!("{line}");
     }
 }
+
+/// Every fused dense tile.
+#[cfg(target_os = "linux")]
+const FUSED_TILES: [FusedTile; 8] = [
+    FusedTile { mb: 1, s: 0 },
+    FusedTile { mb: 2, s: 0 },
+    FusedTile { mb: 4, s: 0 },
+    FusedTile { mb: 1, s: 2 },
+    FusedTile { mb: 1, s: 5 },
+    FusedTile { mb: 2, s: 4 },
+    FusedTile { mb: 2, s: 6 },
+    FusedTile { mb: 4, s: 8 },
+];
+
+/// A random quantized weight at `bits` without its dequantized image, with
+/// scales and biases in the checkpoint's ranges.
+fn random_weights(
+    ctx: &MetalContext,
+    rng: &mut StdRng,
+    bits: usize,
+    rows: usize,
+    k: usize,
+) -> QuantWeights {
+    if bits == 4 {
+        return random_q4_weights(ctx, rng, rows, k);
+    }
+    let (words, groups) = (k / 4, k / GROUP_SIZE);
+    let mut codes = vec![0u32; rows * words];
+    rng.fill(&mut codes[..]);
+    let mut params = |lo: f32, hi: f32| -> Vec<bf16> {
+        (0..rows * groups).map(|_| bf16::from_f32(rng.gen_range(lo..hi))).collect()
+    };
+    let scales = params(0.0002, 0.002);
+    let biases = params(-0.15, 0.0);
+    let upload = |v: &[u8], shape: &[usize], dtype| {
+        Tensor::from_bytes(ctx, v, shape, dtype).expect("weight upload")
+    };
+    QuantWeights {
+        codes: upload(bytemuck::cast_slice(&codes), &[rows, words], DType::U32),
+        scales: upload(bytemuck::cast_slice(&scales), &[rows, groups], DType::BF16),
+        biases: upload(bytemuck::cast_slice(&biases), &[rows, groups], DType::BF16),
+        group_size: GROUP_SIZE,
+        bits: 8,
+    }
+}
+
+/// The fused dense GEMM reproduces the staged route (dequant to bf16, then
+/// `gemm_bf16_nt_nax`) bit for bit, in every tile: the model's dense shapes
+/// at both widths (the GDN projections at 4 bits; attention, shared expert,
+/// router, hyper-connection and inject at 8) and odd ones (N odd or below a
+/// block, a 64-deep K), at row counts on both sides of the 16-row blocks
+/// and the tiles' heights, A and C at a word offset into their buffers.
+#[cfg(target_os = "linux")]
+#[test]
+fn gemm_quant_fused_matches_staged() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(41);
+    let shapes = [
+        (4usize, 6144usize, 2560usize),
+        (4, 2560, 6144),
+        (4, 48, 2560),
+        (8, 12288, 2560),
+        (8, 320, 10240),
+        (8, 10240, 320),
+        (8, 2560, 640),
+        (8, 512, 2560),
+        (8, 4, 10240),
+        (8, 1, 2560),
+        (4, 33, 64),
+        (8, 7, 128),
+    ];
+    for (bits, n, k) in shapes {
+        let w = random_weights(&ctx, &mut rng, bits, n, k);
+        let scratch = Tensor::zeros(&ctx, &[n, k], DType::BF16).expect("scratch");
+        for m in [17usize, 32, 45, 64, 100, 200] {
+            let av: Vec<f32> = (0..(m + 1) * k).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+            // A and C into their buffers, by a row and by two.
+            let a_all = Tensor::from_f32_as_bf16(&ctx, &av, &[m + 1, k]).expect("a");
+            let a = a_all.view(k, &[m, k]).expect("a view");
+            let staged = Tensor::zeros(&ctx, &[m, n], DType::BF16).expect("c");
+            let fused: Vec<Tensor> = FUSED_TILES
+                .iter()
+                .map(|_| Tensor::zeros(&ctx, &[m + 2, n], DType::BF16).expect("c"))
+                .collect();
+            let pass = ctx.begin().expect("pass");
+            gemm_quant_bf16_nt(&ctx, &pass, &a, &w, &staged, &scratch).expect("staged");
+            for (tile, c) in FUSED_TILES.iter().zip(&fused) {
+                let c = c.view(2 * n, &[m, n]).expect("c view");
+                gemm_quant_fused_nt(&ctx, &pass, &a, &w, &c, *tile).expect("fused");
+            }
+            pass.commit_wait().expect("commit");
+            let want = output_bits(&staged);
+            assert!(want.iter().any(|&b| b != 0), "{bits}-bit [{n} x {k}] m={m}: empty output");
+            for (tile, c) in FUSED_TILES.iter().zip(&fused) {
+                let got = output_bits(&c.view(2 * n, &[m, n]).expect("c view"));
+                let differ = got.iter().zip(&want).filter(|(g, w)| g != w).count();
+                assert_eq!(
+                    differ,
+                    0,
+                    "{bits}-bit [{n} x {k}] m={m} tile {tile:?}: {differ} of {} outputs differ",
+                    got.len()
+                );
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn tile_label(t: &FusedTile) -> String {
+    if t.s > 0 { format!("p{}b{}", t.s, t.mb) } else { format!("b{}", t.mb) }
+}
+
+/// The dense projections of a prefill chunk at the model's shapes, per call
+/// in a chain of barriered levels over four distinct weights each: the
+/// staged route (dequant, barrier, `gemm_bf16_nt_nax`, barrier) against the
+/// fused GEMM's tiles, us per call, best of several passes, at the row
+/// counts of `LILY_DENSE_M` (default 32,128,512). `LILY_DENSE_TILES=b2,p5b1,..`
+/// times those tiles only; `LILY_DENSE_SHAPES=bits:n:k,..` those shapes.
+/// `cargo test --release --lib -- --ignored --nocapture
+/// dense_quant_gemm_timing`.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "timing only"]
+fn dense_quant_gemm_timing() {
+    let ctx = MetalContext::new().expect("metal context");
+    let mut rng = StdRng::seed_from_u64(42);
+    let env_list = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+    let ms: Vec<usize> = env_list("LILY_DENSE_M")
+        .map(|v| v.split(',').map(|x| x.parse().expect("m")).collect())
+        .unwrap_or(vec![32, 128, 512]);
+    let tiles: Vec<FusedTile> = env_list("LILY_DENSE_TILES")
+        .map(|v| {
+            v.split(',')
+                .map(|t| {
+                    let b = t.as_bytes();
+                    // b<MB>, or p<S>b<MB>: the producer tile.
+                    if b[0] == b'p' {
+                        FusedTile { mb: (b[3] - b'0') as usize, s: (b[1] - b'0') as usize }
+                    } else {
+                        FusedTile { mb: (b[1] - b'0') as usize, s: 0 }
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or(FUSED_TILES.to_vec());
+    // (bits, N, K, calls per prefill pass)
+    let shapes: Vec<(usize, usize, usize, usize)> = env_list("LILY_DENSE_SHAPES")
+        .map(|v| {
+            v.split(',')
+                .map(|s| {
+                    let p: Vec<usize> = s.split(':').map(|x| x.parse().expect("shape")).collect();
+                    (p[0], p[1], p[2], 1)
+                })
+                .collect()
+        })
+        .unwrap_or(vec![
+            (4, 10240, 2560, 36),
+            (4, 6144, 2560, 36),
+            (4, 2560, 6144, 36),
+            (4, 48, 2560, 72),
+            (8, 12288, 2560, 12),
+            (8, 2560, 6144, 12),
+            (8, 512, 2560, 72),
+            (8, 640, 2560, 108),
+            (8, 2560, 640, 48),
+            (8, 320, 10240, 96),
+            (8, 10240, 320, 96),
+            (8, 4, 10240, 96),
+            (8, 1, 2560, 48),
+        ]);
+    let copies = 4;
+    for &m in &ms {
+        let mut totals = vec![0.0f64; tiles.len() + 1];
+        for &(bits, n, k, calls) in &shapes {
+            let ws: Vec<QuantWeights> =
+                (0..copies).map(|_| random_weights(&ctx, &mut rng, bits, n, k)).collect();
+            let av: Vec<f32> = (0..m * k).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+            let a = Tensor::from_f32_as_bf16(&ctx, &av, &[m, k]).expect("a");
+            let c = Tensor::zeros(&ctx, &[m, n], DType::BF16).expect("c");
+            let scratch = Tensor::zeros(&ctx, &[n, k], DType::BF16).expect("scratch");
+            // GPU timestamps here resolve a millisecond or two: the first
+            // pass sizes the others to about 60 ms.
+            let time = |run: &dyn Fn(&ComputePass<'_>, &QuantWeights)| -> f64 {
+                let mut best = f64::MAX;
+                let mut reps = 8usize;
+                for i in 0..4 {
+                    let pass = ctx.begin_concurrent().expect("pass");
+                    for _ in 0..reps {
+                        for w in &ws {
+                            run(&pass, w);
+                            pass.level_barrier(&[&c]).expect("barrier");
+                        }
+                    }
+                    let done = pass.commit().expect("commit").wait_retain().expect("wait");
+                    let t = done.timing().expect("timing");
+                    let per = (t.gpu_end_secs - t.gpu_start_secs) / (reps * copies) as f64;
+                    if i == 0 {
+                        reps = ((0.06 / (per.max(1e-6) * copies as f64)) as usize).clamp(8, 4000);
+                    } else {
+                        best = best.min(per);
+                    }
+                }
+                best * 1e6
+            };
+            let staged = time(&|pass, w| {
+                gemm_quant_bf16_nt(&ctx, pass, &a, w, &c, &scratch).expect("staged")
+            });
+            let mut line = format!(
+                "m={m:5} q{bits} [{n:5} x {k:5}] x{calls:3}: staged {staged:8.1}",
+            );
+            totals[0] += staged * calls as f64;
+            for (i, tile) in tiles.iter().enumerate() {
+                let us = time(&|pass, w| {
+                    gemm_quant_fused_nt(&ctx, pass, &a, w, &c, *tile).expect("fused")
+                });
+                totals[i + 1] += us * calls as f64;
+                line += &format!(" {} {us:8.1}", tile_label(tile));
+            }
+            eprintln!("{line}");
+        }
+        let mut line = format!("m={m:5} per pass ms: staged {:7.2}", totals[0] / 1e3);
+        for (i, tile) in tiles.iter().enumerate() {
+            line += &format!(" {} {:7.2}", tile_label(tile), totals[i + 1] / 1e3);
+        }
+        eprintln!("{line}");
+    }
+}
