@@ -474,6 +474,7 @@ fn dsa_store_and_attend_match_cpu() {
             &scores,
             &denom,
             &lat,
+            &zeros(&ctx, 4 * 8 * 64 * 512),
             m,
             s,
             1.0 / 16.0,
@@ -507,6 +508,159 @@ fn dsa_store_and_attend_match_cpu() {
                 1e-5,
                 1e-4,
             );
+        }
+    }
+}
+
+/// The attention over selected rows (the sparse and MTP paths): per-row
+/// lists with unused slots, against the CPU.
+#[test]
+fn dsa_attend_selected_matches_cpu() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(70);
+    let (cached, m, s, count) = (700usize, 2usize, 2056usize, 344usize);
+    let lat_rows: Vec<f32> =
+        f32s(&mut rng, cached * 512, -1.5, 1.5).into_iter().map(r::round_f16).collect();
+    let bytes: Vec<u8> = lat_rows
+        .iter()
+        .flat_map(|&v| f16::from_f32(v).to_bits().to_le_bytes())
+        .collect();
+    let cache = Tensor::from_bytes(&ctx, &bytes, &[cached * 512], DType::F16).unwrap();
+    let mut sel = vec![u32::MAX; m * s];
+    let mut lists = Vec::new();
+    for i in 0..m {
+        let mut l = Vec::new();
+        for slot in 0..count {
+            // Every seventh slot unused; rows spread over the cache.
+            if slot % 7 != 3 {
+                let row = (slot * 131 + i * 17) % cached;
+                sel[i * s + slot] = row as u32;
+                l.push(row);
+            }
+        }
+        lists.push(l);
+    }
+    let tsel =
+        Tensor::from_bytes(&ctx, bytemuck::cast_slice(&sel), &[m * s], DType::U32)
+            .unwrap();
+    let qk = f32s(&mut rng, m * 64 * 512, -0.2, 0.2);
+    let tqk = tensor(&ctx, &qk);
+    let scores = zeros(&ctx, m * 64 * s);
+    let denom = zeros(&ctx, m * 64);
+    let lat = zeros(&ctx, m * 64 * 512);
+    run(&ctx, |p| {
+        dsa_attend(
+            &ctx,
+            p,
+            &tqk,
+            &cache,
+            Rows::Selected { sel: &tsel, count },
+            &scores,
+            &denom,
+            &lat,
+            &zeros(&ctx, 4 * 8 * 64 * 512),
+            m,
+            s,
+            1.0 / 16.0,
+        )
+        .unwrap()
+    });
+    let glat = lat.to_f32().unwrap();
+    for (i, rows) in lists.iter().enumerate() {
+        for h in 0..64 {
+            let ql = &qk[(i * 64 + h) * 512..(i * 64 + h + 1) * 512];
+            let sc: Vec<f32> = rows
+                .iter()
+                .map(|&t| r::dot(ql, &lat_rows[t * 512..(t + 1) * 512]) / 16.0)
+                .collect();
+            let mx = sc.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let e: Vec<f32> = sc.iter().map(|&x| (x - mx).exp()).collect();
+            let d: f32 = e.iter().sum();
+            let exp: Vec<f32> = (0..512)
+                .map(|j| {
+                    rows.iter()
+                        .zip(&e)
+                        .map(|(&t, &wt)| wt * lat_rows[t * 512 + j])
+                        .sum::<f32>()
+                        / d
+                })
+                .collect();
+            assert_close(
+                &glat[(i * 64 + h) * 512..(i * 64 + h + 1) * 512],
+                &exp,
+                1e-5,
+                1e-4,
+            );
+        }
+    }
+}
+
+/// DSA decode attention (scores, softmax, weighted latent sum) at the
+/// model's shapes: a dense run at 264 rows and the sparse 2 056-slot
+/// selection, `LILY_GLM53_ROWS` query rows (default 1), best of five serial
+/// passes of 11 layers' calls over 11 caches.
+#[test]
+#[ignore = "timing only"]
+fn dsa_timing() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(71);
+    let m: usize =
+        std::env::var("LILY_GLM53_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    let cached = 4096;
+    let caches: Vec<Tensor> = (0..11)
+        .map(|_| {
+            let bytes: Vec<u8> = f32s(&mut rng, cached * 512, -1.5, 1.5)
+                .iter()
+                .flat_map(|&v| f16::from_f32(v).to_bits().to_le_bytes())
+                .collect();
+            Tensor::from_bytes(&ctx, &bytes, &[cached * 512], DType::F16).unwrap()
+        })
+        .collect();
+    let s_max = 2056;
+    let sel: Vec<u32> =
+        (0..m * s_max).map(|k| ((k % s_max) * 2 + k / s_max) as u32).collect();
+    let tsel =
+        Tensor::from_bytes(&ctx, bytemuck::cast_slice(&sel), &[m * s_max], DType::U32)
+            .unwrap();
+    let qk = tensor(&ctx, &f32s(&mut rng, m * 64 * 512, -0.2, 0.2));
+    let scores = zeros(&ctx, m * 64 * s_max);
+    let denom = zeros(&ctx, m * 64);
+    let lat = zeros(&ctx, m * 64 * 512);
+    let partial = zeros(&ctx, 4 * 8 * 64 * 512);
+    for (label, sparse) in [("dense 264 rows", false), ("selected 2056", true)] {
+        let s = if sparse { s_max } else { 264 };
+        let rows = if sparse {
+            Rows::Selected { sel: &tsel, count: s_max }
+        } else {
+            Rows::Causal { pos0: 264 - m }
+        };
+        let mut best = f64::MAX;
+        for _ in 0..5 {
+            let pass = ctx.begin().unwrap();
+            for c in &caches {
+                dsa_attend(
+                    &ctx, &pass, &qk, c, rows, &scores, &denom, &lat, &partial, m, s,
+                    0.0625,
+                )
+                .unwrap();
+            }
+            let t = std::time::Instant::now();
+            pass.commit_wait().unwrap();
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        println!("dsa {label:16} m={m} {:8.1} us a layer", best / 11.0 * 1e6);
+        // With LILY_KERNEL_PROFILE: each kernel alone, per layer.
+        let mut by: Vec<(&str, f64)> = Vec::new();
+        for p in crate::metal::profile::take() {
+            for k in &p.kernels {
+                match by.iter_mut().find(|(n, _)| *n == k.name) {
+                    Some(e) => e.1 += k.gpu_secs,
+                    None => by.push((k.name, k.gpu_secs)),
+                }
+            }
+        }
+        for (name, secs) in by {
+            println!("dsa   {name:28} {:8.1} us a layer", secs / 55.0 * 1e6);
         }
     }
 }

@@ -526,6 +526,10 @@ fn bench(
             digest = (digest ^ u64::from(next)).wrapping_mul(0x100000001b3);
         }
         let dt = t.elapsed().as_secs_f64();
+        if ctx.profiling() {
+            eprintln!("decode at prompt {prompt_len}, per step:");
+            profile_report(n);
+        }
         steps.sort_by(f64::total_cmp);
         println!(
             "run {run}: prompt {prompt_len}: prefill {pf:.2} s = {:.1} tok/s; decode {n} tokens {dt:.2} s = {:.2} tok/s; step median {:.2} ms p10 {:.2} ms; digest {digest:016x}",

@@ -1099,6 +1099,16 @@ pub fn kv_store(
     )
 }
 
+/// The widest score row the attention kernels take (the latent mix keeps
+/// its row list in threadgroup memory): the dense window, 2 051 rows,
+/// rounded up; the sparse selection is as wide.
+pub const DSA_MAX_SLOTS: usize = 2056;
+
+/// The most chunks the latent mix splits its slots into; its
+/// partial sums take `m * DSA_LORA_CHUNKS * 64 * 512` f32 (rows past that
+/// size take one chunk).
+pub const DSA_LORA_CHUNKS: usize = 8;
+
 /// Which cache rows a DSA query attends.
 #[derive(Clone, Copy)]
 pub enum Rows<'t> {
@@ -1122,11 +1132,12 @@ pub fn dsa_attend(
     scores: &Tensor,
     denom: &Tensor,
     lat: &Tensor,
+    partial: &Tensor,
     m: usize,
     s: usize,
     scale: f32,
 ) -> Result<()> {
-    check_f32(&[qk_low, scores, denom, lat])?;
+    check_f32(&[qk_low, scores, denom, lat, partial])?;
     ensure!(scores.numel() >= m * 64 * s, "scores of {}", scores.numel());
     let (pos0, sel, has_sel, n_sel) = match rows {
         Rows::Causal { pos0 } => {
@@ -1138,6 +1149,7 @@ pub fn dsa_attend(
             (0, sel, 1, count)
         }
     };
+    ensure!(s <= DSA_MAX_SLOTS, "attention over {s} slots");
     let scores_k = ctx.pipeline("glm53_dsa_scores", SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &scores_k,
@@ -1149,7 +1161,7 @@ pub fn dsa_attend(
             &u32_bytes(n_sel),
             &f32_bytes(scale),
         ],
-        Grid::Threadgroups { groups: (s.div_ceil(8), m, 1), threadgroup: (64, 1, 1) },
+        Grid::Threadgroups { groups: (s.div_ceil(32), m, 1), threadgroup: (256, 1, 1) },
     )?;
     pass.memory_barrier()?;
     let softmax = ctx.pipeline("glm53_dsa_softmax", SOURCE, MslVersion::V3_1)?;
@@ -1160,6 +1172,15 @@ pub fn dsa_attend(
         Grid::Threadgroups { groups: (64, m, 1), threadgroup: (256, 1, 1) },
     )?;
     pass.memory_barrier()?;
+    // Slots split into chunks of at least 8 steps of 32 (at most
+    // DSA_LORA_CHUNKS) when the rows are few enough for the partials.
+    let steps = s.div_ceil(32);
+    let chunks = if m * DSA_LORA_CHUNKS * 64 * 512 <= partial.numel() {
+        (steps / 8).clamp(1, DSA_LORA_CHUNKS)
+    } else {
+        1
+    };
+    let chunk = steps.div_ceil(chunks) * 32;
     let lora = ctx.pipeline("glm53_dsa_lora", SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &lora,
@@ -1169,9 +1190,31 @@ pub fn dsa_attend(
             cache.binding(),
             sel.binding(),
             lat.binding(),
+            partial.binding(),
         ],
-        &[&u32_bytes(s), &u32_bytes(pos0), &u32_bytes(has_sel), &u32_bytes(n_sel)],
-        Grid::Threadgroups { groups: (64, 8, m), threadgroup: (64, 1, 1) },
+        &[
+            &u32_bytes(s),
+            &u32_bytes(pos0),
+            &u32_bytes(has_sel),
+            &u32_bytes(n_sel),
+            &u32_bytes(chunks),
+            &u32_bytes(chunk),
+        ],
+        Grid::Threadgroups { groups: (4, 8, m * chunks), threadgroup: (256, 1, 1) },
+    )?;
+    if chunks == 1 {
+        return Ok(());
+    }
+    pass.memory_barrier()?;
+    let reduce = ctx.pipeline("glm53_dsa_lora_reduce", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &reduce,
+        &[partial.binding(), denom.binding(), lat.binding()],
+        &[&u32_bytes(chunks)],
+        Grid::Threadgroups {
+            groups: (64 * 512 / 4 / 256, m, 1),
+            threadgroup: (256, 1, 1),
+        },
     )
 }
 
