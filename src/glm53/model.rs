@@ -783,13 +783,21 @@ impl Glm53Model {
         let cfg = &self.cfg;
         match (a, &st.layers[il]) {
             (AttnW::Kda(w), LayerState::Kda { conv, s }) => {
-                k::gemv(ctx, pass, &w.q, &sc.xn, &sc.kq, m)?;
-                k::gemv(ctx, pass, &w.k, &sc.xn, &sc.kk, m)?;
-                k::gemv(ctx, pass, &w.v, &sc.xn, &sc.kv, m)?;
-                k::gemv(ctx, pass, &w.f_a, &sc.xn, &sc.klow, m)?;
-                k::gemv(ctx, pass, &w.beta, &sc.xn, &sc.kbeta, m)?;
-                k::gemv(ctx, pass, &w.g_a, &sc.xn, &sc.klow2, m)?;
+                k::gemv_sets(ctx, pass, &[(&w.q, &sc.kq), (&w.k, &sc.kk)], &sc.xn, m)?;
+                k::gemv_sets(
+                    ctx,
+                    pass,
+                    &[
+                        (&w.v, &sc.kv),
+                        (&w.f_a, &sc.klow),
+                        (&w.beta, &sc.kbeta),
+                        (&w.g_a, &sc.klow2),
+                    ],
+                    &sc.xn,
+                    m,
+                )?;
                 pass.memory_barrier()?;
+                // f_b and g_b read different inputs: one dispatch each.
                 k::gemv(ctx, pass, &w.f_b, &sc.klow, &sc.kgate, m)?;
                 k::gemv(ctx, pass, &w.g_b, &sc.klow2, &sc.kog, m)?;
                 pass.memory_barrier()?;
@@ -827,14 +835,19 @@ impl Glm53Model {
                     "MTP attention window past {limit} rows (il {il})"
                 );
                 // Level 1: everything that reads xn.
-                k::gemv(ctx, pass, &w.q_a, &sc.xn, &sc.qr, m)?;
-                k::gemv(ctx, pass, &w.kv_a, &sc.xn, &sc.kv_raw, m)?;
+                k::gemv_sets(
+                    ctx,
+                    pass,
+                    &[(&w.q_a, &sc.qr), (&w.kv_a, &sc.kv_raw)],
+                    &sc.xn,
+                    m,
+                )?;
                 if let Some(ix) = &w.indexer {
-                    k::gemv(ctx, pass, &ix.k, &sc.xn, &sc.ik, m)?;
-                    k::gemv(ctx, pass, &ix.gate, &sc.xn, &sc.ig, m)?;
+                    let mut sets = vec![(&ix.k, &sc.ik), (&ix.gate, &sc.ig)];
                     if sparse {
-                        k::gemv(ctx, pass, &ix.proj, &sc.xn, &sc.iw, m)?;
+                        sets.push((&ix.proj, &sc.iw));
                     }
+                    k::gemv_sets(ctx, pass, &sets, &sc.xn, m)?;
                 }
                 pass.memory_barrier()?;
                 // Level 2: the norms, the latent store, the pooled keys.
@@ -975,8 +988,7 @@ impl Glm53Model {
         let lim = cfg.swiglu_limit;
         match f {
             FfnW::Dense { gate, up, down } => {
-                k::gemv(ctx, pass, gate, &sc.xn, &sc.fg, m)?;
-                k::gemv(ctx, pass, up, &sc.xn, &sc.fu, m)?;
+                k::gemv_sets(ctx, pass, &[(gate, &sc.fg), (up, &sc.fu)], &sc.xn, m)?;
                 pass.memory_barrier()?;
                 k::swiglu(ctx, pass, &sc.fg, &sc.fu, &sc.fmid, m * cfg.ff_dense, lim)?;
                 pass.memory_barrier()?;
@@ -986,8 +998,13 @@ impl Glm53Model {
             FfnW::Moe { router, bias, gate, up, down, sh_gate, sh_up, sh_down } => {
                 let used = cfg.n_expert_used;
                 k::gemv(ctx, pass, router, &sc.xn, &sc.rlogits, m)?;
-                k::gemv(ctx, pass, sh_gate, &sc.xn, &sc.fg, m)?;
-                k::gemv(ctx, pass, sh_up, &sc.xn, &sc.fu, m)?;
+                k::gemv_sets(
+                    ctx,
+                    pass,
+                    &[(sh_gate, &sc.fg), (sh_up, &sc.fu)],
+                    &sc.xn,
+                    m,
+                )?;
                 pass.memory_barrier()?;
                 k::router_topk(
                     ctx,

@@ -24,14 +24,21 @@ float glm53_group_sum(float v, uint width) {
 }
 
 // ---------------------------------------------------------------------------
-// GEMV: y[i][n] = W[n] . x[i, group(n)] for i < m (m <= 4). One subgroup
-// takes R rows at once (R = 32 / tasks for rows of fewer than 32 tasks of 32
-// values, else 1), its lanes striding the row's tasks. x row i of group g is
-// at x + 4 * (i * x_row_stride + g * K); the group of row n is n / x_group
-// (per-head projections, attn_k_b and attn_v_b; x_group = N otherwise).
-// Threadgroups of 256 threads: 8 subgroups.
-// Buffers: 0 W (row 0), 1 x, 2 y. Params: 3 K, 4 N, 5 m, 6 row_bytes,
-// 7 x_group, 8 x_row_stride, 9 y_row_stride.
+// GEMV over up to four weights of one type that share their input (one
+// dispatch for a dependency level's projections: dispatches of one level
+// do not overlap on this driver). Set s (rows_s rows of K values, weight at
+// buffer 1 + s, output at 5 + s) owns the next ceil(rows_s / rows per
+// threadgroup) threadgroups, so a threadgroup's set is uniform.
+// y_s[i][n] = W_s[n] . x[i, group(n)] for i < m (m <= 4). One subgroup
+// takes R rows at once (R = 32 / tasks for rows of fewer than 32 tasks of
+// 32 values, else 1), its lanes striding the row's tasks. x row i of group g
+// is at x + 4 * (i * x_row_stride + g * K); the group of row n is n / x_group
+// (per-head projections, attn_k_b and attn_v_b, single set; x_group >=
+// rows otherwise). Output rows of set s are rows_s apart unless y_row_stride
+// is nonzero. Threadgroups of 256 threads: 8 subgroups.
+// Buffers: 0 x, 1-4 W, 5-8 y. Params: 9 K, 10 m, 11 row_bytes,
+// 12-15 rows of each set (0: unused), 16 x_group, 17 x_row_stride,
+// 18 y_row_stride.
 // ---------------------------------------------------------------------------
 #if defined(KERNEL_glm53_gemv_q8_0) || defined(KERNEL_glm53_gemv_q4_k) || \
     defined(KERNEL_glm53_gemv_q2_k) || defined(KERNEL_glm53_gemv_iq2_xxs) || \
@@ -50,21 +57,34 @@ float glm53_group_sum(float v, uint width) {
 #define GEMV_TYPE GLM53_F32
 #endif
 void main() {
-    const uint64_t W = arg(0);
-    const uint64_t X = arg(1);
-    const uint64_t Y = arg(2);
-    const uint K = arg_u32(3);
-    const uint N = arg_u32(4);
-    const uint m = arg_u32(5);
-    const uint row_bytes = arg_u32(6);
-    const uint x_group = arg_u32(7);
-    const uint x_row_stride = arg_u32(8);
-    const uint y_row_stride = arg_u32(9);
+    const uint64_t X = arg(0);
+    const uint K = arg_u32(9);
+    const uint m = arg_u32(10);
+    const uint row_bytes = arg_u32(11);
+    const uint x_group = arg_u32(16);
+    const uint x_row_stride = arg_u32(17);
+    const uint y_stride_param = arg_u32(18);
     const uint tasks = K / GLM53_TASK;
     const uint width = min(tasks, 32u);
     const uint per_sg = 32u / width;
+    const uint rows_per_tg = 8u * per_sg;
+    // The threadgroup's set.
+    uint tg = gl_WorkGroupID.x;
+    uint set = 0u;
+    uint N = arg_u32(12);
+    [[unroll]] for (uint s = 0u; s < 3u; s++) {
+        const uint tgs = (N + rows_per_tg - 1u) / rows_per_tg;
+        if (set == s && tg >= tgs) {
+            tg -= tgs;
+            set = s + 1u;
+            N = arg_u32(13u + s);
+        }
+    }
+    const uint64_t W = arg(1u + set);
+    const uint64_t Y = arg(5u + set);
+    const uint y_row_stride = y_stride_param != 0u ? y_stride_param : N;
     const uint lane = gl_SubgroupInvocationID;
-    const uint n = (gl_WorkGroupID.x * 8u + gl_SubgroupID) * per_sg + lane / width;
+    const uint n = (tg * 8u + gl_SubgroupID) * per_sg + lane / width;
     const uint sub = lane % width;
     const bool live = n < N;
     const uint64_t row = W + uint64_t(min(n, N - 1u)) * row_bytes;

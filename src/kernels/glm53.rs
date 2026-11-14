@@ -128,45 +128,88 @@ pub fn gemv_with(
     m: usize,
     l: GemvLayout,
 ) -> Result<()> {
-    check_f32(&[x, y])?;
+    gemv_dispatch(ctx, pass, &[(w, y)], x, m, l)
+}
+
+/// One dispatch of up to four GEMVs of one weight type and width over the
+/// same input `x` (`m` rows): `y_s[i] = w_s x[i]`. On this driver
+/// dispatches of one dependency level run one after another, so a level's
+/// projections are best one dispatch.
+pub fn gemv_sets(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    sets: &[(&QWeight, &Tensor)],
+    x: &Tensor,
+    m: usize,
+) -> Result<()> {
+    let rows = sets.iter().map(|(w, _)| w.rows).max().unwrap_or(0);
+    let cols = sets.first().map_or(0, |(w, _)| w.cols);
+    let l = GemvLayout { x_group: rows.max(1), x_row_stride: cols, y_row_stride: 0 };
+    gemv_dispatch(ctx, pass, sets, x, m, l)
+}
+
+fn gemv_dispatch(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    sets: &[(&QWeight, &Tensor)],
+    x: &Tensor,
+    m: usize,
+    l: GemvLayout,
+) -> Result<()> {
+    ensure!((1..=4).contains(&sets.len()), "GEMV of {} sets", sets.len());
     ensure!((1..=GEMV_MAX_ROWS).contains(&m), "GEMV of {m} rows");
-    let tasks = w.cols / 32;
+    let w0 = sets[0].0;
+    check_f32(&[x])?;
+    let tasks = w0.cols / 32;
     ensure!(
-        w.cols.is_multiple_of(32) && (tasks >= 32 || tasks.is_power_of_two()),
+        w0.cols.is_multiple_of(32) && (tasks >= 32 || tasks.is_power_of_two()),
         "GEMV row of {} values",
-        w.cols
-    );
-    let groups = w.rows.div_ceil(l.x_group);
-    ensure!(
-        x.numel() >= (m - 1) * l.x_row_stride + groups * w.cols,
-        "GEMV input of {} values",
-        x.numel()
-    );
-    ensure!(
-        y.numel() >= (m - 1) * l.y_row_stride + w.rows,
-        "GEMV output of {}",
-        y.numel()
+        w0.cols
     );
     let per_sg = 32 / tasks.min(32);
     let rows_per_tg = 8 * per_sg;
-    let name = gemv_name(w.ty)?;
-    let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
+    let mut groups = 0;
+    for &(w, y) in sets {
+        ensure!(
+            w.ty == w0.ty && w.cols == w0.cols && w.row_bytes == w0.row_bytes,
+            "GEMV sets of different types or widths"
+        );
+        check_f32(&[y])?;
+        let stride = if l.y_row_stride == 0 { w.rows } else { l.y_row_stride };
+        ensure!(y.numel() >= (m - 1) * stride + w.rows, "GEMV output of {}", y.numel());
+        let x_groups = w.rows.div_ceil(l.x_group);
+        ensure!(
+            x.numel() >= (m - 1) * l.x_row_stride + x_groups * w.cols,
+            "GEMV input of {} values",
+            x.numel()
+        );
+        groups += w.rows.div_ceil(rows_per_tg);
+    }
+    let mut bindings = vec![x.binding()];
+    for s in 0..4 {
+        bindings.push(sets.get(s).map_or(x.binding(), |(w, _)| w.t.binding()));
+    }
+    for s in 0..4 {
+        bindings.push(sets.get(s).map_or(x.binding(), |(_, y)| y.binding()));
+    }
+    let rows = |s: usize| u32_bytes(sets.get(s).map_or(0, |(w, _)| w.rows));
+    let pipeline = ctx.pipeline(gemv_name(w0.ty)?, SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
-        &[w.t.binding(), x.binding(), y.binding()],
+        &bindings,
         &[
-            &u32_bytes(w.cols),
-            &u32_bytes(w.rows),
+            &u32_bytes(w0.cols),
             &u32_bytes(m),
-            &u32_bytes(w.row_bytes),
+            &u32_bytes(w0.row_bytes),
+            &rows(0),
+            &rows(1),
+            &rows(2),
+            &rows(3),
             &u32_bytes(l.x_group),
             &u32_bytes(l.x_row_stride),
             &u32_bytes(l.y_row_stride),
         ],
-        Grid::Threadgroups {
-            groups: (w.rows.div_ceil(rows_per_tg), 1, 1),
-            threadgroup: (256, 1, 1),
-        },
+        Grid::Threadgroups { groups: (groups, 1, 1), threadgroup: (256, 1, 1) },
     )
 }
 

@@ -732,3 +732,37 @@ fn hc_post_mix_and_pre2_match_cpu() {
         assert_close(&gxn[i * hidden..(i + 1) * hidden], &exn, 1e-4, 1e-3);
     }
 }
+
+#[test]
+fn gemv_sets_match_single_gemvs() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(65);
+    let cols = 4096;
+    for ty in [GgmlType::Q8_0, GgmlType::Q4K, GgmlType::Bf16] {
+        let rows = [72usize, 8, 130, 64];
+        let raws: Vec<Vec<u8>> =
+            rows.iter().map(|&r| random_blocks(&mut rng, ty, r * cols)).collect();
+        let ws: Vec<QWeight> = raws
+            .iter()
+            .zip(rows)
+            .map(|(raw, r)| QWeight::from_bytes(&ctx, raw, ty, cols, r).unwrap())
+            .collect();
+        for m in [1, 3] {
+            let x = f32s(&mut rng, m * cols, -1.0, 1.0);
+            let tx = tensor(&ctx, &x);
+            let ys: Vec<Tensor> = rows.iter().map(|&r| zeros(&ctx, m * r)).collect();
+            let singles: Vec<Tensor> =
+                rows.iter().map(|&r| zeros(&ctx, m * r)).collect();
+            let sets: Vec<(&QWeight, &Tensor)> = ws.iter().zip(&ys).collect();
+            run(&ctx, |p| {
+                gemv_sets(&ctx, p, &sets, &tx, m).unwrap();
+                for (w, y) in ws.iter().zip(&singles) {
+                    gemv(&ctx, p, w, &tx, y, m).unwrap();
+                }
+            });
+            for (a, b) in ys.iter().zip(&singles) {
+                assert_eq!(a.to_f32().unwrap(), b.to_f32().unwrap(), "{ty:?} m={m}");
+            }
+        }
+    }
+}
