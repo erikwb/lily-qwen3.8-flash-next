@@ -362,3 +362,22 @@ batching (max_batch_rows) and session persistence (not implemented);
 (6) Metal kernels (none written: GLSL only, as asked).
 Server notes: needs --cache-bytes >= 8.6G (bf16 format floor) and should run
 with --pin-weights off (pin would mlock all 96.5 GB).
+
+## Fix 74b9b2d (2026-11-13 22:35): every Pi request failed on lily-glm-server
+
+Cause: 5492603 sized the scratch for 1 024-row prefill runs, including the
+verify pass's `spec_tokens`/`draws`, while `verify` staged a fixed
+`[u32; MAX_ROWS]` (16 bytes) into them: "byte length 16 does not match shape
+[1024] of U32" on every speculative request (any request with --mtp-drafts 1,
+whatever its fields). The device-lost faults in the same log were compute
+timeouts (ETIMEDOUT, "deferred behind earlier work of another VM"): a
+concurrent pass batches 128 dispatches a command buffer, over a second of GPU
+work at 1 024 rows, timed from submission. Fix: verify buffers sized for 4 rows,
+all token staging through `write_words`; prompt runs > 4 rows go a pass a layer
+(<= 2 in flight). Tests: `scratch_staging_fits_every_caller`; ignored
+`speculative_cycle_after_a_long_prefill` fails at 0ed3add with the server's
+error, passes at 74b9b2d. Checks: kernels + glm53 tests 25/25, 4K prefill digest
+unchanged (160.6 tok/s), spec 93% / 36.2 tok/s identical tokens, 20-case NLL
+0.4668. lily-glm-srv rebuilt at 74b9b2d (SOURCE_COMMIT), restarted; Pi: "pong"
+(1 629-token prompt, 9.6 s), bash tool round trip with --thinking high and off
+both answer correctly (cached prefixes reused, no failures).
