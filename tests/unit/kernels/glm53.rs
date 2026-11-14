@@ -446,12 +446,19 @@ fn kda_prefill_matches_cpu() {
 /// single-chunk run's results bit for bit: output, prepared q/k/v/decay,
 /// recurrent state, conv window and both snapshots, from a nonzero starting
 /// state, at row counts around the chunk boundaries and with snapshots on
-/// both sides of one.
+/// both sides of one, for four heads and one.
 #[test]
 fn kda_prefill_chunks_are_bit_exact() {
+    // The model's head count's kind (even) and an odd one (the edge copy's
+    // grid ends mid-threadgroup).
+    for heads in [4, 1] {
+        kda_chunks_case(heads);
+    }
+}
+
+fn kda_chunks_case(heads: usize) {
     let ctx = ctx();
     let mut rng = StdRng::seed_from_u64(76);
-    let heads = 4;
     let p = heads * 128;
     let c = kda_case(&mut rng, heads);
     let t = |v: &Vec<f32>| tensor(&ctx, v);
@@ -486,6 +493,8 @@ fn kda_prefill_chunks_are_bit_exact() {
         (63, None),
         (64, Some(33)),
         (65, Some(64)),
+        (65, Some(30)),
+        (65, Some(31)),
     ];
     for (n, snap_row) in cases {
         let raw: Vec<Vec<f32>> = [p, p, p, p, heads, p]
@@ -524,7 +533,10 @@ fn kda_prefill_chunks_are_bit_exact() {
                 .iter()
                 .enumerate()
         {
-            assert!(got[0][k] == got[1][k], "{name} differs at {n} rows");
+            assert!(
+                got[0][k] == got[1][k],
+                "{name} differs at {n} rows, {heads} heads"
+            );
         }
     }
 }
