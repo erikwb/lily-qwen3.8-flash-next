@@ -617,8 +617,16 @@ pub struct KdaInputs<'a> {
     pub out_gate: &'a Tensor,
 }
 
+/// Where a run of KDA tokens also leaves the conv window and state as they
+/// were after one of its rows (speculative decoding's rollback point).
+pub struct KdaSnapshot<'a> {
+    pub row: usize,
+    pub conv: &'a Tensor,
+    pub state: &'a Tensor,
+}
+
 /// KDA for `rows` consecutive tokens of one sequence: the one-token kernel
-/// for a single row, else prepare / recurrence / output.
+/// for a single row without a snapshot, else prepare / recurrence / output.
 #[allow(clippy::too_many_arguments)]
 pub fn kda(
     ctx: &MetalContext,
@@ -629,14 +637,22 @@ pub fn kda(
     state: &Tensor,
     out: &Tensor,
     rows: usize,
+    snap: Option<KdaSnapshot<'_>>,
 ) -> Result<()> {
+    let (snap_row, snap_conv, snap_state) = match &snap {
+        Some(s) => {
+            ensure!(s.row < rows, "KDA snapshot after row {} of {rows}", s.row);
+            (s.row, s.conv, s.state)
+        }
+        None => (u32::MAX as usize, conv_state, state),
+    };
     check_f32(&[x.q, x.k, x.v, x.gate, x.beta, x.out_gate, conv_state, state, out])?;
     let proj = p.heads * 128;
     ensure!(
         state.numel() >= p.heads * 128 * 128 && conv_state.numel() >= 9 * proj,
         "KDA state"
     );
-    if rows == 1 {
+    if rows == 1 && snap.is_none() {
         let pipeline = ctx.pipeline("glm53_kda_decode", SOURCE, MslVersion::V3_1)?;
         return pass.dispatch_at(
             &pipeline,
@@ -676,8 +692,14 @@ pub fn kda(
             p.a_log.binding(),
             p.dt_bias.binding(),
             conv_state.binding(),
+            snap_conv.binding(),
         ],
-        &[&u32_bytes(p.heads), &u32_bytes(rows), &f32_bytes(p.lower_bound)],
+        &[
+            &u32_bytes(p.heads),
+            &u32_bytes(rows),
+            &f32_bytes(p.lower_bound),
+            &u32_bytes(snap_row),
+        ],
         Grid::Threadgroups { groups: (p.heads, 1, 1), threadgroup: (128, 1, 1) },
     )?;
     pass.memory_barrier()?;
@@ -693,8 +715,9 @@ pub fn kda(
             x.beta.binding(),
             state.binding(),
             out.binding(),
+            snap_state.binding(),
         ],
-        &[&u32_bytes(p.heads), &u32_bytes(rows)],
+        &[&u32_bytes(p.heads), &u32_bytes(rows), &u32_bytes(snap_row)],
         Grid::Threadgroups { groups: (p.heads, 32, 1), threadgroup: (128, 1, 1) },
     )?;
     pass.memory_barrier()?;

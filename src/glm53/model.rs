@@ -167,15 +167,26 @@ struct LayerW {
     ffn: FfnW,
 }
 
+/// The MTP block's own weights besides its layer's (`blk.45.nextn.*`).
+struct NextnW {
+    eh_proj: QWeight,
+    enorm: Tensor,
+    hnorm: Tensor,
+    shared_head_norm: Tensor,
+}
+
 /// The model's weights on the GPU.
 pub struct Glm53Model {
     pub cfg: Config,
     pub gguf: Gguf,
     mapped: Mapped,
     layers: Vec<LayerW>,
+    nextn: NextnW,
     embed: QWeight,
     output: QWeight,
     output_norm: Tensor,
+    /// Whether the engine speculates with the MTP block (`--mtp-drafts`).
+    pub mtp: bool,
 }
 
 impl Glm53Model {
@@ -272,7 +283,24 @@ impl Glm53Model {
         let embed = mapped.q("token_embd.weight")?;
         let output = mapped.q("output.weight")?;
         let output_norm = mapped.f32("output_norm.weight")?;
-        Ok(Self { cfg, gguf, mapped, layers, embed, output, output_norm })
+        let n = |s: &str| format!("blk.{}.nextn.{s}", cfg.mtp_layer());
+        let nextn = NextnW {
+            eh_proj: mapped.q(&n("eh_proj.weight"))?,
+            enorm: mapped.f32(&n("enorm.weight"))?,
+            hnorm: mapped.f32(&n("hnorm.weight"))?,
+            shared_head_norm: mapped.f32(&n("shared_head_norm.weight"))?,
+        };
+        Ok(Self {
+            cfg,
+            gguf,
+            mapped,
+            layers,
+            nextn,
+            embed,
+            output,
+            output_norm,
+            mtp: false,
+        })
     }
 
     /// The buffers holding the mapped file.
@@ -291,8 +319,20 @@ impl Glm53Model {
 
 /// One layer's recurrent state or caches.
 pub enum LayerState {
-    Kda { conv: Tensor, s: Tensor },
-    Dsa { latent: Tensor, pooled: Tensor, tail_k: Tensor, tail_g: Tensor },
+    /// `conv_alt`/`s_alt` receive the state after a verify pass's first row,
+    /// which becomes current when its draft is rejected.
+    Kda {
+        conv: Tensor,
+        s: Tensor,
+        conv_alt: Tensor,
+        s_alt: Tensor,
+    },
+    Dsa {
+        latent: Tensor,
+        pooled: Tensor,
+        tail_k: Tensor,
+        tail_g: Tensor,
+    },
 }
 
 /// A session: caches and recurrent state at position `pos`.
@@ -304,6 +344,14 @@ pub struct Glm53State {
     /// session's capacity).
     pub(crate) pool_scores: Tensor,
     pub(crate) pool_cap: usize,
+    /// The first main position whose MTP cache row is written in the
+    /// current run of MTP steps (the draft head attends from there).
+    pub(crate) mtp_min: Option<usize>,
+    /// The main position the next MTP step continues the run at.
+    pub(crate) mtp_next: Option<usize>,
+    /// A verify pass that fed rows from this position and the draws of its
+    /// rows, until `finish_speculation` decides what stays.
+    pub(crate) spec: Option<(usize, usize, Vec<u32>)>,
 }
 
 impl Glm53State {
@@ -313,18 +361,28 @@ impl Glm53State {
         let layers = (0..cfg.n_layer)
             .map(|il| -> Result<LayerState> {
                 Ok(match cfg.kinds[il] {
-                    LayerKind::Kda => LayerState::Kda {
-                        conv: Tensor::zeros(
-                            ctx,
-                            &[3 * (cfg.kda_conv - 1) * p],
-                            DType::F32,
-                        )?,
-                        s: Tensor::zeros(
-                            ctx,
-                            &[cfg.kda_heads * cfg.kda_dim * cfg.kda_dim],
-                            DType::F32,
-                        )?,
-                    },
+                    LayerKind::Kda => {
+                        let conv = || {
+                            Tensor::zeros(
+                                ctx,
+                                &[3 * (cfg.kda_conv - 1) * p],
+                                DType::F32,
+                            )
+                        };
+                        let s = || {
+                            Tensor::zeros(
+                                ctx,
+                                &[cfg.kda_heads * cfg.kda_dim * cfg.kda_dim],
+                                DType::F32,
+                            )
+                        };
+                        LayerState::Kda {
+                            conv: conv()?,
+                            s: s()?,
+                            conv_alt: conv()?,
+                            s_alt: s()?,
+                        }
+                    }
                     LayerKind::Dsa => LayerState::Dsa {
                         latent: Tensor::zeros(
                             ctx,
@@ -344,14 +402,23 @@ impl Glm53State {
             .collect::<Result<_>>()?;
         let pool_cap = capacity / 4 + 1;
         let pool_scores = Tensor::zeros(ctx, &[MAX_ROWS * pool_cap], DType::F32)?;
-        Ok(Self { pos: 0, capacity, layers, pool_scores, pool_cap })
+        Ok(Self {
+            pos: 0,
+            capacity,
+            layers,
+            pool_scores,
+            pool_cap,
+            mtp_min: None,
+            mtp_next: None,
+            spec: None,
+        })
     }
 
     /// Zeroes everything (GPU idle).
     pub fn reset(&mut self) {
         for l in &self.layers {
             match l {
-                LayerState::Kda { conv, s } => {
+                LayerState::Kda { conv, s, .. } => {
                     conv.zero_fill();
                     s.zero_fill();
                 }
@@ -362,6 +429,19 @@ impl Glm53State {
             }
         }
         self.pos = 0;
+        self.mtp_min = None;
+        self.mtp_next = None;
+        self.spec = None;
+    }
+
+    /// Makes the KDA states saved after a verify pass's first row current.
+    pub(crate) fn take_kda_snapshots(&mut self) {
+        for l in &mut self.layers {
+            if let LayerState::Kda { conv, s, conv_alt, s_alt } = l {
+                std::mem::swap(conv, conv_alt);
+                std::mem::swap(s, s_alt);
+            }
+        }
     }
 }
 
@@ -408,13 +488,27 @@ pub struct Scratch {
     rw: Tensor,
     moe_mid: Tensor,
     // Head
-    hidden: Tensor,
+    /// The stream mean of the last step's rows (the MTP head's input).
+    pub hidden: Tensor,
+    hidden_norm: Tensor,
     pub logits: Tensor,
     /// The last (or only) row's logits: `logits[0..vocab]`.
     pub logits_last: Tensor,
     sampler: SamplerScratch,
     /// U32[2]: the ping-pong slots the in-graph sampler draws into.
     pub next_token: Tensor,
+    /// U32[MAX_ROWS]: a verify pass's draws, one a row.
+    pub draws: Tensor,
+    /// U32[MAX_ROWS]: tokens a verify pass feeds.
+    pub spec_tokens: Tensor,
+    /// U32[2]: the MTP step's input token (0) and its draft (1).
+    pub mtp_io: Tensor,
+    mtp_emb: Tensor,
+    mtp_cat: Tensor,
+    mtp_x: Tensor,
+    mtp_h1: Tensor,
+    /// U32[S]: the cache rows the MTP head attends.
+    mtp_sel: Tensor,
 }
 
 impl Scratch {
@@ -466,9 +560,18 @@ impl Scratch {
             rw: f(m * cfg.n_expert_used)?,
             moe_mid: f(m * cfg.n_expert_used * cfg.ff_expert)?,
             hidden: f(m * cfg.hidden)?,
+            hidden_norm: f(m * cfg.hidden)?,
             logits,
             sampler: SamplerScratch::new(ctx, cfg.vocab)?,
             next_token: u(2)?,
+            draws: u(m)?,
+            spec_tokens: u(m)?,
+            mtp_io: u(2)?,
+            mtp_emb: f(cfg.hc_dim())?,
+            mtp_cat: f(2 * cfg.hidden)?,
+            mtp_x: f(cfg.hidden)?,
+            mtp_h1: f(cfg.hidden)?,
+            mtp_sel: u(s)?,
         })
     }
 
@@ -580,7 +683,7 @@ impl Glm53Model {
         }))?;
         let Some(trace) = trace else {
             let pass = self.begin(ctx)?;
-            self.encode(ctx, &pass, st, sc, &sc.tokens, m, want_logits)?;
+            self.encode(ctx, &pass, st, sc, &sc.tokens, m, want_logits, None)?;
             pass.commit_wait()?;
             st.pos += m;
             return Ok(());
@@ -594,7 +697,7 @@ impl Glm53Model {
             pass.commit_wait()?;
             pass = ctx.begin()?;
             let attn_in = read(&sc.xn, m * cfg.hidden)?;
-            self.attention(ctx, &pass, st, sc, &l.attn, il, pos0, m)?;
+            self.attention(ctx, &pass, st, sc, &l.attn, il, pos0, m, None)?;
             k::hc_post(
                 ctx,
                 &pass,
@@ -649,6 +752,7 @@ impl Glm53Model {
         tokens: &Tensor,
         m: usize,
         logits: Logits,
+        snap: Option<usize>,
     ) -> Result<()> {
         let cfg = &self.cfg;
         let pos0 = st.pos;
@@ -667,7 +771,7 @@ impl Glm53Model {
             // Each HC pre applies the HC post of the sublayer before it.
             let prev = (il > 0).then_some(&sc.ffn_out);
             self.hc_pre(ctx, pass, sc, hc_a, &l.attn_norm, m, prev)?;
-            self.attention(ctx, pass, st, sc, &l.attn, il, pos0, m)?;
+            self.attention(ctx, pass, st, sc, &l.attn, il, pos0, m, snap)?;
             self.hc_pre(ctx, pass, sc, hc_f, &l.ffn_norm, m, Some(&sc.attn_out))?;
             self.ffn(ctx, pass, sc, &l.ffn, m)?;
         }
@@ -685,25 +789,151 @@ impl Glm53Model {
         logits: Logits,
     ) -> Result<()> {
         let cfg = &self.cfg;
-        if logits == Logits::None {
-            return Ok(());
-        }
+        // The stream mean is kept (the MTP head reads it) even without logits.
         let (first, rows) = if logits == Logits::All { (0, m) } else { (m - 1, 1) };
         let h = sc.h.view(first * cfg.hc_dim(), &[rows * cfg.hc_dim()])?;
         k::hc_mean(ctx, pass, &h, &sc.hidden, rows, cfg.hidden)?;
         pass.memory_barrier()?;
+        if logits == Logits::None {
+            return Ok(());
+        }
         k::rmsnorm(
             ctx,
             pass,
             &sc.hidden,
             Some(&self.output_norm),
-            &sc.hidden,
+            &sc.hidden_norm,
             rows,
             cfg.hidden,
             cfg.rms_eps,
         )?;
         pass.memory_barrier()?;
-        k::gemv(ctx, pass, &self.output, &sc.hidden, &sc.logits, rows)?;
+        k::gemv(ctx, pass, &self.output, &sc.hidden_norm, &sc.logits, rows)?;
+        pass.memory_barrier()
+    }
+
+    /// One MTP step (ds4 `glm_graph_mtp_step`) at main position `p`: the
+    /// token at `p + 1` (`sc.mtp_io[0]`) and the main model's stream mean at
+    /// `p` (`hidden`, 4096 f32) through the nextn block, whose latent row `p`
+    /// it writes; with `draft`, the shared head's greedy token for `p + 2`
+    /// goes to `sc.mtp_io[1]`. The head attends its own rows from
+    /// `st.mtp_min` (at most the dense window: ds4 attends the whole run).
+    /// Host-writes the row list, so the GPU must be idle on the scratch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_mtp(
+        &self,
+        ctx: &MetalContext,
+        pass: &ComputePass<'_>,
+        st: &Glm53State,
+        sc: &Scratch,
+        hidden: &Tensor,
+        p: usize,
+        draft: bool,
+    ) -> Result<()> {
+        let cfg = &self.cfg;
+        let il = cfg.mtp_layer();
+        let l = &self.layers[il];
+        let nx = &self.nextn;
+        let limit = cfg.indexer_selected_limit();
+        let s = limit.next_multiple_of(8);
+        let first = st.mtp_min.unwrap_or(p).max((p + 1).saturating_sub(limit));
+        let mut rows = vec![u32::MAX; s];
+        for (slot, row) in (first..=p).enumerate() {
+            rows[slot] = row as u32;
+        }
+        sc.mtp_sel.write_bytes(bytemuck::cast_slice(&rows))?;
+        let token = sc.mtp_io.view(0, &[1])?;
+        k::embed(ctx, pass, &self.embed, &token, &sc.mtp_emb, 1)?;
+        pass.memory_barrier()?;
+        let e = sc.mtp_emb.view(0, &[cfg.hidden])?;
+        let cat_e = sc.mtp_cat.view(0, &[cfg.hidden])?;
+        let cat_h = sc.mtp_cat.view(cfg.hidden, &[cfg.hidden])?;
+        k::rmsnorm(ctx, pass, &e, Some(&nx.enorm), &cat_e, 1, cfg.hidden, cfg.rms_eps)?;
+        k::rmsnorm(
+            ctx,
+            pass,
+            hidden,
+            Some(&nx.hnorm),
+            &cat_h,
+            1,
+            cfg.hidden,
+            cfg.rms_eps,
+        )?;
+        pass.memory_barrier()?;
+        k::gemv(ctx, pass, &nx.eh_proj, &sc.mtp_cat, &sc.mtp_x, 1)?;
+        pass.memory_barrier()?;
+        k::rmsnorm(
+            ctx,
+            pass,
+            &sc.mtp_x,
+            Some(&l.attn_norm),
+            &sc.xn,
+            1,
+            cfg.hidden,
+            cfg.rms_eps,
+        )?;
+        pass.memory_barrier()?;
+        if !draft {
+            // Catching up only publishes the latent row (ds4 does the same).
+            let (AttnW::Dsa(w), LayerState::Dsa { latent, .. }) =
+                (&l.attn, &st.layers[il])
+            else {
+                anyhow::bail!("the MTP block's attention is not DSA");
+            };
+            k::gemv(ctx, pass, &w.kv_a, &sc.xn, &sc.kv_raw, 1)?;
+            pass.memory_barrier()?;
+            k::kv_store(
+                ctx,
+                pass,
+                &sc.kv_raw,
+                &w.kv_a_norm,
+                latent,
+                p,
+                1,
+                cfg.rms_eps,
+            )?;
+            return pass.memory_barrier();
+        }
+        self.attention(ctx, pass, st, sc, &l.attn, il, p, 1, None)?;
+        k::add(ctx, pass, &sc.mtp_x, &sc.attn_out, &sc.mtp_h1, cfg.hidden)?;
+        pass.memory_barrier()?;
+        k::rmsnorm(
+            ctx,
+            pass,
+            &sc.mtp_h1,
+            Some(&l.ffn_norm),
+            &sc.xn,
+            1,
+            cfg.hidden,
+            cfg.rms_eps,
+        )?;
+        pass.memory_barrier()?;
+        self.ffn(ctx, pass, sc, &l.ffn, 1)?;
+        k::add(ctx, pass, &sc.mtp_h1, &sc.ffn_out, &sc.mtp_x, cfg.hidden)?;
+        pass.memory_barrier()?;
+        k::rmsnorm(
+            ctx,
+            pass,
+            &sc.mtp_x,
+            Some(&nx.shared_head_norm),
+            &sc.hidden_norm,
+            1,
+            cfg.hidden,
+            cfg.rms_eps,
+        )?;
+        pass.memory_barrier()?;
+        k::gemv(ctx, pass, &self.output, &sc.hidden_norm, &sc.logits, 1)?;
+        pass.memory_barrier()?;
+        let out = sc.mtp_io.view(1, &[1])?;
+        crate::kernels::sample::sample_f32(
+            ctx,
+            pass,
+            &sc.logits_last,
+            &sc.sampler,
+            &crate::kernels::sample::SamplingParams::greedy(),
+            0,
+            &out,
+        )?;
         pass.memory_barrier()
     }
 
@@ -779,10 +1009,11 @@ impl Glm53Model {
         il: usize,
         pos0: usize,
         m: usize,
+        snap: Option<usize>,
     ) -> Result<()> {
         let cfg = &self.cfg;
         match (a, &st.layers[il]) {
-            (AttnW::Kda(w), LayerState::Kda { conv, s }) => {
+            (AttnW::Kda(w), LayerState::Kda { conv, s, conv_alt, s_alt }) => {
                 k::gemv_sets(ctx, pass, &[(&w.q, &sc.kq), (&w.k, &sc.kk)], &sc.xn, m)?;
                 k::gemv_sets(
                     ctx,
@@ -820,7 +1051,12 @@ impl Glm53Model {
                     beta: &sc.kbeta,
                     out_gate: &sc.kog,
                 };
-                k::kda(ctx, pass, &p, &x, conv, s, &sc.kout, m)?;
+                let snap = snap.map(|row| k::KdaSnapshot {
+                    row,
+                    conv: conv_alt,
+                    state: s_alt,
+                });
+                k::kda(ctx, pass, &p, &x, conv, s, &sc.kout, m, snap)?;
                 pass.memory_barrier()?;
                 k::gemv(ctx, pass, &w.out, &sc.kout, &sc.attn_out, m)?;
                 pass.memory_barrier()
@@ -830,10 +1066,6 @@ impl Glm53Model {
                 let hq = cfg.n_head * cfg.key_dim;
                 let limit = cfg.indexer_selected_limit();
                 let sparse = w.indexer.is_some() && pos0 + m > limit;
-                ensure!(
-                    w.indexer.is_some() || pos0 + m <= limit,
-                    "MTP attention window past {limit} rows (il {il})"
-                );
                 // Level 1: everything that reads xn.
                 k::gemv_sets(
                     ctx,
@@ -932,6 +1164,13 @@ impl Glm53Model {
                         cfg.indexer_top_k / cfg.indexer_pool,
                     )?;
                     Rows::Selected { sel: &sc.sel, count: s }
+                } else if w.indexer.is_none() {
+                    // The MTP head: the rows of its current run
+                    // (`encode_mtp` writes them into mtp_sel).
+                    Rows::Selected {
+                        sel: &sc.mtp_sel,
+                        count: limit.next_multiple_of(8),
+                    }
                 } else {
                     Rows::Causal { pos0 }
                 };

@@ -10,8 +10,8 @@ use super::model::{Glm53Model, Glm53State, LayerState, Logits, MAX_ROWS, Scratch
 use crate::engine::{
     DecodeStateApi, Draw, LanguageModel, LoadOptions, ScratchApi, SnapshotApi,
 };
-use crate::kernels::sample::sample_f32;
-use crate::metal::{EncodedPass, MetalContext};
+use crate::kernels::sample::{SamplingParams, sample_f32};
+use crate::metal::{EncodedPass, MetalContext, PendingPass};
 use crate::tensor::{DType, Tensor};
 
 /// Copies `src`'s first `bytes` into `dst` through host memory (both
@@ -53,7 +53,7 @@ fn recurrent(st: &Glm53State) -> Vec<&Tensor> {
     st.layers
         .iter()
         .flat_map(|l| match l {
-            LayerState::Kda { conv, s } => vec![conv, s],
+            LayerState::Kda { conv, s, .. } => vec![conv, s],
             LayerState::Dsa { tail_k, tail_g, .. } => vec![tail_k, tail_g],
         })
         .collect()
@@ -106,7 +106,12 @@ impl DecodeStateApi for Glm53State {
         self.layers
             .iter()
             .map(|l| match l {
-                LayerState::Kda { conv, s } => conv.byte_len() + s.byte_len(),
+                LayerState::Kda { conv, s, conv_alt, s_alt } => {
+                    conv.byte_len()
+                        + s.byte_len()
+                        + conv_alt.byte_len()
+                        + s_alt.byte_len()
+                }
                 LayerState::Dsa { latent, pooled, tail_k, tail_g } => {
                     latent.byte_len()
                         + pooled.byte_len()
@@ -173,6 +178,31 @@ impl ScratchApi for Scratch {
     }
 }
 
+impl Glm53Model {
+    /// Runs one MTP step at main position `p` for the token at `p + 1`,
+    /// reading hidden row `row` of the scratch; returns the draft when
+    /// asked. Waits for the GPU.
+    #[allow(clippy::too_many_arguments)]
+    fn mtp_step(
+        &self,
+        ctx: &MetalContext,
+        state: &mut Glm53State,
+        scratch: &Scratch,
+        token: u32,
+        row: usize,
+        p: usize,
+        draft: bool,
+    ) -> Result<u32> {
+        scratch.mtp_io.write_bytes(bytemuck::cast_slice(&[token, 0u32]))?;
+        let hidden = scratch.hidden.view(row * self.cfg.hidden, &[self.cfg.hidden])?;
+        let pass = self.begin(ctx)?;
+        self.encode_mtp(ctx, &pass, state, scratch, &hidden, p, draft)?;
+        pass.commit_wait()?;
+        state.mtp_next = Some(p + 1);
+        Ok(scratch.mtp_io.to_u32()?[1])
+    }
+}
+
 impl LanguageModel for Glm53Model {
     type State = Glm53State;
     type Scratch = Scratch;
@@ -180,12 +210,149 @@ impl LanguageModel for Glm53Model {
     const MODEL_ID: &'static str = "glm-5.3-flash";
 
     fn load(ctx: &MetalContext, path: &Path, options: &LoadOptions) -> Result<Self> {
-        if options.mtp_drafts > 0 {
-            eprintln!(
-                "glm-5.3-flash: the MTP draft head is not wired up yet; decoding plainly"
-            );
+        let mut model = Glm53Model::load(ctx, path)?;
+        model.mtp = options.mtp_drafts > 0;
+        Ok(model)
+    }
+
+    /// One draft a step: the MTP block predicts one token ahead (ds4 drafts
+    /// one for GLM 5.3 too).
+    fn max_drafts(&self) -> usize {
+        usize::from(self.mtp)
+    }
+
+    fn draft_initial(
+        &self,
+        ctx: &MetalContext,
+        state: &mut Glm53State,
+        scratch: &mut Scratch,
+        first: u32,
+        _drafts: usize,
+        _params: &SamplingParams,
+        _step0: usize,
+    ) -> Result<Vec<u32>> {
+        ensure!(state.pos > 0, "drafting before any token was fed");
+        // The last fed token's position; its stream mean is the scratch's
+        // hidden row 0.
+        let p = state.pos - 1;
+        if state.mtp_next != Some(p) {
+            state.mtp_min = Some(p);
         }
-        Glm53Model::load(ctx, path)
+        let draft = self.mtp_step(ctx, state, scratch, first, 0, p, true)?;
+        Ok(vec![draft])
+    }
+
+    fn verify<'a>(
+        &self,
+        ctx: &'a MetalContext,
+        state: &mut Glm53State,
+        scratch: &mut Scratch,
+        pending: u32,
+        drafts: &[u32],
+        params: &SamplingParams,
+        step0: usize,
+        _next_drafts: usize,
+    ) -> Result<(Vec<u32>, PendingPass<'a>)> {
+        let rows = 1 + drafts.len();
+        ensure!(rows <= 2, "GLM verifies one draft a step, got {}", drafts.len());
+        ensure!(state.spec.is_none(), "a verify pass is already pending");
+        state.ensure_capacity(ctx, state.pos + rows)?;
+        let mut words = [0u32; MAX_ROWS];
+        words[0] = pending;
+        words[1..rows].copy_from_slice(drafts);
+        scratch.spec_tokens.write_bytes(bytemuck::cast_slice(&words))?;
+        let pass = self.begin(ctx)?;
+        // KDA keeps the state after row 0 aside: the rollback if row 1's
+        // draft is rejected.
+        let snap = (rows > 1).then_some(0);
+        self.encode(
+            ctx,
+            &pass,
+            state,
+            scratch,
+            &scratch.spec_tokens,
+            rows,
+            Logits::All,
+            snap,
+        )?;
+        let vocab = self.cfg.vocab;
+        for r in 0..rows {
+            let logits = scratch.logits.view(r * vocab, &[vocab])?;
+            let out = scratch.draws.view(r, &[1])?;
+            sample_f32(
+                ctx,
+                &pass,
+                &logits,
+                scratch.sampler(),
+                params,
+                step0 + r,
+                &out,
+            )?;
+            pass.memory_barrier()?;
+        }
+        pass.commit_wait()?;
+        let draws = scratch.draws.to_u32()?[..rows].to_vec();
+        state.spec = Some((state.pos, rows, draws.clone()));
+        state.pos += rows;
+        // Nothing runs behind the verify pass: the draft is proposed in
+        // finish_speculation, once the kept count is known.
+        Ok((draws, ctx.begin()?.commit()?))
+    }
+
+    fn finish_speculation(
+        &self,
+        ctx: &MetalContext,
+        state: &mut Glm53State,
+        scratch: &mut Scratch,
+        accepted: usize,
+        propose: bool,
+        draft: PendingPass<'_>,
+    ) -> Result<Vec<u32>> {
+        draft.wait()?;
+        let (pos0, rows, draws) = state
+            .spec
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("no verify pass pending"))?;
+        ensure!(accepted < rows, "{accepted} accepted of {} drafts", rows - 1);
+        state.pos = pos0 + 1 + accepted;
+        if accepted + 1 < rows {
+            // Back to the state after row 0.
+            state.take_kda_snapshots();
+        }
+        for &token in &draws[accepted + 1..] {
+            scratch.sampler().uncount(token);
+        }
+        let mut proposals = Vec::new();
+        if propose {
+            if state.mtp_next != Some(pos0) {
+                state.mtp_min = Some(pos0);
+            }
+            // Catch the head up on the accepted rows, then draft from the
+            // last one.
+            for r in 0..accepted {
+                self.mtp_step(ctx, state, scratch, draws[r], r, pos0 + r, false)?;
+            }
+            proposals.push(self.mtp_step(
+                ctx,
+                state,
+                scratch,
+                draws[accepted],
+                accepted,
+                pos0 + accepted,
+                true,
+            )?);
+        } else {
+            state.mtp_next = None;
+        }
+        // The last fed row's stream mean becomes hidden row 0 (what the next
+        // draft reads).
+        let hidden = self.cfg.hidden;
+        if accepted > 0 {
+            let row = scratch.hidden.view(accepted * hidden, &[hidden])?;
+            let first = scratch.hidden.view(0, &[hidden])?;
+            first.write_bytes(row.contents())?;
+        }
+        Ok(proposals)
     }
 
     fn max_position_embeddings(&self) -> usize {
@@ -250,6 +417,7 @@ impl LanguageModel for Glm53Model {
                 &scratch.tokens,
                 chunk.len(),
                 logits,
+                None,
             )?;
             if let (true, Some(d)) = (last, draw) {
                 let out = scratch.next_token.view(0, &[1])?;
@@ -290,7 +458,7 @@ impl LanguageModel for Glm53Model {
         ensure!(state.pos < state.capacity, "decode step past the state's capacity");
         let pass = self.begin(ctx)?;
         let token = scratch.next_token.view(slot_in, &[1])?;
-        self.encode(ctx, &pass, state, scratch, &token, 1, Logits::Last)?;
+        self.encode(ctx, &pass, state, scratch, &token, 1, Logits::Last, None)?;
         let out = scratch.next_token.view(slot_out, &[1])?;
         sample_f32(
             ctx,

@@ -400,7 +400,8 @@ fn kda_compare(tokens: usize, chunk: usize, seed: u64) {
         let inputs =
             KdaInputs { q: &tq, k: &tk, v: &tv, gate: &tg, beta: &tb, out_gate: &tog };
         run(&ctx, |pass| {
-            kda(&ctx, pass, &params, &inputs, &conv_state, &state, &out, n).unwrap()
+            kda(&ctx, pass, &params, &inputs, &conv_state, &state, &out, n, None)
+                .unwrap()
         });
         let got = out.to_f32().unwrap();
         for j in 0..n {
@@ -879,4 +880,89 @@ fn moe_timing() {
             bytes as f64 / per / 1e9
         );
     }
+}
+
+#[test]
+fn kda_snapshot_is_the_state_after_its_row() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(68);
+    let mut cfg = crate::glm53::Config::glm53_flash();
+    let heads = 2;
+    cfg.kda_heads = heads;
+    let p = heads * 128;
+    let c = kda_case(&mut rng, heads);
+    let t = |v: &Vec<f32>| tensor(&ctx, v);
+    let (qc, kc, vc, al, dt, on) = (
+        t(&c.q_conv),
+        t(&c.k_conv),
+        t(&c.v_conv),
+        t(&c.a_log),
+        t(&c.dt_bias),
+        t(&c.o_norm),
+    );
+    let params = KdaParams {
+        q_conv: &qc,
+        k_conv: &kc,
+        v_conv: &vc,
+        a_log: &al,
+        dt_bias: &dt,
+        o_norm: &on,
+        heads,
+        lower_bound: -5.0,
+        eps: 1e-5,
+    };
+    let cp = r::KdaParams {
+        q_conv: &c.q_conv,
+        k_conv: &c.k_conv,
+        v_conv: &c.v_conv,
+        a_log: &c.a_log,
+        dt_bias: &c.dt_bias,
+        o_norm: &c.o_norm,
+    };
+    // Two tokens of history first, so the conv window is not all zero.
+    let mut st = r::KdaState::new(&cfg);
+    let conv_state = zeros(&ctx, 9 * p);
+    let state = zeros(&ctx, heads * 128 * 128);
+    for n in [2usize, 3] {
+        let q = f32s(&mut rng, n * p, -2.0, 2.0);
+        let k = f32s(&mut rng, n * p, -2.0, 2.0);
+        let v = f32s(&mut rng, n * p, -2.0, 2.0);
+        let g = f32s(&mut rng, n * p, -3.0, 3.0);
+        let b = f32s(&mut rng, n * heads, -2.0, 2.0);
+        let og = f32s(&mut rng, n * p, -2.0, 2.0);
+        let (tq, tk, tv, tg, tb, tog) = (t(&q), t(&k), t(&v), t(&g), t(&b), t(&og));
+        let out = zeros(&ctx, n * p);
+        let inputs =
+            KdaInputs { q: &tq, k: &tk, v: &tv, gate: &tg, beta: &tb, out_gate: &tog };
+        let snap_conv = zeros(&ctx, 9 * p);
+        let snap_state = zeros(&ctx, heads * 128 * 128);
+        let snap = (n == 3).then_some(KdaSnapshot {
+            row: 0,
+            conv: &snap_conv,
+            state: &snap_state,
+        });
+        run(&ctx, |pass| {
+            kda(&ctx, pass, &params, &inputs, &conv_state, &state, &out, n, snap)
+                .unwrap()
+        });
+        for j in 0..n {
+            let s = j * p..(j + 1) * p;
+            r::kda_step(
+                &cfg,
+                &mut st,
+                &cp,
+                &q[s.clone()],
+                &k[s.clone()],
+                &v[s.clone()],
+                &g[s.clone()],
+                &b[j * heads..(j + 1) * heads],
+                &og[s.clone()],
+            );
+            if n == 3 && j == 0 {
+                assert_close(&snap_state.to_f32().unwrap(), &st.s, 1e-4, 1e-3);
+                assert_close(&snap_conv.to_f32().unwrap(), &st.conv, 0.0, 0.0);
+            }
+        }
+    }
+    assert_close(&state.to_f32().unwrap(), &st.s, 1e-4, 1e-3);
 }

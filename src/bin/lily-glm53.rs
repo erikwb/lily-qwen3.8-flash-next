@@ -86,6 +86,23 @@ enum Cmd {
         #[arg(long, default_value_t = 3)]
         runs: usize,
     },
+    /// Greedy speculative decoding with the MTP head through the engine
+    /// interface, against plain greedy decoding of the same prompt.
+    Spec {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        text: PathBuf,
+        #[arg(long, default_value_t = 256)]
+        prompt_len: usize,
+        #[arg(long, default_value_t = 128)]
+        n: usize,
+        #[arg(long, default_value_t = 2)]
+        runs: usize,
+        /// Use the chat template around a question instead of raw text.
+        #[arg(long)]
+        chat: Option<String>,
+    },
     /// Greedy generation from token ids.
     Generate {
         #[arg(long)]
@@ -113,6 +130,9 @@ fn main() -> Result<()> {
             score(&model, &fixture, &effort, limit, legacy)
         }
         Cmd::Chat { model, prompt, n, think } => chat(&model, &prompt, n, think),
+        Cmd::Spec { model, text, prompt_len, n, runs, chat } => {
+            spec(&model, &text, prompt_len, n, runs, chat.as_deref())
+        }
         Cmd::Bench { model, text, prompt_len, n, runs } => {
             bench(&model, &text, prompt_len, n, runs)
         }
@@ -487,6 +507,117 @@ fn bench(
             steps[n / 2],
             steps[n / 10],
         );
+    }
+    Ok(())
+}
+
+fn spec(
+    path: &PathBuf,
+    text: &PathBuf,
+    prompt_len: usize,
+    n: usize,
+    runs: usize,
+    chat: Option<&str>,
+) -> Result<()> {
+    use lily::engine::{DecodeStateApi, Draw, LanguageModel, LoadOptions};
+    use lily::kernels::sample::SamplingParams;
+    let tok = lily::tokenizer::Tokenizer::from_gguf(path)?;
+    let ids = match chat {
+        Some(q) => {
+            let messages = [serde_json::json!({"role": "user", "content": q})];
+            tok.encode_chat(&lily::tokenizer::ChatRender {
+                messages: &messages,
+                tools: None,
+                enable_thinking: false,
+                reasoning_effort: None,
+                preserve_thinking: None,
+            })?
+        }
+        None => {
+            let mut ids = tok.encode("[gMASK]<sop>")?;
+            let body = tok.encode(&std::fs::read_to_string(text)?)?;
+            ids.extend_from_slice(&body[..prompt_len - ids.len()]);
+            ids
+        }
+    };
+    let ctx = MetalContext::new()?;
+    let options = LoadOptions { mtp_drafts: 1, ..Default::default() };
+    let model = <Glm53Model as LanguageModel>::load(&ctx, path, &options)?;
+    let greedy = SamplingParams::greedy();
+    let mut sc = LanguageModel::new_scratch_with_capacity(&model, &ctx, 0)?;
+    for run in 0..runs {
+        // Plain greedy reference.
+        let mut st = LanguageModel::new_state(&model, &ctx, ids.len() + n + 8)?;
+        LanguageModel::prefill(
+            &model,
+            &ctx,
+            &mut st,
+            &mut sc,
+            &ids,
+            Some(Draw { params: &greedy, step: 0 }),
+        )?;
+        let mut plain = vec![sc.next_token.to_u32()?[0]];
+        let t = Instant::now();
+        while plain.len() < n {
+            let last = *plain.last().unwrap();
+            model.forward(&ctx, &mut st, &mut sc, &[last], true)?;
+            plain.push(argmax(&sc.logits.to_f32()?[..model.cfg.vocab]) as u32);
+        }
+        let plain_s = t.elapsed().as_secs_f64();
+        // Speculative.
+        let mut st = LanguageModel::new_state(&model, &ctx, ids.len() + n + 8)?;
+        LanguageModel::prefill(
+            &model,
+            &ctx,
+            &mut st,
+            &mut sc,
+            &ids,
+            Some(Draw { params: &greedy, step: 0 }),
+        )?;
+        let mut out = vec![sc.next_token.to_u32()?[0]];
+        let t = Instant::now();
+        let mut proposals = model.draft_initial(
+            &ctx,
+            &mut st,
+            &mut sc,
+            out[0],
+            1,
+            &greedy,
+            out.len(),
+        )?;
+        let (mut steps, mut accepted) = (0usize, 0usize);
+        while out.len() < n {
+            let pending = *out.last().unwrap();
+            let (draws, pend) = model.verify(
+                &ctx,
+                &mut st,
+                &mut sc,
+                pending,
+                &proposals,
+                &greedy,
+                out.len(),
+                1,
+            )?;
+            let kept = usize::from(draws[0] == proposals[0]);
+            out.extend_from_slice(&draws[..=kept]);
+            accepted += kept;
+            steps += 1;
+            proposals =
+                model.finish_speculation(&ctx, &mut st, &mut sc, kept, true, pend)?;
+        }
+        let spec_s = t.elapsed().as_secs_f64();
+        out.truncate(n);
+        let same = plain.iter().zip(&out).take_while(|(a, b)| a == b).count();
+        println!(
+            "run {run}: plain {:.2} tok/s; speculative {:.2} tok/s, {steps} steps, accepted {accepted}/{steps} ({:.0}%); same first {same}/{n} tokens; pos {}",
+            n as f64 / plain_s,
+            n as f64 / spec_s,
+            100.0 * accepted as f64 / steps as f64,
+            st.pos()
+        );
+        if run == 0 {
+            println!("speculative text: {:?}", tok.decode(&out, false)?);
+        }
     }
     Ok(())
 }

@@ -591,8 +591,10 @@ void main() {
 // recurrence walks the tokens for four value rows per threadgroup; output
 // normalizes and gates.
 // prepare: Grid heads. Buffers: 0 q, 1 k, 2 v, 3 raw_gate (-> decay),
-// 4 q_conv, 5 k_conv, 6 v_conv, 7 a_log, 8 dt_bias, 9 conv_state.
-// Params: 10 n_heads, 11 n_rows, 12 lower_bound.
+// 4 q_conv, 5 k_conv, 6 v_conv, 7 a_log, 8 dt_bias, 9 conv_state,
+// 10 conv snapshot. Params: 11 n_heads, 12 n_rows, 13 lower_bound,
+// 14 snap_row: after that token the conv window is also copied to the
+// snapshot (speculative decoding's rollback; ~0u for none).
 // ---------------------------------------------------------------------------
 #ifdef KERNEL_glm53_kda_prefill_prepare
 shared float sq[128];
@@ -602,9 +604,10 @@ shared float reduce_k[4];
 void main() {
     const uint D = 128u;
     const uint HISTORY = 3u;
-    const uint n_heads = arg_u32(10);
-    const uint n_rows = arg_u32(11);
-    const float lower_bound = arg_f32(12);
+    const uint n_heads = arg_u32(11);
+    const uint n_rows = arg_u32(12);
+    const float lower_bound = arg_f32(13);
+    const uint snap_row = arg_u32(14);
     const uint head = gl_WorkGroupID.x;
     const uint tid = gl_LocalInvocationIndex;
     const uint lane = gl_SubgroupInvocationID;
@@ -638,6 +641,11 @@ void main() {
         F32(vs).v[channel] = F32(vs).v[projection + channel];
         F32(vs).v[projection + channel] = F32(vs).v[2u * projection + channel];
         F32(vs).v[2u * projection + channel] = v_new;
+        if (token == snap_row) {
+            [[unroll]] for (uint w = 0u; w < 9u; w++) {
+                F32(arg(10)).v[w * projection + channel] = F32(qs).v[w * projection + channel];
+            }
+        }
         sq[tid] = q_acc / (1.0 + exp(-q_acc));
         sk[tid] = k_acc / (1.0 + exp(-k_acc));
         F32(arg(2) + 4u * index).v[0] = v_acc / (1.0 + exp(-v_acc));
@@ -661,12 +669,14 @@ void main() {
 #endif
 
 // recurrence: Grid (heads, 32), 128 threads. Buffers: 0 q, 1 k, 2 v,
-// 3 decay, 4 raw_beta, 5 state, 6 out. Params: 7 n_heads, 8 n_rows.
+// 3 decay, 4 raw_beta, 5 state, 6 out, 7 state snapshot (written after
+// token snap_row). Params: 8 n_heads, 9 n_rows, 10 snap_row.
 #ifdef KERNEL_glm53_kda_prefill_recurrence
 void main() {
     const uint D = 128u;
-    const uint n_heads = arg_u32(7);
-    const uint n_rows = arg_u32(8);
+    const uint n_heads = arg_u32(8);
+    const uint n_rows = arg_u32(9);
+    const uint snap_row = arg_u32(10);
     const uint head = gl_WorkGroupID.x;
     const uint value = gl_WorkGroupID.y * 4u + gl_SubgroupID;
     const uint lane = gl_SubgroupInvocationID;
@@ -686,6 +696,9 @@ void main() {
         h = fma(k4, vec4(delta_v), h);
         const float result = subgroupAdd(dot(h, q4));
         if (lane == 0u) F32(arg(6) + 4u * base).v[value] = result;
+        if (token == snap_row) {
+            F32x4(arg(7) + 4u * ((uint64_t(head) * D + value) * D + k0)).v[0] = h;
+        }
     }
     F32x4(sp).v[0] = h;
 }
@@ -885,10 +898,10 @@ void main() {
             const uint src = pos - pos0;
             k_value = F32(arg(0)).v[src * HD + tid];
             g_value = F32(arg(1)).v[src * HD + tid];
-            if (!complete) {
-                F32(arg(6)).v[r * HD + tid] = k_value;
-                F32(arg(7)).v[r * HD + tid] = g_value;
-            }
+            // Kept even when the pool completes: a speculative row that
+            // completes it may be rolled back and fed again.
+            F32(arg(6)).v[r * HD + tid] = k_value;
+            F32(arg(7)).v[r * HD + tid] = g_value;
         } else if (pos < pos0) {
             k_value = F32(arg(6)).v[r * HD + tid];
             g_value = F32(arg(7)).v[r * HD + tid];
