@@ -515,7 +515,41 @@ pub struct Scratch {
     mtp_sel: Tensor,
 }
 
+/// Writes `words` to the start of the U32 tensor `t` and zeroes the rest:
+/// staging through this cannot disagree with the tensor's size. GPU idle on
+/// `t`.
+pub(crate) fn write_words(t: &Tensor, words: &[u32]) -> Result<()> {
+    ensure!(t.dtype() == DType::U32, "staging words into a {:?} tensor", t.dtype());
+    ensure!(
+        words.len() <= t.numel(),
+        "{} words do not fit a tensor of {}",
+        words.len(),
+        t.numel()
+    );
+    let mut all = vec![0u32; t.numel()];
+    all[..words.len()].copy_from_slice(words);
+    t.write_bytes(bytemuck::cast_slice(&all))
+}
+
 impl Scratch {
+    /// Stages a prefill or decode run's token ids (at most PREFILL_ROWS).
+    pub(crate) fn stage_tokens(&self, tokens: &[u32]) -> Result<()> {
+        write_words(&self.tokens, tokens)
+    }
+
+    /// Stages a verify pass's rows: the pending token, then the drafts.
+    pub(crate) fn stage_spec_tokens(&self, pending: u32, drafts: &[u32]) -> Result<()> {
+        let rows: Vec<u32> =
+            std::iter::once(pending).chain(drafts.iter().copied()).collect();
+        ensure!(rows.len() <= MAX_ROWS, "verify of {} rows", rows.len());
+        write_words(&self.spec_tokens, &rows)
+    }
+
+    /// Stages the MTP step's input token (its draft slot cleared).
+    pub(crate) fn stage_mtp_token(&self, token: u32) -> Result<()> {
+        write_words(&self.mtp_io, &[token])
+    }
+
     fn new(ctx: &MetalContext, cfg: &Config) -> Result<Self> {
         let m = PREFILL_ROWS;
         let f = |n: usize| Tensor::zeros(ctx, &[n], DType::F32);
@@ -577,8 +611,9 @@ impl Scratch {
             logits,
             sampler: SamplerScratch::new(ctx, cfg.vocab)?,
             next_token: u(2)?,
-            draws: u(m)?,
-            spec_tokens: u(m)?,
+            // A verify pass's rows, not a prefill run's.
+            draws: u(MAX_ROWS)?,
+            spec_tokens: u(MAX_ROWS)?,
             mtp_io: u(2)?,
             mtp_emb: f(cfg.hc_dim())?,
             mtp_cat: f(2 * cfg.hidden)?,
@@ -689,15 +724,9 @@ impl Glm53Model {
             st.capacity,
             pos0 + m
         );
-        sc.tokens.write_bytes(bytemuck::cast_slice(&{
-            let mut t = [0u32; PREFILL_ROWS];
-            t[..m].copy_from_slice(tokens);
-            t
-        }))?;
+        sc.stage_tokens(tokens)?;
         let Some(trace) = trace else {
-            let pass = self.begin(ctx)?;
-            self.encode(ctx, &pass, st, sc, &sc.tokens, m, want_logits, None)?;
-            pass.commit_wait()?;
+            self.run_rows(ctx, st, sc, m, want_logits, |_| Ok(()))?;
             st.pos += m;
             return Ok(());
         };
@@ -767,6 +796,36 @@ impl Glm53Model {
         logits: Logits,
         snap: Option<usize>,
     ) -> Result<()> {
+        self.encode_layers(
+            ctx,
+            pass,
+            st,
+            sc,
+            tokens,
+            m,
+            logits,
+            snap,
+            0..self.cfg.n_trunk,
+        )
+    }
+
+    /// [`Self::encode`] of trunk layers `layers` only: the embedding when
+    /// they start at layer 0, the final HC post and the head when they end
+    /// at the last layer. Consecutive ranges in consecutive passes make one
+    /// step.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_layers(
+        &self,
+        ctx: &MetalContext,
+        pass: &ComputePass<'_>,
+        st: &Glm53State,
+        sc: &Scratch,
+        tokens: &Tensor,
+        m: usize,
+        logits: Logits,
+        snap: Option<usize>,
+        layers: std::ops::Range<usize>,
+    ) -> Result<()> {
         let cfg = &self.cfg;
         let pos0 = st.pos;
         ensure!((1..=PREFILL_ROWS).contains(&m), "step of {m} rows");
@@ -777,9 +836,12 @@ impl Glm53Model {
             st.capacity,
             pos0 + m
         );
-        k::embed(ctx, pass, &self.embed, tokens, &sc.h, m)?;
-        pass.memory_barrier()?;
-        for il in 0..cfg.n_trunk {
+        ensure!(layers.end <= cfg.n_trunk, "layers {layers:?}");
+        if layers.start == 0 {
+            k::embed(ctx, pass, &self.embed, tokens, &sc.h, m)?;
+            pass.memory_barrier()?;
+        }
+        for il in layers.clone() {
             let l = &self.layers[il];
             let [hc_a, hc_f] = l.hc.as_ref().expect("trunk layer has HC");
             // Each HC pre applies the HC post of the sublayer before it.
@@ -789,9 +851,66 @@ impl Glm53Model {
             self.hc_pre(ctx, pass, sc, hc_f, &l.ffn_norm, m, Some(&sc.attn_out))?;
             self.ffn(ctx, pass, sc, &l.ffn, m)?;
         }
+        if layers.end < cfg.n_trunk {
+            return Ok(());
+        }
         k::hc_post(ctx, pass, &sc.h, &sc.ffn_out, &sc.split, &sc.h, m, cfg.hidden)?;
         pass.memory_barrier()?;
         self.encode_head(ctx, pass, sc, m, logits)
+    }
+
+    /// Runs a step of the `m` rows staged in `sc.tokens` at the state's
+    /// position (without advancing it), `tail` encoded at its end, and
+    /// waits. A run of prompt rows takes a pass a layer: its dispatches run
+    /// for milliseconds each, and the kernel driver times a command buffer
+    /// from its submission (about two seconds), so one batched command
+    /// buffer of a 1 024-row run, queued behind others or another client's
+    /// work, ran out of time. At most two layers' passes are in flight.
+    pub fn run_rows(
+        &self,
+        ctx: &MetalContext,
+        st: &Glm53State,
+        sc: &Scratch,
+        m: usize,
+        logits: Logits,
+        tail: impl FnOnce(&ComputePass<'_>) -> Result<()>,
+    ) -> Result<()> {
+        let n = self.cfg.n_trunk;
+        if m <= MAX_ROWS {
+            let pass = self.begin(ctx)?;
+            self.encode(ctx, &pass, st, sc, &sc.tokens, m, logits, None)?;
+            tail(&pass)?;
+            return pass.commit_wait();
+        }
+        let mut pending = std::collections::VecDeque::new();
+        let mut tail = Some(tail);
+        for il in 0..n {
+            let pass = self.begin(ctx)?;
+            self.encode_layers(
+                ctx,
+                &pass,
+                st,
+                sc,
+                &sc.tokens,
+                m,
+                logits,
+                None,
+                il..il + 1,
+            )?;
+            if il + 1 == n {
+                (tail.take().expect("tail runs once"))(&pass)?;
+                pass.commit_wait()?;
+            } else {
+                pending.push_back(pass.commit()?);
+                if pending.len() > 2 {
+                    pending.pop_front().expect("in flight").wait()?;
+                }
+            }
+        }
+        for p in pending {
+            p.wait()?;
+        }
+        Ok(())
     }
 
     fn encode_head(
@@ -855,7 +974,7 @@ impl Glm53Model {
         for (slot, row) in (first..=p).enumerate() {
             rows[slot] = row as u32;
         }
-        sc.mtp_sel.write_bytes(bytemuck::cast_slice(&rows))?;
+        write_words(&sc.mtp_sel, &rows)?;
         let token = sc.mtp_io.view(0, &[1])?;
         k::embed(ctx, pass, &self.embed, &token, &sc.mtp_emb, 1)?;
         pass.memory_barrier()?;
@@ -1384,3 +1503,7 @@ impl Glm53Model {
 fn read(t: &Tensor, n: usize) -> Result<Vec<f32>> {
     Ok(t.to_f32()?[..n].to_vec())
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/glm53/model.rs"]
+mod tests;

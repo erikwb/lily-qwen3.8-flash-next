@@ -6,9 +6,7 @@ use std::path::Path;
 
 use anyhow::{Result, ensure};
 
-use super::model::{
-    Glm53Model, Glm53State, LayerState, Logits, MAX_ROWS, PREFILL_ROWS, Scratch,
-};
+use super::model::{Glm53Model, Glm53State, LayerState, Logits, PREFILL_ROWS, Scratch};
 use crate::engine::{
     DecodeStateApi, Draw, LanguageModel, LoadOptions, ScratchApi, SnapshotApi,
 };
@@ -196,7 +194,7 @@ impl Glm53Model {
         p: usize,
         draft: bool,
     ) -> Result<u32> {
-        scratch.mtp_io.write_bytes(bytemuck::cast_slice(&[token, 0u32]))?;
+        scratch.stage_mtp_token(token)?;
         let hidden = scratch.hidden.view(row * self.cfg.hidden, &[self.cfg.hidden])?;
         let pass = self.begin(ctx)?;
         self.encode_mtp(ctx, &pass, state, scratch, &hidden, p, draft)?;
@@ -260,10 +258,7 @@ impl LanguageModel for Glm53Model {
         ensure!(rows <= 2, "GLM verifies one draft a step, got {}", drafts.len());
         ensure!(state.spec.is_none(), "a verify pass is already pending");
         state.ensure_capacity(ctx, state.pos + rows)?;
-        let mut words = [0u32; MAX_ROWS];
-        words[0] = pending;
-        words[1..rows].copy_from_slice(drafts);
-        scratch.spec_tokens.write_bytes(bytemuck::cast_slice(&words))?;
+        scratch.stage_spec_tokens(pending, drafts)?;
         let pass = self.begin(ctx)?;
         // KDA keeps the state after row 0 aside: the rollback if row 1's
         // draft is rejected.
@@ -406,35 +401,25 @@ impl LanguageModel for Glm53Model {
         let chunks: Vec<&[u32]> = tokens.chunks(PREFILL_ROWS).collect();
         for (i, chunk) in chunks.iter().enumerate() {
             let last = i + 1 == chunks.len();
-            let mut words = [0u32; PREFILL_ROWS];
-            words[..chunk.len()].copy_from_slice(chunk);
-            scratch.tokens.write_bytes(bytemuck::cast_slice(&words))?;
-            let pass = self.begin(ctx)?;
+            scratch.stage_tokens(chunk)?;
             let logits =
                 if last && draw.is_some() { Logits::Last } else { Logits::None };
-            self.encode(
-                ctx,
-                &pass,
-                state,
-                scratch,
-                &scratch.tokens,
-                chunk.len(),
-                logits,
-                None,
-            )?;
-            if let (true, Some(d)) = (last, draw) {
-                let out = scratch.next_token.view(0, &[1])?;
-                sample_f32(
-                    ctx,
-                    &pass,
-                    &scratch.logits_last,
-                    scratch.sampler(),
-                    d.params,
-                    d.step,
-                    &out,
-                )?;
-            }
-            pass.commit_wait()?;
+            let sampler = scratch.sampler();
+            self.run_rows(ctx, state, scratch, chunk.len(), logits, |pass| {
+                if let (true, Some(d)) = (last, draw) {
+                    let out = scratch.next_token.view(0, &[1])?;
+                    sample_f32(
+                        ctx,
+                        pass,
+                        &scratch.logits_last,
+                        sampler,
+                        d.params,
+                        d.step,
+                        &out,
+                    )?;
+                }
+                Ok(())
+            })?;
             state.pos += chunk.len();
         }
         Ok(())
