@@ -628,6 +628,25 @@ fn dsa_attend_refuses_unpadded_prompt_widths() {
         1.0,
     );
     assert!(r.is_err());
+    // An empty selected width on the matrix route (its first weight loads
+    // run before its slot loop): refused too.
+    let one = zeros(&ctx, 1);
+    let sel = Tensor::zeros(&ctx, &[1], DType::U32).unwrap();
+    let r = dsa_attend(
+        &ctx,
+        &pass,
+        &qk,
+        &cache,
+        Rows::Selected { sel: &sel, count: 0 },
+        &one,
+        &denom,
+        &lat,
+        &partial,
+        m,
+        0,
+        1.0,
+    );
+    assert!(r.is_err());
     pass.commit_wait().unwrap();
 }
 

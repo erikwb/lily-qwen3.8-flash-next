@@ -1178,10 +1178,67 @@ pub enum Rows<'t> {
     Selected { sel: &'t Tensor, count: usize },
 }
 
+/// The scores stage of [`dsa_attend`] (`scores[i][h][s]`, -inf past each
+/// row's count): on the matrix route when `mu` (its widths a nonzero
+/// multiple of 8; a tile whose queries leave f16's range computes in f32),
+/// else on the SIMT kernel.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dsa_scores(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    qk_low: &Tensor,
+    cache: &Tensor,
+    rows: Rows<'_>,
+    scores: &Tensor,
+    m: usize,
+    s: usize,
+    scale: f32,
+    mu: bool,
+) -> Result<()> {
+    check_f32(&[qk_low, scores])?;
+    ensure!(scores.numel() >= m * 64 * s, "scores of {}", scores.numel());
+    let (pos0, sel, has_sel, n_sel) = match rows {
+        Rows::Causal { pos0 } => {
+            ensure!(pos0 + m <= s, "causal rows past the scores' width {s}");
+            (pos0, qk_low, 0usize, 0usize)
+        }
+        Rows::Selected { sel, count } => {
+            ensure!(count <= s && sel.numel() >= m * s, "selection");
+            (0, sel, 1, count)
+        }
+    };
+    ensure!(s <= DSA_MAX_SLOTS, "attention over {s} slots");
+    // The matrix route's weight loads are four wide: rows padded to 8, and
+    // its first loads run before its slot loop (no empty rows).
+    ensure!(
+        !mu || (s >= 8 && s.is_multiple_of(8)),
+        "prompt attention over {s} slots (a nonzero multiple of 8)"
+    );
+    let (name, groups, tg) = if mu {
+        ("glm53_dsa_scores_mu", s.div_ceil(64), 128)
+    } else {
+        ("glm53_dsa_scores", s.div_ceil(32), 256)
+    };
+    let scores_k = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &scores_k,
+        &[qk_low.binding(), cache.binding(), sel.binding(), scores.binding()],
+        &[
+            &u32_bytes(s),
+            &u32_bytes(pos0),
+            &u32_bytes(has_sel),
+            &u32_bytes(n_sel),
+            &f32_bytes(scale),
+        ],
+        Grid::Threadgroups { groups: (groups, m, 1), threadgroup: (tg, 1, 1) },
+    )
+}
+
 /// Absorbed DSA attention core over the latent cache: from `qk_low`
 /// (`[m][64][512]`) to the mixed latent `lat` (`[m][64][512]`), with scratch
 /// `scores` (`[m][64][s]`) and `denom` (`[m][64]`); `s` bounds every row's
-/// count.
+/// count. More than [`GEMV_MAX_ROWS`] rows take the matrix route, which
+/// needs `s` a nonzero multiple of 8.
 #[allow(clippy::too_many_arguments)]
 pub fn dsa_attend(
     ctx: &MetalContext,
@@ -1218,26 +1275,7 @@ pub fn dsa_attend(
     let f32_only =
         *F32_ONLY.get_or_init(|| std::env::var_os("LILY_GLM53_DSA_F32").is_some());
     let mu = m > GEMV_MAX_ROWS && !f32_only;
-    // The matrix route's weight loads are four wide: rows padded to 8.
-    ensure!(!mu || s.is_multiple_of(8), "prompt attention over {s} slots (pad to 8)");
-    let (name, groups, tg) = if mu {
-        ("glm53_dsa_scores_mu", s.div_ceil(64), 128)
-    } else {
-        ("glm53_dsa_scores", s.div_ceil(32), 256)
-    };
-    let scores_k = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
-    pass.dispatch_at(
-        &scores_k,
-        &[qk_low.binding(), cache.binding(), sel.binding(), scores.binding()],
-        &[
-            &u32_bytes(s),
-            &u32_bytes(pos0),
-            &u32_bytes(has_sel),
-            &u32_bytes(n_sel),
-            &f32_bytes(scale),
-        ],
-        Grid::Threadgroups { groups: (groups, m, 1), threadgroup: (tg, 1, 1) },
-    )?;
+    dsa_scores(ctx, pass, qk_low, cache, rows, scores, m, s, scale, mu)?;
     pass.memory_barrier()?;
     let softmax = ctx.pipeline("glm53_dsa_softmax", SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
