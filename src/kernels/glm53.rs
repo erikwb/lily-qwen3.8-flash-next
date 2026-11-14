@@ -56,16 +56,38 @@ impl QWeight {
     }
 }
 
-fn gemv_name(ty: GgmlType) -> Result<&'static str> {
-    Ok(match ty {
-        GgmlType::Q8_0 => "glm53_gemv_q8_0",
-        GgmlType::Q4K => "glm53_gemv_q4_k",
-        GgmlType::Q2K => "glm53_gemv_q2_k",
-        GgmlType::Iq2Xxs => "glm53_gemv_iq2_xxs",
-        GgmlType::Bf16 => "glm53_gemv_bf16",
-        GgmlType::F32 => "glm53_gemv_f32",
+/// The GEMV kernel of a type and row count (`m` in 1..=4: the count is a
+/// compile-time constant of each kernel).
+fn gemv_name(ty: GgmlType, m: usize) -> Result<&'static str> {
+    macro_rules! rows {
+        ($t:literal) => {
+            [
+                concat!("glm53_gemv_", $t, "_m1"),
+                concat!("glm53_gemv_", $t, "_m2"),
+                concat!("glm53_gemv_", $t, "_m3"),
+                concat!("glm53_gemv_", $t, "_m4"),
+            ]
+        };
+    }
+    const NAMES: [[&str; GEMV_MAX_ROWS]; 6] = [
+        rows!("q8_0"),
+        rows!("q4_k"),
+        rows!("q2_k"),
+        rows!("iq2_xxs"),
+        rows!("bf16"),
+        rows!("f32"),
+    ];
+    ensure!((1..=GEMV_MAX_ROWS).contains(&m), "GEMV of {m} rows");
+    let t = match ty {
+        GgmlType::Q8_0 => 0,
+        GgmlType::Q4K => 1,
+        GgmlType::Q2K => 2,
+        GgmlType::Iq2Xxs => 3,
+        GgmlType::Bf16 => 4,
+        GgmlType::F32 => 5,
         GgmlType::F16 => anyhow::bail!("no GLM GEMV over F16"),
-    })
+    };
+    Ok(NAMES[t][m - 1])
 }
 
 fn moe_name(gate_up: bool, ty: GgmlType) -> Result<&'static str> {
@@ -193,7 +215,7 @@ fn gemv_dispatch(
         bindings.push(sets.get(s).map_or(x.binding(), |(_, y)| y.binding()));
     }
     let rows = |s: usize| u32_bytes(sets.get(s).map_or(0, |(w, _)| w.rows));
-    let pipeline = ctx.pipeline(gemv_name(w0.ty)?, SOURCE, MslVersion::V3_1)?;
+    let pipeline = ctx.pipeline(gemv_name(w0.ty, m)?, SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
         &bindings,

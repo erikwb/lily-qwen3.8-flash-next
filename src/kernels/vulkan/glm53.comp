@@ -36,30 +36,69 @@ float glm53_group_sum(float v, uint width) {
 // (per-head projections, attn_k_b and attn_v_b, single set; x_group >=
 // rows otherwise). Output rows of set s are rows_s apart unless y_row_stride
 // is nonzero. Threadgroups of 256 threads: 8 subgroups.
-// Buffers: 0 x, 1-4 W, 5-8 y. Params: 9 K, 10 m, 11 row_bytes,
+// Buffers: 0 x, 1-4 W, 5-8 y. Params: 9 K, 10 m (unused: the kernel's own), 11 row_bytes,
 // 12-15 rows of each set (0: unused), 16 x_group, 17 x_row_stride,
 // 18 y_row_stride.
 // ---------------------------------------------------------------------------
-#if defined(KERNEL_glm53_gemv_q8_0) || defined(KERNEL_glm53_gemv_q4_k) || \
-    defined(KERNEL_glm53_gemv_q2_k) || defined(KERNEL_glm53_gemv_iq2_xxs) || \
-    defined(KERNEL_glm53_gemv_bf16) || defined(KERNEL_glm53_gemv_f32)
-#if defined(KERNEL_glm53_gemv_q8_0)
+#if defined(KERNEL_glm53_gemv_q8_0_m1) || \
+    defined(KERNEL_glm53_gemv_q8_0_m2) || \
+    defined(KERNEL_glm53_gemv_q8_0_m3) || defined(KERNEL_glm53_gemv_q8_0_m4)
 #define GEMV_TYPE GLM53_Q8_0
-#elif defined(KERNEL_glm53_gemv_q4_k)
+#elif defined(KERNEL_glm53_gemv_q4_k_m1) || \
+    defined(KERNEL_glm53_gemv_q4_k_m2) || \
+    defined(KERNEL_glm53_gemv_q4_k_m3) || defined(KERNEL_glm53_gemv_q4_k_m4)
 #define GEMV_TYPE GLM53_Q4_K
-#elif defined(KERNEL_glm53_gemv_q2_k)
+#elif defined(KERNEL_glm53_gemv_q2_k_m1) || \
+    defined(KERNEL_glm53_gemv_q2_k_m2) || \
+    defined(KERNEL_glm53_gemv_q2_k_m3) || defined(KERNEL_glm53_gemv_q2_k_m4)
 #define GEMV_TYPE GLM53_Q2_K
-#elif defined(KERNEL_glm53_gemv_iq2_xxs)
+#elif defined(KERNEL_glm53_gemv_iq2_xxs_m1) || \
+    defined(KERNEL_glm53_gemv_iq2_xxs_m2) || \
+    defined(KERNEL_glm53_gemv_iq2_xxs_m3) || \
+    defined(KERNEL_glm53_gemv_iq2_xxs_m4)
 #define GEMV_TYPE GLM53_IQ2_XXS
-#elif defined(KERNEL_glm53_gemv_bf16)
+#elif defined(KERNEL_glm53_gemv_bf16_m1) || \
+    defined(KERNEL_glm53_gemv_bf16_m2) || \
+    defined(KERNEL_glm53_gemv_bf16_m3) || defined(KERNEL_glm53_gemv_bf16_m4)
 #define GEMV_TYPE GLM53_BF16
-#else
+#elif defined(KERNEL_glm53_gemv_f32_m1) || \
+    defined(KERNEL_glm53_gemv_f32_m2) || defined(KERNEL_glm53_gemv_f32_m3) || \
+    defined(KERNEL_glm53_gemv_f32_m4)
 #define GEMV_TYPE GLM53_F32
+#endif
+#ifdef GEMV_TYPE
+#if defined(KERNEL_glm53_gemv_q8_0_m1) || \
+    defined(KERNEL_glm53_gemv_q4_k_m1) || \
+    defined(KERNEL_glm53_gemv_q2_k_m1) || \
+    defined(KERNEL_glm53_gemv_iq2_xxs_m1) || \
+    defined(KERNEL_glm53_gemv_bf16_m1) || defined(KERNEL_glm53_gemv_f32_m1)
+#define GEMV_M 1u
+#elif defined(KERNEL_glm53_gemv_q8_0_m2) || \
+    defined(KERNEL_glm53_gemv_q4_k_m2) || \
+    defined(KERNEL_glm53_gemv_q2_k_m2) || \
+    defined(KERNEL_glm53_gemv_iq2_xxs_m2) || \
+    defined(KERNEL_glm53_gemv_bf16_m2) || defined(KERNEL_glm53_gemv_f32_m2)
+#define GEMV_M 2u
+#elif defined(KERNEL_glm53_gemv_q8_0_m3) || \
+    defined(KERNEL_glm53_gemv_q4_k_m3) || \
+    defined(KERNEL_glm53_gemv_q2_k_m3) || \
+    defined(KERNEL_glm53_gemv_iq2_xxs_m3) || \
+    defined(KERNEL_glm53_gemv_bf16_m3) || defined(KERNEL_glm53_gemv_f32_m3)
+#define GEMV_M 3u
+#elif defined(KERNEL_glm53_gemv_q8_0_m4) || \
+    defined(KERNEL_glm53_gemv_q4_k_m4) || \
+    defined(KERNEL_glm53_gemv_q2_k_m4) || \
+    defined(KERNEL_glm53_gemv_iq2_xxs_m4) || \
+    defined(KERNEL_glm53_gemv_bf16_m4) || defined(KERNEL_glm53_gemv_f32_m4)
+#define GEMV_M 4u
 #endif
 void main() {
     const uint64_t X = arg(0);
     const uint K = arg_u32(9);
-    const uint m = arg_u32(10);
+    // The row count is the kernel's (glm53_gemv_<type>_m<rows>): a branch
+    // on a runtime count in the loop waits for every load in flight (Q4_K
+    // 8192 x 4096 at m = 1: 65 -> 55 us, 2026-11-14).
+    const uint m = GEMV_M;
     const uint row_bytes = arg_u32(11);
     const uint x_group = arg_u32(16);
     const uint x_row_stride = arg_u32(17);
