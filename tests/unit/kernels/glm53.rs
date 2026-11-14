@@ -172,7 +172,7 @@ fn moe_gate_up_and_down_match_cpu() {
     run(&ctx, |p| {
         moe_gate_up(&ctx, p, &gw, &uw, ff, &tx, &tsel, &tw, &mid, m, used, limit)
             .unwrap();
-        moe_down(&ctx, p, &dw, hidden, &mid, &tsel, &out, m, used).unwrap();
+        moe_down(&ctx, p, &dw, hidden, &mid, &tsel, None, &out, m, used).unwrap();
     });
     let mut emid = vec![0f32; m * used * ff];
     let mut eout = vec![0f32; m * hidden];
@@ -201,6 +201,16 @@ fn moe_gate_up_and_down_match_cpu() {
     }
     assert_close(&mid.to_f32().unwrap(), &emid, 1e-5, 1e-4);
     assert_close(&out.to_f32().unwrap(), &eout, 1e-5, 1e-3);
+    // With the shared expert's output added in place: exactly routed + add.
+    let shared = f32s(&mut rng, m * hidden, -1.0, 1.0);
+    let both = tensor(&ctx, &shared);
+    run(&ctx, |p| {
+        moe_down(&ctx, p, &dw, hidden, &mid, &tsel, Some(&both), &both, m, used)
+            .unwrap()
+    });
+    let routed = out.to_f32().unwrap();
+    let expect: Vec<f32> = routed.iter().zip(&shared).map(|(a, b)| a + b).collect();
+    assert_eq!(both.to_f32().unwrap(), expect);
 }
 
 #[test]

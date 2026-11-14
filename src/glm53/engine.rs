@@ -239,7 +239,7 @@ impl LanguageModel for Glm53Model {
             let mut words = [0u32; MAX_ROWS];
             words[..chunk.len()].copy_from_slice(chunk);
             scratch.tokens.write_bytes(bytemuck::cast_slice(&words))?;
-            let pass = ctx.begin()?;
+            let pass = self.begin(ctx)?;
             let logits =
                 if last && draw.is_some() { Logits::Last } else { Logits::None };
             self.encode(
@@ -288,7 +288,7 @@ impl LanguageModel for Glm53Model {
         draw: Draw<'_>,
     ) -> Result<EncodedPass<'a>> {
         ensure!(state.pos < state.capacity, "decode step past the state's capacity");
-        let pass = ctx.begin()?;
+        let pass = self.begin(ctx)?;
         let token = scratch.next_token.view(slot_in, &[1])?;
         self.encode(ctx, &pass, state, scratch, &token, 1, Logits::Last)?;
         let out = scratch.next_token.view(slot_out, &[1])?;

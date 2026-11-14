@@ -219,8 +219,9 @@ pub fn moe_gate_up(
     )
 }
 
-/// Routed experts' down projection summed over each row's slots:
-/// `out[i] = sum_s down_{sel[i][s]} mid[i * used + s]`.
+/// Routed experts' down projection summed over each row's slots, plus
+/// `add` when given: `out[i] = sum_s down_{sel[i][s]} mid[i * used + s]
+/// (+ add[i])`; `out` may be `add`.
 #[allow(clippy::too_many_arguments)]
 pub fn moe_down(
     ctx: &MetalContext,
@@ -229,6 +230,7 @@ pub fn moe_down(
     hidden: usize,
     mid: &Tensor,
     sel: &Tensor,
+    add: Option<&Tensor>,
     out: &Tensor,
     m: usize,
     used: usize,
@@ -240,12 +242,19 @@ pub fn moe_down(
     let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
-        &[down.t.binding(), mid.binding(), sel.binding(), out.binding()],
+        &[
+            down.t.binding(),
+            mid.binding(),
+            sel.binding(),
+            out.binding(),
+            add.unwrap_or(out).binding(),
+        ],
         &[
             &u32_bytes(down.cols),
             &u32_bytes(hidden),
             &u32_bytes(down.row_bytes),
             &u32_bytes(used),
+            &u32_bytes(usize::from(add.is_some())),
         ],
         Grid::Threadgroups {
             groups: (hidden.div_ceil(8), m, 1),
@@ -538,6 +547,7 @@ pub fn kda(
         &[&u32_bytes(p.heads), &u32_bytes(rows), &f32_bytes(p.lower_bound)],
         Grid::Threadgroups { groups: (p.heads, 1, 1), threadgroup: (128, 1, 1) },
     )?;
+    pass.memory_barrier()?;
     let recurrence =
         ctx.pipeline("glm53_kda_prefill_recurrence", SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
@@ -554,6 +564,7 @@ pub fn kda(
         &[&u32_bytes(p.heads), &u32_bytes(rows)],
         Grid::Threadgroups { groups: (p.heads, 32, 1), threadgroup: (128, 1, 1) },
     )?;
+    pass.memory_barrier()?;
     let output = ctx.pipeline("glm53_kda_prefill_output", SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &output,
@@ -642,6 +653,7 @@ pub fn dsa_attend(
         ],
         Grid::Threadgroups { groups: (s.div_ceil(8), m, 1), threadgroup: (64, 1, 1) },
     )?;
+    pass.memory_barrier()?;
     let softmax = ctx.pipeline("glm53_dsa_softmax", SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &softmax,
@@ -649,6 +661,7 @@ pub fn dsa_attend(
         &[&u32_bytes(s)],
         Grid::Threadgroups { groups: (64, m, 1), threadgroup: (256, 1, 1) },
     )?;
+    pass.memory_barrier()?;
     let lora = ctx.pipeline("glm53_dsa_lora", SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &lora,
@@ -723,6 +736,7 @@ pub fn indexer_pool_update(
             },
         )?;
         done += chunk;
+        pass.memory_barrier()?;
     }
     Ok(())
 }

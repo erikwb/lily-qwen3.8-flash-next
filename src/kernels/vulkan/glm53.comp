@@ -152,8 +152,9 @@ void main() {
 // Routed experts, down and combine: out[i][r] = sum over the row's slots of
 // down[sel[i][s]][r] . mid[i * used + s]. One subgroup per output row.
 // Grid (ceil(H / 8), m), 256 threads.
-// Buffers: 0 down experts, 1 mid, 2 sel, 3 out [m][H]. Params: 4 F (the
-// down rows' length), 5 H, 6 row_bytes, 7 used.
+// Buffers: 0 down experts, 1 mid, 2 sel, 3 out [m][H], 4 add [m][H] (read
+// when has_add; may be out). Params: 5 F (the down rows' length), 6 H,
+// 7 row_bytes, 8 used, 9 has_add.
 // ---------------------------------------------------------------------------
 #if defined(KERNEL_glm53_moe_down_q2_k) || defined(KERNEL_glm53_moe_down_q4_k) || \
     defined(KERNEL_glm53_moe_down_iq2_xxs)
@@ -165,10 +166,11 @@ void main() {
 #define MOE_TYPE GLM53_IQ2_XXS
 #endif
 void main() {
-    const uint F = arg_u32(4);
-    const uint H = arg_u32(5);
-    const uint row_bytes = arg_u32(6);
-    const uint used = arg_u32(7);
+    const uint F = arg_u32(5);
+    const uint H = arg_u32(6);
+    const uint row_bytes = arg_u32(7);
+    const uint used = arg_u32(8);
+    const bool has_add = arg_u32(9) != 0u;
     const uint i = gl_WorkGroupID.y;
     const uint r = gl_WorkGroupID.x * 8u + gl_SubgroupID;
     if (r >= H) return;
@@ -186,7 +188,12 @@ void main() {
         }
     }
     acc = subgroupAdd(acc);
-    if (gl_SubgroupInvocationID == 0u) F32(arg(3)).v[i * H + r] = acc;
+    if (gl_SubgroupInvocationID == 0u) {
+        // The shared expert's output, added after the routed sum as ds4
+        // adds them (moe + shared).
+        if (has_add) acc = acc + F32(arg(4)).v[i * H + r];
+        F32(arg(3)).v[i * H + r] = acc;
+    }
 }
 #endif
 

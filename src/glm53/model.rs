@@ -383,6 +383,7 @@ pub struct Scratch {
     kbeta: Tensor,
     kog: Tensor,
     klow: Tensor,
+    klow2: Tensor,
     kout: Tensor,
     // DSA
     qr: Tensor,
@@ -407,7 +408,6 @@ pub struct Scratch {
     rsel: Tensor,
     rw: Tensor,
     moe_mid: Tensor,
-    moe_out: Tensor,
     // Head
     hidden: Tensor,
     pub logits: Tensor,
@@ -444,6 +444,7 @@ impl Scratch {
             kbeta: f(m * cfg.kda_heads)?,
             kog: f(m * p)?,
             klow: f(m * cfg.kda_dim)?,
+            klow2: f(m * cfg.kda_dim)?,
             kout: f(m * p)?,
             qr: f(m * cfg.q_lora)?,
             q: f(m * hq)?,
@@ -466,7 +467,6 @@ impl Scratch {
             rsel: u(m * cfg.n_expert_used)?,
             rw: f(m * cfg.n_expert_used)?,
             moe_mid: f(m * cfg.n_expert_used * cfg.ff_expert)?,
-            moe_out: f(m * cfg.hidden)?,
             hidden: f(m * cfg.hidden)?,
             logits,
             sampler: SamplerScratch::new(ctx, cfg.vocab)?,
@@ -563,7 +563,7 @@ impl Glm53Model {
         sc: &mut Scratch,
         tokens: &[u32],
         want_logits: Logits,
-        mut trace: Option<&mut Vec<LayerTrace>>,
+        trace: Option<&mut Vec<LayerTrace>>,
     ) -> Result<()> {
         let cfg = &self.cfg;
         let m = tokens.len();
@@ -581,7 +581,7 @@ impl Glm53Model {
             t
         }))?;
         let Some(trace) = trace else {
-            let pass = ctx.begin()?;
+            let pass = self.begin(ctx)?;
             self.encode(ctx, &pass, st, sc, &sc.tokens, m, want_logits)?;
             pass.commit_wait()?;
             st.pos += m;
@@ -662,6 +662,7 @@ impl Glm53Model {
             pos0 + m
         );
         k::embed(ctx, pass, &self.embed, tokens, &sc.h, m)?;
+        pass.memory_barrier()?;
         for il in 0..cfg.n_trunk {
             let l = &self.layers[il];
             let [hc_a, hc_f] = l.hc.as_ref().expect("trunk layer has HC");
@@ -677,9 +678,11 @@ impl Glm53Model {
                 m,
                 cfg.hidden,
             )?;
+            pass.memory_barrier()?;
             self.hc_pre(ctx, pass, sc, hc_f, &l.ffn_norm, m)?;
             self.ffn(ctx, pass, sc, &l.ffn, m)?;
             k::hc_post(ctx, pass, &sc.h, &sc.ffn_out, &sc.split, &sc.h, m, cfg.hidden)?;
+            pass.memory_barrier()?;
         }
         self.encode_head(ctx, pass, sc, m, logits)
     }
@@ -699,6 +702,7 @@ impl Glm53Model {
         let (first, rows) = if logits == Logits::All { (0, m) } else { (m - 1, 1) };
         let h = sc.h.view(first * cfg.hc_dim(), &[rows * cfg.hc_dim()])?;
         k::hc_mean(ctx, pass, &h, &sc.hidden, rows, cfg.hidden)?;
+        pass.memory_barrier()?;
         k::rmsnorm(
             ctx,
             pass,
@@ -709,7 +713,21 @@ impl Glm53Model {
             cfg.hidden,
             cfg.rms_eps,
         )?;
-        k::gemv(ctx, pass, &self.output, &sc.hidden, &sc.logits, rows)
+        pass.memory_barrier()?;
+        k::gemv(ctx, pass, &self.output, &sc.hidden, &sc.logits, rows)?;
+        pass.memory_barrier()
+    }
+
+    /// The pass a step is encoded into: concurrent, its dependency levels
+    /// separated by barriers; `LILY_GLM53_SERIAL=1` makes every dispatch its
+    /// own level (A/B and debugging).
+    pub fn begin<'c>(&self, ctx: &'c MetalContext) -> Result<ComputePass<'c>> {
+        static SERIAL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *SERIAL.get_or_init(|| std::env::var_os("LILY_GLM53_SERIAL").is_some()) {
+            ctx.begin()
+        } else {
+            ctx.begin_concurrent()
+        }
     }
 
     fn hc_pre(
@@ -723,7 +741,9 @@ impl Glm53Model {
     ) -> Result<()> {
         let cfg = &self.cfg;
         k::rmsnorm(ctx, pass, &sc.h, None, &sc.flat, m, cfg.hc_dim(), cfg.rms_eps)?;
+        pass.memory_barrier()?;
         k::gemv(ctx, pass, &hc.fn_w, &sc.flat, &sc.mix, m)?;
+        pass.memory_barrier()?;
         k::hc_pre(
             ctx,
             pass,
@@ -739,9 +759,13 @@ impl Glm53Model {
             cfg.sinkhorn_iters,
             cfg.hc_eps,
             cfg.rms_eps,
-        )
+        )?;
+        pass.memory_barrier()
     }
 
+    /// The attention sublayer from `sc.xn` to `sc.attn_out`, in dependency
+    /// levels: dispatches between two barriers are independent and may run
+    /// side by side on a concurrent pass.
     #[allow(clippy::too_many_arguments)]
     fn attention(
         &self,
@@ -761,10 +785,12 @@ impl Glm53Model {
                 k::gemv(ctx, pass, &w.k, &sc.xn, &sc.kk, m)?;
                 k::gemv(ctx, pass, &w.v, &sc.xn, &sc.kv, m)?;
                 k::gemv(ctx, pass, &w.f_a, &sc.xn, &sc.klow, m)?;
-                k::gemv(ctx, pass, &w.f_b, &sc.klow, &sc.kgate, m)?;
                 k::gemv(ctx, pass, &w.beta, &sc.xn, &sc.kbeta, m)?;
-                k::gemv(ctx, pass, &w.g_a, &sc.xn, &sc.klow, m)?;
-                k::gemv(ctx, pass, &w.g_b, &sc.klow, &sc.kog, m)?;
+                k::gemv(ctx, pass, &w.g_a, &sc.xn, &sc.klow2, m)?;
+                pass.memory_barrier()?;
+                k::gemv(ctx, pass, &w.f_b, &sc.klow, &sc.kgate, m)?;
+                k::gemv(ctx, pass, &w.g_b, &sc.klow2, &sc.kog, m)?;
+                pass.memory_barrier()?;
                 let p = KdaParams {
                     q_conv: &w.q_conv,
                     k_conv: &w.k_conv,
@@ -785,10 +811,31 @@ impl Glm53Model {
                     out_gate: &sc.kog,
                 };
                 k::kda(ctx, pass, &p, &x, conv, s, &sc.kout, m)?;
-                k::gemv(ctx, pass, &w.out, &sc.kout, &sc.attn_out, m)
+                pass.memory_barrier()?;
+                k::gemv(ctx, pass, &w.out, &sc.kout, &sc.attn_out, m)?;
+                pass.memory_barrier()
             }
             (AttnW::Dsa(w), LayerState::Dsa { latent, pooled, tail_k, tail_g }) => {
+                let kv = cfg.kv_lora;
+                let hq = cfg.n_head * cfg.key_dim;
+                let limit = cfg.indexer_selected_limit();
+                let sparse = w.indexer.is_some() && pos0 + m > limit;
+                ensure!(
+                    w.indexer.is_some() || pos0 + m <= limit,
+                    "MTP attention window past {limit} rows (il {il})"
+                );
+                // Level 1: everything that reads xn.
                 k::gemv(ctx, pass, &w.q_a, &sc.xn, &sc.qr, m)?;
+                k::gemv(ctx, pass, &w.kv_a, &sc.xn, &sc.kv_raw, m)?;
+                if let Some(ix) = &w.indexer {
+                    k::gemv(ctx, pass, &ix.k, &sc.xn, &sc.ik, m)?;
+                    k::gemv(ctx, pass, &ix.gate, &sc.xn, &sc.ig, m)?;
+                    if sparse {
+                        k::gemv(ctx, pass, &ix.proj, &sc.xn, &sc.iw, m)?;
+                    }
+                }
+                pass.memory_barrier()?;
+                // Level 2: the norms, the latent store, the pooled keys.
                 k::rmsnorm(
                     ctx,
                     pass,
@@ -799,8 +846,6 @@ impl Glm53Model {
                     cfg.q_lora,
                     cfg.rms_eps,
                 )?;
-                k::gemv(ctx, pass, &w.q_b, &sc.qr, &sc.q, m)?;
-                k::gemv(ctx, pass, &w.kv_a, &sc.xn, &sc.kv_raw, m)?;
                 k::kv_store(
                     ctx,
                     pass,
@@ -811,8 +856,24 @@ impl Glm53Model {
                     m,
                     cfg.rms_eps,
                 )?;
-                let kv = cfg.kv_lora;
-                let hq = cfg.n_head * cfg.key_dim;
+                if let Some(ix) = &w.indexer {
+                    let pp = PoolParams {
+                        norm_w: &ix.norm_w,
+                        norm_b: &ix.norm_b,
+                        ape: &ix.ape,
+                    };
+                    k::indexer_pool_update(
+                        ctx, pass, &pp, &sc.ik, &sc.ig, pooled, tail_k, tail_g, pos0, m,
+                    )?;
+                }
+                pass.memory_barrier()?;
+                // Level 3: the queries.
+                k::gemv(ctx, pass, &w.q_b, &sc.qr, &sc.q, m)?;
+                if let (true, Some(ix)) = (sparse, &w.indexer) {
+                    k::gemv(ctx, pass, &ix.q_b, &sc.qr, &sc.iq, m)?;
+                }
+                pass.memory_barrier()?;
+                // Level 4: absorbed queries, pool scores.
                 k::gemv_with(
                     ctx,
                     pass,
@@ -826,63 +887,40 @@ impl Glm53Model {
                         y_row_stride: cfg.n_head * kv,
                     },
                 )?;
-                let limit = cfg.indexer_selected_limit();
-                let rows = match &w.indexer {
-                    Some(ix) => {
-                        k::gemv(ctx, pass, &ix.k, &sc.xn, &sc.ik, m)?;
-                        k::gemv(ctx, pass, &ix.gate, &sc.xn, &sc.ig, m)?;
-                        let pp = PoolParams {
-                            norm_w: &ix.norm_w,
-                            norm_b: &ix.norm_b,
-                            ape: &ix.ape,
-                        };
-                        k::indexer_pool_update(
-                            ctx, pass, &pp, &sc.ik, &sc.ig, pooled, tail_k, tail_g,
-                            pos0, m,
-                        )?;
-                        if pos0 + m <= limit {
-                            Rows::Causal { pos0 }
-                        } else {
-                            k::gemv(ctx, pass, &ix.q_b, &sc.qr, &sc.iq, m)?;
-                            k::gemv(ctx, pass, &ix.proj, &sc.xn, &sc.iw, m)?;
-                            let scale = 1.0
-                                / ((cfg.indexer_dim * cfg.indexer_heads) as f32).sqrt();
-                            k::indexer_scores(
-                                ctx,
-                                pass,
-                                &sc.iq,
-                                &sc.iw,
-                                pooled,
-                                &st.pool_scores,
-                                m,
-                                st.pool_cap,
-                                pos0,
-                                scale,
-                            )?;
-                            let s = limit.next_multiple_of(8);
-                            k::indexer_topk(
-                                ctx,
-                                pass,
-                                &st.pool_scores,
-                                &sc.sel,
-                                &sc.sel_count,
-                                m,
-                                st.pool_cap,
-                                s,
-                                pos0,
-                                cfg.indexer_top_k / cfg.indexer_pool,
-                            )?;
-                            Rows::Selected { sel: &sc.sel, count: s }
-                        }
-                    }
-                    None => {
-                        ensure!(
-                            pos0 + m <= limit,
-                            "MTP attention window past {limit} rows (il {il})"
-                        );
-                        Rows::Causal { pos0 }
-                    }
+                let rows = if sparse {
+                    let scale =
+                        1.0 / ((cfg.indexer_dim * cfg.indexer_heads) as f32).sqrt();
+                    k::indexer_scores(
+                        ctx,
+                        pass,
+                        &sc.iq,
+                        &sc.iw,
+                        pooled,
+                        &st.pool_scores,
+                        m,
+                        st.pool_cap,
+                        pos0,
+                        scale,
+                    )?;
+                    pass.memory_barrier()?;
+                    let s = limit.next_multiple_of(8);
+                    k::indexer_topk(
+                        ctx,
+                        pass,
+                        &st.pool_scores,
+                        &sc.sel,
+                        &sc.sel_count,
+                        m,
+                        st.pool_cap,
+                        s,
+                        pos0,
+                        cfg.indexer_top_k / cfg.indexer_pool,
+                    )?;
+                    Rows::Selected { sel: &sc.sel, count: s }
+                } else {
+                    Rows::Causal { pos0 }
                 };
+                pass.memory_barrier()?;
                 let s = match rows {
                     Rows::Causal { .. } => (pos0 + m).next_multiple_of(8),
                     Rows::Selected { count, .. } => count,
@@ -900,6 +938,7 @@ impl Glm53Model {
                     s,
                     1.0 / (cfg.key_dim as f32).sqrt(),
                 )?;
+                pass.memory_barrier()?;
                 k::gemv_with(
                     ctx,
                     pass,
@@ -913,12 +952,15 @@ impl Glm53Model {
                         y_row_stride: cfg.n_head * cfg.value_dim,
                     },
                 )?;
-                k::gemv(ctx, pass, &w.out, &sc.heads, &sc.attn_out, m)
+                pass.memory_barrier()?;
+                k::gemv(ctx, pass, &w.out, &sc.heads, &sc.attn_out, m)?;
+                pass.memory_barrier()
             }
             _ => anyhow::bail!("layer {il}: weights and state disagree"),
         }
     }
 
+    /// The FFN sublayer from `sc.xn` to `sc.ffn_out`, in dependency levels.
     fn ffn(
         &self,
         ctx: &MetalContext,
@@ -933,12 +975,18 @@ impl Glm53Model {
             FfnW::Dense { gate, up, down } => {
                 k::gemv(ctx, pass, gate, &sc.xn, &sc.fg, m)?;
                 k::gemv(ctx, pass, up, &sc.xn, &sc.fu, m)?;
+                pass.memory_barrier()?;
                 k::swiglu(ctx, pass, &sc.fg, &sc.fu, &sc.fmid, m * cfg.ff_dense, lim)?;
-                k::gemv(ctx, pass, down, &sc.fmid, &sc.ffn_out, m)
+                pass.memory_barrier()?;
+                k::gemv(ctx, pass, down, &sc.fmid, &sc.ffn_out, m)?;
+                pass.memory_barrier()
             }
             FfnW::Moe { router, bias, gate, up, down, sh_gate, sh_up, sh_down } => {
                 let used = cfg.n_expert_used;
                 k::gemv(ctx, pass, router, &sc.xn, &sc.rlogits, m)?;
+                k::gemv(ctx, pass, sh_gate, &sc.xn, &sc.fg, m)?;
+                k::gemv(ctx, pass, sh_up, &sc.xn, &sc.fu, m)?;
+                pass.memory_barrier()?;
                 k::router_topk(
                     ctx,
                     pass,
@@ -951,6 +999,8 @@ impl Glm53Model {
                     used,
                     cfg.expert_weight_scale,
                 )?;
+                k::swiglu(ctx, pass, &sc.fg, &sc.fu, &sc.fmid, m * cfg.ff_expert, lim)?;
+                pass.memory_barrier()?;
                 k::moe_gate_up(
                     ctx,
                     pass,
@@ -965,6 +1015,9 @@ impl Glm53Model {
                     used,
                     lim,
                 )?;
+                k::gemv(ctx, pass, sh_down, &sc.fmid, &sc.ffn_out, m)?;
+                pass.memory_barrier()?;
+                // Routed sum plus the shared expert's output.
                 k::moe_down(
                     ctx,
                     pass,
@@ -972,15 +1025,12 @@ impl Glm53Model {
                     cfg.hidden,
                     &sc.moe_mid,
                     &sc.rsel,
-                    &sc.moe_out,
+                    Some(&sc.ffn_out),
+                    &sc.ffn_out,
                     m,
                     used,
                 )?;
-                k::gemv(ctx, pass, sh_gate, &sc.xn, &sc.fg, m)?;
-                k::gemv(ctx, pass, sh_up, &sc.xn, &sc.fu, m)?;
-                k::swiglu(ctx, pass, &sc.fg, &sc.fu, &sc.fmid, m * cfg.ff_expert, lim)?;
-                k::gemv(ctx, pass, sh_down, &sc.fmid, &sc.ffn_out, m)?;
-                k::add(ctx, pass, &sc.moe_out, &sc.ffn_out, &sc.ffn_out, m * cfg.hidden)
+                pass.memory_barrier()
             }
         }
     }
