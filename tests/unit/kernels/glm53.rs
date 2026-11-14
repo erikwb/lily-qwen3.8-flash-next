@@ -787,6 +787,11 @@ fn gemv_timing() {
         ("shexp Q8_0 2048x4096", GgmlType::Q8_0, 4096, 2048, 1),
         ("head Q8_0 154880x4096", GgmlType::Q8_0, 4096, 154880, 1),
         ("kda_v Q8_0 m=4", GgmlType::Q8_0, 4096, 8192, 4),
+        ("router F32 288x4096", GgmlType::F32, 4096, 288, 1),
+        ("kv_a Q8_0 512x4096", GgmlType::Q8_0, 4096, 512, 1),
+        ("q_a Q8_0 1536x4096", GgmlType::Q8_0, 4096, 1536, 1),
+        ("f_b Q8_0 8192x128", GgmlType::Q8_0, 128, 8192, 1),
+        ("attn_out Q8_0 4096x16384", GgmlType::Q8_0, 16384, 4096, 1),
     ];
     for (label, ty, cols, rows, m) in shapes {
         let copies = if rows > 100_000 { 1 } else { 4 };
@@ -1002,6 +1007,41 @@ fn gemm_matches_cpu() {
     }
 }
 
+/// The dense GEMM walks K in 64-deep steps: widths of 64 are computed,
+/// widths that are not a multiple of 64 are refused before anything is
+/// encoded.
+#[test]
+fn gemm_k_widths() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(75);
+    let (rows, m) = (40, 5);
+    for cols in [32usize, 64, 96] {
+        let raw = random_blocks(&mut rng, GgmlType::Q8_0, rows * cols);
+        let w = QWeight::from_bytes(&ctx, &raw, GgmlType::Q8_0, cols, rows).unwrap();
+        let x = f32s(&mut rng, m * cols, -1.0, 1.0);
+        let tx = tensor(&ctx, &x);
+        let y = zeros(&ctx, m * rows);
+        let pass = ctx.begin().unwrap();
+        let r = gemm(&ctx, &pass, &w, &tx, &y, m);
+        pass.commit_wait().unwrap();
+        if cols % 64 != 0 {
+            assert!(r.is_err(), "K = {cols} accepted");
+            continue;
+        }
+        r.unwrap();
+        let cpu = mat(GgmlType::Q8_0, &raw, rows, cols);
+        let g = y.to_f32().unwrap();
+        for i in 0..m {
+            let e = cpu.mv(&x[i * cols..(i + 1) * cols]);
+            let scale: f32 =
+                (e.iter().map(|v| v * v).sum::<f32>() / rows as f32).sqrt();
+            for (a, b) in g[i * rows..(i + 1) * rows].iter().zip(&e) {
+                assert!((a - b).abs() <= 2e-2 * scale + 1e-6, "K = {cols}: {a} vs {b}");
+            }
+        }
+    }
+}
+
 #[test]
 fn gemm_batched_matches_grouped_gemv() {
     // attn_k_b's shape for 4 heads, 70 rows: per head a 512 x 256 block.
@@ -1049,6 +1089,209 @@ fn moe_grouped_matches_per_pair_kernels() {
         QWeight::from_bytes(&ctx, &d_raw, GgmlType::Q2K, ff, experts * hidden).unwrap();
     let x = f32s(&mut rng, m * hidden, -2.0, 2.0);
     // Distinct experts per row, skewed so some experts get more than 64 pairs.
+    let sel: Vec<u32> = (0..m)
+        .flat_map(|i| (0..used).map(move |s| ((i * (s + 1) + s * s) % experts) as u32))
+        .collect();
+    let wts = f32s(&mut rng, m * used, 0.1, 0.6);
+    let shared = f32s(&mut rng, m * hidden, -1.0, 1.0);
+    let tx = tensor(&ctx, &x);
+    let tsel =
+        Tensor::from_bytes(&ctx, bytemuck::cast_slice(&sel), &[sel.len()], DType::U32)
+            .unwrap();
+    let tw = tensor(&ctx, &wts);
+    let grouped = tensor(&ctx, &shared);
+    let reference = tensor(&ctx, &shared);
+    let mid = zeros(&ctx, m * used * ff);
+    let gs = MoeGroupScratch::new(&ctx, m * used, experts, ff, hidden).unwrap();
+    run(&ctx, |p| {
+        moe_grouped(
+            &ctx, p, &gw, &uw, &dw, ff, hidden, &tx, &tsel, &tw, &grouped, &gs, m,
+            used, experts, 0.05,
+        )
+        .unwrap();
+        moe_gate_up(&ctx, p, &gw, &uw, ff, &tx, &tsel, &tw, &mid, m, used, 0.05)
+            .unwrap();
+        moe_down(
+            &ctx,
+            p,
+            &dw,
+            hidden,
+            &mid,
+            &tsel,
+            Some(&reference),
+            &reference,
+            m,
+            used,
+        )
+        .unwrap();
+    });
+    let a = grouped.to_f32().unwrap();
+    let b = reference.to_f32().unwrap();
+    let scale = (b.iter().map(|v| v * v).sum::<f32>() / b.len() as f32).sqrt();
+    for (k, (x, y)) in a.iter().zip(&b).enumerate() {
+        assert!((x - y).abs() <= 3e-2 * scale, "element {k}: {x} vs {y}");
+    }
+}
+
+/// The prefill's grouped routed experts at the model's shapes (gate/up
+/// IQ2_XXS 2048 x 4096, down Q2_K 4096 x 2048) over 64 experts, for runs
+/// whose pairs per expert match a 256-token and a 4K-token prompt of the
+/// model (288 experts, 8 used): best of three passes of one call.
+#[test]
+#[ignore = "timing only"]
+fn moe_grouped_timing() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(72);
+    let (experts, hidden, ff, used) = (64, 4096, 2048, 8);
+    let mk = |rng: &mut StdRng, ty, cols, rows| {
+        let raw = random_blocks(rng, ty, rows * cols);
+        QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap()
+    };
+    let gw = mk(&mut rng, GgmlType::Iq2Xxs, hidden, experts * ff);
+    let uw = mk(&mut rng, GgmlType::Iq2Xxs, hidden, experts * ff);
+    let dw = mk(&mut rng, GgmlType::Q2K, ff, experts * hidden);
+    // Rows such that pairs per expert = 256 * 8 / 288 and 4096 * 8 / 288.
+    for (label, m) in [("256-token density", 57), ("4K-token density", 910)] {
+        let sel: Vec<u32> = (0..m)
+            .flat_map(|i| {
+                let start = (i * 37) % experts;
+                (0..used).map(move |s| ((start + s * 7) % experts) as u32)
+            })
+            .collect();
+        let x = tensor(&ctx, &f32s(&mut rng, m * hidden, -1.0, 1.0));
+        let tsel = Tensor::from_bytes(
+            &ctx,
+            bytemuck::cast_slice(&sel),
+            &[sel.len()],
+            DType::U32,
+        )
+        .unwrap();
+        let tw = tensor(&ctx, &f32s(&mut rng, m * used, 0.1, 0.6));
+        let out = zeros(&ctx, m * hidden);
+        let gs = MoeGroupScratch::new(&ctx, m * used, experts, ff, hidden).unwrap();
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let pass = ctx.begin().unwrap();
+            moe_grouped(
+                &ctx, &pass, &gw, &uw, &dw, ff, hidden, &x, &tsel, &tw, &out, &gs, m,
+                used, experts, 10.0,
+            )
+            .unwrap();
+            let t = std::time::Instant::now();
+            pass.commit_wait().unwrap();
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        println!("moe grouped {label:20} m {m:4}: {:8.1} us", best * 1e6);
+    }
+}
+
+/// The prefill's dense GEMMs at the model's shapes for a run of 1 024 rows:
+/// best of three passes of four calls.
+#[test]
+#[ignore = "timing only"]
+fn gemm_timing() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(73);
+    let m = 1024;
+    for (label, ty, cols, rows) in [
+        ("kda_v Q8_0 8192x4096", GgmlType::Q8_0, 4096usize, 8192usize),
+        ("kda_out Q8_0 4096x8192", GgmlType::Q8_0, 8192, 4096),
+        ("kda_q Q4_K 8192x4096", GgmlType::Q4K, 4096, 8192),
+        ("f_b Q8_0 8192x128", GgmlType::Q8_0, 128, 8192),
+        ("shexp Q8_0 2048x4096", GgmlType::Q8_0, 4096, 2048),
+    ] {
+        let raw = random_blocks(&mut rng, ty, rows * cols);
+        let w = QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap();
+        let x = tensor(&ctx, &f32s(&mut rng, m * cols, -1.0, 1.0));
+        let y = zeros(&ctx, m * rows);
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let pass = ctx.begin().unwrap();
+            for _ in 0..4 {
+                gemm(&ctx, &pass, &w, &x, &y, m).unwrap();
+            }
+            let t = std::time::Instant::now();
+            pass.commit_wait().unwrap();
+            best = best.min(t.elapsed().as_secs_f64() / 4.0);
+        }
+        println!(
+            "gemm {label:24} m {m}: {:8.1} us  {:5.1} TFLOP/s",
+            best * 1e6,
+            2.0 * (m * rows * cols) as f64 / best / 1e12
+        );
+    }
+}
+
+/// The fused gate/up/SwiGLU expert GEMM gives the separate GEMMs' and
+/// SwiGLU's values bit for bit: experts with 16, 32, 48, 64 and 65 pairs
+/// (one, two, three and four working subgroups, and a second tile), small
+/// ones, an unused one; the clamp off, tight and loose.
+#[test]
+fn moe_grouped_fused_matches_separate() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(74);
+    let (experts, hidden, ff, used, m) = (12, 1024, 512, 8, 40);
+    let mk = |rng: &mut StdRng, ty, cols, rows| {
+        let raw = random_blocks(rng, ty, rows * cols);
+        QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap()
+    };
+    let gw = mk(&mut rng, GgmlType::Iq2Xxs, hidden, experts * ff);
+    let uw = mk(&mut rng, GgmlType::Iq2Xxs, hidden, experts * ff);
+    let dw = mk(&mut rng, GgmlType::Q2K, ff, experts * hidden);
+    // 320 pairs: experts 0-4 take 16, 32, 48, 64 and 65, expert 5 none,
+    // experts 6-11 the other 95, in a scrambled order.
+    let counts = [16usize, 32, 48, 64, 65, 0, 16, 16, 16, 16, 16, 15];
+    assert_eq!(counts.iter().sum::<usize>(), m * used);
+    let mut sel: Vec<u32> = counts
+        .iter()
+        .enumerate()
+        .flat_map(|(e, &c)| std::iter::repeat_n(e as u32, c))
+        .collect();
+    for i in (1..sel.len()).rev() {
+        sel.swap(i, rng.gen_range(0..=i));
+    }
+    let x = tensor(&ctx, &f32s(&mut rng, m * hidden, -2.0, 2.0));
+    let tsel =
+        Tensor::from_bytes(&ctx, bytemuck::cast_slice(&sel), &[sel.len()], DType::U32)
+            .unwrap();
+    let tw = tensor(&ctx, &f32s(&mut rng, m * used, 0.1, 0.6));
+    let gs = MoeGroupScratch::new(&ctx, m * used, experts, ff, hidden).unwrap();
+    for limit in [0.0f32, 1e-3, 10.0] {
+        let mut got = Vec::new();
+        for fused in [true, false] {
+            let out = zeros(&ctx, m * hidden);
+            run(&ctx, |p| {
+                moe_grouped_with(
+                    &ctx, p, &gw, &uw, &dw, ff, hidden, &x, &tsel, &tw, &out, &gs, m,
+                    used, experts, limit, fused,
+                )
+                .unwrap()
+            });
+            got.push((gs.mid.to_f32().unwrap(), out.to_f32().unwrap()));
+        }
+        let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&got[0].0), bits(&got[1].0), "mid, limit {limit}");
+        assert_eq!(bits(&got[0].1), bits(&got[1].1), "out, limit {limit}");
+    }
+}
+
+/// The grouped route of Q2_K gate/up experts (separate GEMMs and SwiGLU)
+/// against the per-pair kernels.
+#[test]
+fn moe_grouped_q2_k_gate_up_matches_per_pair_kernels() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(76);
+    let (experts, hidden, ff, used, m) = (12, 512, 256, 8, 70);
+    let g_raw = random_blocks(&mut rng, GgmlType::Q2K, experts * ff * hidden);
+    let u_raw = random_blocks(&mut rng, GgmlType::Q2K, experts * ff * hidden);
+    let d_raw = random_blocks(&mut rng, GgmlType::Q2K, experts * hidden * ff);
+    let gw =
+        QWeight::from_bytes(&ctx, &g_raw, GgmlType::Q2K, hidden, experts * ff).unwrap();
+    let uw =
+        QWeight::from_bytes(&ctx, &u_raw, GgmlType::Q2K, hidden, experts * ff).unwrap();
+    let dw =
+        QWeight::from_bytes(&ctx, &d_raw, GgmlType::Q2K, ff, experts * hidden).unwrap();
+    let x = f32s(&mut rng, m * hidden, -2.0, 2.0);
     let sel: Vec<u32> = (0..m)
         .flat_map(|i| (0..used).map(move |s| ((i * (s + 1) + s * s) % experts) as u32))
         .collect();

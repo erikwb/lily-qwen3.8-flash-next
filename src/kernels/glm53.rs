@@ -56,16 +56,38 @@ impl QWeight {
     }
 }
 
-fn gemv_name(ty: GgmlType) -> Result<&'static str> {
-    Ok(match ty {
-        GgmlType::Q8_0 => "glm53_gemv_q8_0",
-        GgmlType::Q4K => "glm53_gemv_q4_k",
-        GgmlType::Q2K => "glm53_gemv_q2_k",
-        GgmlType::Iq2Xxs => "glm53_gemv_iq2_xxs",
-        GgmlType::Bf16 => "glm53_gemv_bf16",
-        GgmlType::F32 => "glm53_gemv_f32",
+/// The GEMV kernel of a type and row count (`m` in 1..=4: the count is a
+/// compile-time constant of each kernel).
+fn gemv_name(ty: GgmlType, m: usize) -> Result<&'static str> {
+    macro_rules! rows {
+        ($t:literal) => {
+            [
+                concat!("glm53_gemv_", $t, "_m1"),
+                concat!("glm53_gemv_", $t, "_m2"),
+                concat!("glm53_gemv_", $t, "_m3"),
+                concat!("glm53_gemv_", $t, "_m4"),
+            ]
+        };
+    }
+    const NAMES: [[&str; GEMV_MAX_ROWS]; 6] = [
+        rows!("q8_0"),
+        rows!("q4_k"),
+        rows!("q2_k"),
+        rows!("iq2_xxs"),
+        rows!("bf16"),
+        rows!("f32"),
+    ];
+    ensure!((1..=GEMV_MAX_ROWS).contains(&m), "GEMV of {m} rows");
+    let t = match ty {
+        GgmlType::Q8_0 => 0,
+        GgmlType::Q4K => 1,
+        GgmlType::Q2K => 2,
+        GgmlType::Iq2Xxs => 3,
+        GgmlType::Bf16 => 4,
+        GgmlType::F32 => 5,
         GgmlType::F16 => anyhow::bail!("no GLM GEMV over F16"),
-    })
+    };
+    Ok(NAMES[t][m - 1])
 }
 
 fn moe_name(gate_up: bool, ty: GgmlType) -> Result<&'static str> {
@@ -193,7 +215,7 @@ fn gemv_dispatch(
         bindings.push(sets.get(s).map_or(x.binding(), |(_, y)| y.binding()));
     }
     let rows = |s: usize| u32_bytes(sets.get(s).map_or(0, |(w, _)| w.rows));
-    let pipeline = ctx.pipeline(gemv_name(w0.ty)?, SOURCE, MslVersion::V3_1)?;
+    let pipeline = ctx.pipeline(gemv_name(w0.ty, m)?, SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &pipeline,
         &bindings,
@@ -255,7 +277,12 @@ pub fn gemm_with(
     l: GemmLayout,
 ) -> Result<()> {
     check_f32(&[x, y])?;
-    ensure!(w.cols.is_multiple_of(32), "GEMM row of {} values", w.cols);
+    // The kernel walks K in 64-deep steps with no tail.
+    ensure!(
+        w.cols.is_multiple_of(64),
+        "GEMM row of {} values (a multiple of 64)",
+        w.cols
+    );
     ensure!(
         l.ldx % 4 == 0 && l.x_batch % 4 == 0,
         "GEMM activations must be 16-byte aligned"
@@ -317,8 +344,11 @@ pub struct MoeGroupScratch {
     pub pairs: Tensor,
     pub tiles: Tensor,
     pub tile_count: Tensor,
+    /// The run's input rows as bfloat (the gate/up GEMMs' operand).
+    pub xb: Tensor,
     pub g: Tensor,
     pub u: Tensor,
+    /// BF16: the down GEMM's operand.
     pub mid: Tensor,
     pub down: Tensor,
 }
@@ -336,9 +366,10 @@ impl MoeGroupScratch {
             pairs: Tensor::zeros(ctx, &[pairs], DType::U32)?,
             tiles: Tensor::zeros(ctx, &[3 * max_tiles], DType::U32)?,
             tile_count: Tensor::zeros(ctx, &[1], DType::U32)?,
+            xb: Tensor::zeros(ctx, &[pairs * hidden], DType::BF16)?,
             g: Tensor::zeros(ctx, &[pairs * ff], DType::F32)?,
             u: Tensor::zeros(ctx, &[pairs * ff], DType::F32)?,
-            mid: Tensor::zeros(ctx, &[pairs * ff], DType::F32)?,
+            mid: Tensor::zeros(ctx, &[pairs * ff], DType::BF16)?,
             down: Tensor::zeros(ctx, &[pairs * hidden], DType::F32)?,
         })
     }
@@ -367,6 +398,34 @@ pub fn moe_grouped(
     experts: usize,
     limit: f32,
 ) -> Result<()> {
+    moe_grouped_with(
+        ctx, pass, gate, up, down, ff, hidden, x, sel, weights, out, sc, m, used,
+        experts, limit, true,
+    )
+}
+
+/// [`moe_grouped`]; `fuse_gate_up` false takes IQ2_XXS experts through the
+/// separate gate and up GEMMs and SwiGLU too (the tests' reference).
+#[allow(clippy::too_many_arguments)]
+fn moe_grouped_with(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    gate: &QWeight,
+    up: &QWeight,
+    down: &QWeight,
+    ff: usize,
+    hidden: usize,
+    x: &Tensor,
+    sel: &Tensor,
+    weights: &Tensor,
+    out: &Tensor,
+    sc: &MoeGroupScratch,
+    m: usize,
+    used: usize,
+    experts: usize,
+    limit: f32,
+    fuse_gate_up: bool,
+) -> Result<()> {
     let pairs = m * used;
     ensure!(
         sc.pairs.numel() >= pairs,
@@ -385,6 +444,17 @@ pub fn moe_grouped(
         &[&u32_bytes(pairs), &u32_bytes(experts)],
         Grid::Threadgroups { groups: (1, 1, 1), threadgroup: (1024, 1, 1) },
     )?;
+    let to_bf16 = ctx.pipeline("glm53_to_bf16", SOURCE, MslVersion::V3_1)?;
+    ensure!(
+        x.numel() >= m * hidden && sc.xb.numel() >= m * hidden,
+        "grouped MoE input"
+    );
+    pass.dispatch_at(
+        &to_bf16,
+        &[x.binding(), sc.xb.binding()],
+        &[],
+        Grid::Threads { grid: (m * hidden / 2, 1, 1), threadgroup: (256, 1, 1) },
+    )?;
     pass.memory_barrier()?;
     let max_tiles = pairs.div_ceil(64) + experts;
     let gemm_moe =
@@ -394,6 +464,11 @@ pub fn moe_grouped(
                 GgmlType::Q2K => "glm53_gemm_moe_q2_k",
                 other => anyhow::bail!("no grouped expert GEMM over {other:?}"),
             };
+            ensure!(
+                w.cols.is_multiple_of(256) && n.is_multiple_of(64),
+                "grouped expert GEMM of {n} x {}",
+                w.cols
+            );
             let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
             pass.dispatch_at(
                 &pipeline,
@@ -409,8 +484,6 @@ pub fn moe_grouped(
                     &u32_bytes(n),
                     &u32_bytes(w.cols),
                     &u32_bytes(w.row_bytes),
-                    &u32_bytes(w.cols),
-                    &u32_bytes(n),
                     &u32_bytes(x_shift),
                 ],
                 Grid::Threadgroups {
@@ -421,16 +494,52 @@ pub fn moe_grouped(
         };
     ensure!(used.is_power_of_two(), "experts used {used}");
     let shift = used.trailing_zeros() as usize;
-    gemm_moe(gate, x, &sc.g, ff, shift)?;
-    gemm_moe(up, x, &sc.u, ff, shift)?;
-    pass.memory_barrier()?;
-    let swiglu = ctx.pipeline("glm53_moe_swiglu", SOURCE, MslVersion::V3_1)?;
-    pass.dispatch_at(
-        &swiglu,
-        &[sc.g.binding(), sc.u.binding(), weights.binding(), sc.mid.binding()],
-        &[&u32_bytes(ff), &f32_bytes(limit)],
-        Grid::Threads { grid: (ff, pairs, 1), threadgroup: (256, 1, 1) },
-    )?;
+    if gate.ty == GgmlType::Iq2Xxs && fuse_gate_up {
+        // Gate, up and the SwiGLU in one GEMM: a tile is 32 columns of
+        // each, written as the down GEMM's bfloat operand.
+        ensure!(
+            gate.cols.is_multiple_of(256) && ff.is_multiple_of(32),
+            "grouped expert GEMM of {ff} x {}",
+            gate.cols
+        );
+        let pipeline =
+            ctx.pipeline("glm53_gemm_moe_gate_up_iq2_xxs", SOURCE, MslVersion::V3_1)?;
+        pass.dispatch_at(
+            &pipeline,
+            &[
+                sc.xb.binding(),
+                gate.t.binding(),
+                sc.mid.binding(),
+                sc.pairs.binding(),
+                sc.tiles.binding(),
+                sc.tile_count.binding(),
+                up.t.binding(),
+                weights.binding(),
+            ],
+            &[
+                &u32_bytes(ff),
+                &u32_bytes(gate.cols),
+                &u32_bytes(gate.row_bytes),
+                &u32_bytes(shift),
+                &f32_bytes(limit),
+            ],
+            Grid::Threadgroups {
+                groups: (ff / 32, max_tiles, 1),
+                threadgroup: (128, 1, 1),
+            },
+        )?;
+    } else {
+        gemm_moe(gate, &sc.xb, &sc.g, ff, shift)?;
+        gemm_moe(up, &sc.xb, &sc.u, ff, shift)?;
+        pass.memory_barrier()?;
+        let swiglu = ctx.pipeline("glm53_moe_swiglu", SOURCE, MslVersion::V3_1)?;
+        pass.dispatch_at(
+            &swiglu,
+            &[sc.g.binding(), sc.u.binding(), weights.binding(), sc.mid.binding()],
+            &[&u32_bytes(ff), &f32_bytes(limit)],
+            Grid::Threads { grid: (ff, pairs, 1), threadgroup: (256, 1, 1) },
+        )?;
+    }
     pass.memory_barrier()?;
     gemm_moe(down, &sc.mid, &sc.down, hidden, 0)?;
     pass.memory_barrier()?;

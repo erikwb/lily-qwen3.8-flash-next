@@ -36,30 +36,69 @@ float glm53_group_sum(float v, uint width) {
 // (per-head projections, attn_k_b and attn_v_b, single set; x_group >=
 // rows otherwise). Output rows of set s are rows_s apart unless y_row_stride
 // is nonzero. Threadgroups of 256 threads: 8 subgroups.
-// Buffers: 0 x, 1-4 W, 5-8 y. Params: 9 K, 10 m, 11 row_bytes,
+// Buffers: 0 x, 1-4 W, 5-8 y. Params: 9 K, 10 m (unused: the kernel's own), 11 row_bytes,
 // 12-15 rows of each set (0: unused), 16 x_group, 17 x_row_stride,
 // 18 y_row_stride.
 // ---------------------------------------------------------------------------
-#if defined(KERNEL_glm53_gemv_q8_0) || defined(KERNEL_glm53_gemv_q4_k) || \
-    defined(KERNEL_glm53_gemv_q2_k) || defined(KERNEL_glm53_gemv_iq2_xxs) || \
-    defined(KERNEL_glm53_gemv_bf16) || defined(KERNEL_glm53_gemv_f32)
-#if defined(KERNEL_glm53_gemv_q8_0)
+#if defined(KERNEL_glm53_gemv_q8_0_m1) || \
+    defined(KERNEL_glm53_gemv_q8_0_m2) || \
+    defined(KERNEL_glm53_gemv_q8_0_m3) || defined(KERNEL_glm53_gemv_q8_0_m4)
 #define GEMV_TYPE GLM53_Q8_0
-#elif defined(KERNEL_glm53_gemv_q4_k)
+#elif defined(KERNEL_glm53_gemv_q4_k_m1) || \
+    defined(KERNEL_glm53_gemv_q4_k_m2) || \
+    defined(KERNEL_glm53_gemv_q4_k_m3) || defined(KERNEL_glm53_gemv_q4_k_m4)
 #define GEMV_TYPE GLM53_Q4_K
-#elif defined(KERNEL_glm53_gemv_q2_k)
+#elif defined(KERNEL_glm53_gemv_q2_k_m1) || \
+    defined(KERNEL_glm53_gemv_q2_k_m2) || \
+    defined(KERNEL_glm53_gemv_q2_k_m3) || defined(KERNEL_glm53_gemv_q2_k_m4)
 #define GEMV_TYPE GLM53_Q2_K
-#elif defined(KERNEL_glm53_gemv_iq2_xxs)
+#elif defined(KERNEL_glm53_gemv_iq2_xxs_m1) || \
+    defined(KERNEL_glm53_gemv_iq2_xxs_m2) || \
+    defined(KERNEL_glm53_gemv_iq2_xxs_m3) || \
+    defined(KERNEL_glm53_gemv_iq2_xxs_m4)
 #define GEMV_TYPE GLM53_IQ2_XXS
-#elif defined(KERNEL_glm53_gemv_bf16)
+#elif defined(KERNEL_glm53_gemv_bf16_m1) || \
+    defined(KERNEL_glm53_gemv_bf16_m2) || \
+    defined(KERNEL_glm53_gemv_bf16_m3) || defined(KERNEL_glm53_gemv_bf16_m4)
 #define GEMV_TYPE GLM53_BF16
-#else
+#elif defined(KERNEL_glm53_gemv_f32_m1) || \
+    defined(KERNEL_glm53_gemv_f32_m2) || defined(KERNEL_glm53_gemv_f32_m3) || \
+    defined(KERNEL_glm53_gemv_f32_m4)
 #define GEMV_TYPE GLM53_F32
+#endif
+#ifdef GEMV_TYPE
+#if defined(KERNEL_glm53_gemv_q8_0_m1) || \
+    defined(KERNEL_glm53_gemv_q4_k_m1) || \
+    defined(KERNEL_glm53_gemv_q2_k_m1) || \
+    defined(KERNEL_glm53_gemv_iq2_xxs_m1) || \
+    defined(KERNEL_glm53_gemv_bf16_m1) || defined(KERNEL_glm53_gemv_f32_m1)
+#define GEMV_M 1u
+#elif defined(KERNEL_glm53_gemv_q8_0_m2) || \
+    defined(KERNEL_glm53_gemv_q4_k_m2) || \
+    defined(KERNEL_glm53_gemv_q2_k_m2) || \
+    defined(KERNEL_glm53_gemv_iq2_xxs_m2) || \
+    defined(KERNEL_glm53_gemv_bf16_m2) || defined(KERNEL_glm53_gemv_f32_m2)
+#define GEMV_M 2u
+#elif defined(KERNEL_glm53_gemv_q8_0_m3) || \
+    defined(KERNEL_glm53_gemv_q4_k_m3) || \
+    defined(KERNEL_glm53_gemv_q2_k_m3) || \
+    defined(KERNEL_glm53_gemv_iq2_xxs_m3) || \
+    defined(KERNEL_glm53_gemv_bf16_m3) || defined(KERNEL_glm53_gemv_f32_m3)
+#define GEMV_M 3u
+#elif defined(KERNEL_glm53_gemv_q8_0_m4) || \
+    defined(KERNEL_glm53_gemv_q4_k_m4) || \
+    defined(KERNEL_glm53_gemv_q2_k_m4) || \
+    defined(KERNEL_glm53_gemv_iq2_xxs_m4) || \
+    defined(KERNEL_glm53_gemv_bf16_m4) || defined(KERNEL_glm53_gemv_f32_m4)
+#define GEMV_M 4u
 #endif
 void main() {
     const uint64_t X = arg(0);
     const uint K = arg_u32(9);
-    const uint m = arg_u32(10);
+    // The row count is the kernel's (glm53_gemv_<type>_m<rows>): a branch
+    // on a runtime count in the loop waits for every load in flight (Q4_K
+    // 8192 x 4096 at m = 1: 65 -> 55 us, 2026-11-14).
+    const uint m = GEMV_M;
     const uint row_bytes = arg_u32(11);
     const uint x_group = arg_u32(16);
     const uint x_row_stride = arg_u32(17);
@@ -121,11 +160,8 @@ void main() {
 // 4 weights f32 [m][used], 5 mid [m * used][F]. Params: 6 K, 7 F,
 // 8 row_bytes, 9 used, 10 limit.
 // ---------------------------------------------------------------------------
-#if defined(KERNEL_glm53_moe_gate_up_iq2_xxs) || defined(KERNEL_glm53_moe_gate_up_q4_k) || \
-    defined(KERNEL_glm53_moe_gate_up_q2_k)
-#if defined(KERNEL_glm53_moe_gate_up_iq2_xxs)
-#define MOE_TYPE GLM53_IQ2_XXS
-#elif defined(KERNEL_glm53_moe_gate_up_q4_k)
+#if defined(KERNEL_glm53_moe_gate_up_q4_k) || defined(KERNEL_glm53_moe_gate_up_q2_k)
+#if defined(KERNEL_glm53_moe_gate_up_q4_k)
 #define MOE_TYPE GLM53_Q4_K
 #else
 #define MOE_TYPE GLM53_Q2_K
@@ -168,6 +204,48 @@ void main() {
 }
 #endif
 
+// The IQ2_XXS form (the model's experts) dots straight from the blocks
+// (glm53_dot_iq2_xxs), gate and up sharing each activation load: 163 -> 108
+// us a layer on the M5 Max (2026-11-14). Two rows a subgroup (113-121 us)
+// and the sign masks computed instead of looked up (112) were slower.
+#ifdef KERNEL_glm53_moe_gate_up_iq2_xxs
+void main() {
+    const uint K = arg_u32(6);
+    const uint F = arg_u32(7);
+    const uint row_bytes = arg_u32(8);
+    const uint used = arg_u32(9);
+    const float limit = arg_f32(10);
+    const uint slot = gl_WorkGroupID.y;
+    const uint i = slot / used;
+    const uint r = gl_WorkGroupID.x * 8u + gl_SubgroupID;
+    if (r >= F) return;
+    const uint e = U32(arg(3)).v[slot];
+    const float we = F32(arg(4)).v[slot];
+    const uint64_t off = (uint64_t(e) * F + r) * row_bytes;
+    const uint64_t gate = arg(0) + off;
+    const uint64_t up = arg(1) + off;
+    const uint64_t X = arg(2) + 4u * uint64_t(i) * K;
+    const uint tasks = K / GLM53_TASK;
+    float ag = 0.0, au = 0.0;
+    for (uint t = gl_SubgroupInvocationID; t < tasks; t += 32u) {
+        vec4 xv[8];
+        [[unroll]] for (uint q = 0u; q < 8u; q++) xv[q] = F32x4(X).v[8u * t + q];
+        ag += glm53_dot_iq2_xxs(gate, t, xv);
+        au += glm53_dot_iq2_xxs(up, t, xv);
+    }
+    ag = subgroupAdd(ag);
+    au = subgroupAdd(au);
+    if (gl_SubgroupInvocationID == 0u) {
+        float gv = ag, uv = au;
+        if (limit > 1e-6) {
+            gv = min(gv, limit);
+            uv = clamp(uv, -limit, limit);
+        }
+        F32(arg(5)).v[slot * F + r] = gv / (1.0 + exp(-gv)) * uv * we;
+    }
+}
+#endif
+
 // ---------------------------------------------------------------------------
 // Routed experts, down and combine: out[i][r] = sum over the row's slots of
 // down[sel[i][s]][r] . mid[i * used + s]. One subgroup per output row.
@@ -176,11 +254,8 @@ void main() {
 // when has_add; may be out). Params: 5 F (the down rows' length), 6 H,
 // 7 row_bytes, 8 used, 9 has_add.
 // ---------------------------------------------------------------------------
-#if defined(KERNEL_glm53_moe_down_q2_k) || defined(KERNEL_glm53_moe_down_q4_k) || \
-    defined(KERNEL_glm53_moe_down_iq2_xxs)
-#if defined(KERNEL_glm53_moe_down_q2_k)
-#define MOE_TYPE GLM53_Q2_K
-#elif defined(KERNEL_glm53_moe_down_q4_k)
+#if defined(KERNEL_glm53_moe_down_q4_k) || defined(KERNEL_glm53_moe_down_iq2_xxs)
+#if defined(KERNEL_glm53_moe_down_q4_k)
 #define MOE_TYPE GLM53_Q4_K
 #else
 #define MOE_TYPE GLM53_IQ2_XXS
@@ -211,6 +286,66 @@ void main() {
     if (gl_SubgroupInvocationID == 0u) {
         // The shared expert's output, added after the routed sum as ds4
         // adds them (moe + shared).
+        if (has_add) acc = acc + F32(arg(4)).v[i * H + r];
+        F32(arg(3)).v[i * H + r] = acc;
+    }
+}
+#endif
+
+// The Q2_K form (the model's experts) dots straight from the blocks. A lane
+// takes a unit of 64 values of the row: block u / 4, half h = (u / 2) % 2,
+// code bytes 16 c.. of the half (c = u % 2) at their four shifts j, which
+// are the 16-value groups 8 h + 2 j + c; the mins multiply the groups'
+// activation sums. Codes are extracted and converted in the ALU: a byte
+// table of f16 codes was slower (88 us against 72 a layer, 2026-11-14), as
+// were two or four rows a subgroup sharing the activation loads (74, 79).
+#ifdef KERNEL_glm53_moe_down_q2_k
+void main() {
+    const uint F = arg_u32(5);
+    const uint H = arg_u32(6);
+    const uint row_bytes = arg_u32(7);
+    const uint used = arg_u32(8);
+    const bool has_add = arg_u32(9) != 0u;
+    const uint i = gl_WorkGroupID.y;
+    const uint r = gl_WorkGroupID.x * 8u + gl_SubgroupID;
+    if (r >= H) return;
+    float acc = 0.0;
+    for (uint s = 0u; s < used; s++) {
+        const uint slot = i * used + s;
+        const uint e = U32(arg(2)).v[slot];
+        const uint64_t X = arg(1) + 4u * uint64_t(slot) * F;
+        const uint64_t row = arg(0) + (uint64_t(e) * H + r) * row_bytes;
+        for (uint u = gl_SubgroupInvocationID; u < F / 64u; u += 32u) {
+            const uint b = u >> 2u, h = (u >> 1u) & 1u, c = u & 1u;
+            const uint xi = 64u * b + 32u * h + 4u * c;
+            const uint64_t blk = row + 84u * b;
+            const uvec4 qw = U32x4(blk).v[1u + 2u * h + c];
+            float sq[4] = float[4](0.0, 0.0, 0.0, 0.0);
+            vec4 xs = vec4(0.0);
+            [[unroll]] for (uint w = 0u; w < 4u; w++) {
+                vec4 xj[4];
+                [[unroll]] for (uint j = 0u; j < 4u; j++) xj[j] = F32x4(X).v[xi + 8u * j + w];
+                [[unroll]] for (uint j = 0u; j < 4u; j++) {
+                    xs[j] += (xj[j].x + xj[j].y) + (xj[j].z + xj[j].w);
+                    [[unroll]] for (uint n = 0u; n < 4u; n++)
+                        sq[j] += float((qw[w] >> (8u * n + 2u * j)) & 3u) * xj[j][n];
+                }
+            }
+            const uint dd = U32(blk).v[20];
+            const float d = glm53_h2f(dd & 0xffffu), dmin = glm53_h2f(dd >> 16u);
+            // Scale bytes 8 h + 2 j + c: bytes c and c + 2 of the two words
+            // at 8 h.
+            const uvec2 sw = U32x2(blk).v[h];
+            [[unroll]] for (uint j = 0u; j < 4u; j++) {
+                const uint sc = (sw[j >> 1u] >> (8u * (c + 2u * (j & 1u)))) & 0xffu;
+                acc += d * float(sc & 0xfu) * sq[j] - dmin * float(sc >> 4u) * xs[j];
+            }
+        }
+    }
+    acc = subgroupAdd(acc);
+    if (gl_SubgroupInvocationID == 0u) {
+        // The shared expert's output, added after the routed sum as ds4 adds
+        // them (moe + shared).
         if (has_add) acc = acc + F32(arg(4)).v[i * H + r];
         F32(arg(3)).v[i * H + r] = acc;
     }
