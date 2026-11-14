@@ -163,3 +163,55 @@ float glm53_task_dot(in float w[32], uint64_t x) {
     }
     return acc;
 }
+
+// ---------------------------------------------------------------------------
+// Dot products straight from the blocks, for the decode GEMVs of the routed
+// experts, which are bound by instructions and loads per weight: the codes
+// become exact f16 values through a table, signs are an XOR of the f16 sign
+// bits, and a group's scale multiplies its sum once instead of every
+// weight. On G17C an f32 fmul widens an f16 source for free but an ffma
+// takes two moves for it, so the products are fmuls and the sums separate
+// adds (`precise`). The products round in another order than
+// glm53_decode + glm53_task_dot; the decoded values are the same.
+// ---------------------------------------------------------------------------
+// A dynamically indexed table must be a plain global with an initializer
+// (the compiler then reads it from the shader's constant data); a `const`
+// array is copied to per-thread scratch first.
+uvec4 glm53_iq2xxs_grid_h[256] = uvec4[256](
+#include "glm53_iq2xxs_grid_h.glsl"
+);
+uvec4 glm53_iq2xxs_signs_h[128] = uvec4[128](
+#include "glm53_iq2xxs_signs_h.glsl"
+);
+
+// IQ2_XXS task t of `row` against the 32 activations xv (as decoded by
+// glm53_decode_iq2_xxs, then dotted). Loads index the row as 16-bit words
+// (66-byte blocks are 33 words).
+float glm53_dot_iq2_xxs(uint64_t row, uint t, in vec4 xv[8]) {
+    const uint bw = (t >> 3u) * 33u;
+    const uint qw = bw + 1u + 4u * (t & 7u);
+    const float d = glm53_h2f(uint(U16(row).v[bw]));
+    const uint aux0 = uint(U16(row).v[qw]) | (uint(U16(row).v[qw + 1u]) << 16u);
+    const uint aux1 = uint(U16(row).v[qw + 2u]) | (uint(U16(row).v[qw + 3u]) << 16u);
+    float s = 0.0;
+    [[unroll]] for (uint l = 0u; l < 4u; l++) {
+        const uint gi = (aux0 >> (8u * l)) & 0xffu;
+        const uint si = (aux1 >> (7u * l)) & 127u;
+#if defined(GLM53_SIGN_ALU)
+        // Signs of values p and p + 4 to bits 15 and 31 of word p: q holds
+        // sign k at bits k and 12 + k (the parity bit, sign 7, at 19).
+        const uint q = si + (si << 12u) + ((bitCount(si) & 1u) << 19u);
+        const uvec4 sg = (uvec4(q) << uvec4(15u, 14u, 13u, 12u)) & 0x80008000u;
+#else
+        const uvec4 sg = glm53_iq2xxs_signs_h[si];
+#endif
+        const uvec4 g = glm53_iq2xxs_grid_h[gi] ^ sg;
+        const vec4 a = xv[2u * l], b = xv[2u * l + 1u];
+        const vec2 p0 = unpackHalf2x16(g.x), p1 = unpackHalf2x16(g.y);
+        const vec2 p2 = unpackHalf2x16(g.z), p3 = unpackHalf2x16(g.w);
+        precise float e = ((p0.x * a.x + p0.y * b.x) + (p1.x * a.y + p1.y * b.y))
+                        + ((p2.x * a.z + p2.y * b.z) + (p3.x * a.w + p3.y * b.w));
+        s += e;
+    }
+    return 0.125 * d * float(2u * (aux1 >> 28u) + 1u) * s;
+}
