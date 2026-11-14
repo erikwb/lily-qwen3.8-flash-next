@@ -176,6 +176,12 @@ impl SamplerScratch {
     pub fn vocab(&self) -> usize {
         self.adjusted.numel()
     }
+
+    /// The emission histogram, for tests. The GPU must be idle on it.
+    #[cfg(test)]
+    pub fn counts(&self) -> Result<Vec<u32>> {
+        self.counts.to_u32()
+    }
 }
 
 /// The distributions the draft head drew its proposals from, one slot per

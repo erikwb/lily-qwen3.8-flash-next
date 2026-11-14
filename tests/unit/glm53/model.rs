@@ -246,6 +246,9 @@ fn speculative_steps_match_ordinary_decoding() {
                 .verify(&ctx, &mut st, &mut sc, toks[0], &[draft], &greedy, 1, 1)
                 .unwrap();
             assert_eq!(draws[0], toks[1], "{case} n={n}: row 0 draw");
+            if case == "accept" {
+                assert_eq!(draws[1], toks[2], "{case} n={n}: row 1 draw");
+            }
             let kept = usize::from(case == "accept");
             m.finish_speculation(&ctx, &mut st, &mut sc, kept, true, pending).unwrap();
             assert_eq!(st.pos(), n + 1 + kept);
@@ -278,6 +281,114 @@ fn speculative_steps_match_ordinary_decoding() {
             continue_and_compare(&m, &ctx, &mut st, &mut sc, &toks, &want, "restored");
             continue_and_compare(&m, &ctx, &mut fork, &mut sc, &toks, &want, "forked");
         }
+    }
+}
+
+/// One ordinary sampled decode step: feeds `input`, draws with `params` at
+/// request step `step`, returns the draw.
+fn sampled_step(
+    m: &Glm53Model,
+    ctx: &MetalContext,
+    st: &mut Glm53State,
+    sc: &Scratch,
+    input: u32,
+    params: &crate::kernels::sample::SamplingParams,
+    step: usize,
+) -> u32 {
+    use crate::engine::{DecodeStateApi, Draw, LanguageModel};
+    sc.next_token
+        .view(0, &[1])
+        .unwrap()
+        .write_bytes(bytemuck::bytes_of(&input))
+        .unwrap();
+    let encoded =
+        m.encode_decode_step(ctx, st, sc, 0, 1, Draw { params, step }).unwrap();
+    m.prepare_step_inputs(st, sc, input).unwrap();
+    let pending = encoded.commit().unwrap();
+    st.advance(1);
+    pending.wait().unwrap();
+    sc.next_token.to_u32().unwrap()[1]
+}
+
+/// Sampled speculation emits what ordinary sampled decoding emits, with
+/// the same penalty counts: the same seed, steps and penalties; a forced
+/// rejection (its row-1 draw is discarded and uncounted), then a forced
+/// acceptance (both rows' draws kept), then ordinary steps.
+#[test]
+#[ignore = "requires LILY_GLM53_GGUF"]
+fn sampled_speculation_matches_ordinary_sampling() {
+    use crate::engine::{Draw, LanguageModel, ScratchApi};
+    use crate::kernels::sample::SamplingParams;
+    let ctx = MetalContext::new().expect("context");
+    let m = real_model(&ctx);
+    let params = SamplingParams {
+        temperature: 1.0,
+        top_k: 40,
+        top_p: 0.95,
+        presence_penalty: 0.5,
+        frequency_penalty: 0.5,
+        repetition_penalty: 1.1,
+        seed: 4242,
+        ..SamplingParams::greedy()
+    };
+    assert!(!params.is_greedy());
+    // The patterned prompt: after a pseudo-random one, two of layer 7's
+    // experts tied to 1e-6 at the top-8 boundary, and the verify pass's
+    // rounding (any two-row pass's) picked the other one.
+    let p = prompt(37);
+    let steps = 7;
+    // Ordinary: t0 from the prompt, then one draw a step, and the counts
+    // after each.
+    let mut st = LanguageModel::new_state(&m, &ctx, p.len() + 16).unwrap();
+    let mut sc = m.new_scratch(&ctx).unwrap();
+    sc.begin_request();
+    let draw = Some(Draw { params: &params, step: 0 });
+    LanguageModel::prefill(&m, &ctx, &mut st, &mut sc, &p, draw).unwrap();
+    let mut toks = vec![sc.next_token.to_u32().unwrap()[0]];
+    let mut counts = vec![sc.sampler().counts().unwrap()];
+    let mut logits = vec![sc.logits_last.to_f32().unwrap()];
+    let mut off_argmax =
+        usize::from(toks[0] != argmax(&sc.logits_last.to_f32().unwrap()));
+    for k in 1..steps {
+        let t = sampled_step(&m, &ctx, &mut st, &sc, toks[k - 1], &params, k);
+        off_argmax += usize::from(t != argmax(&sc.logits_last.to_f32().unwrap()));
+        toks.push(t);
+        counts.push(sc.sampler().counts().unwrap());
+        logits.push(sc.logits_last.to_f32().unwrap());
+    }
+    eprintln!("sampled: {toks:?}, {off_argmax} draws off the argmax");
+    assert!(off_argmax > 0, "the run never left the argmax");
+    assert!(counts[steps - 1].iter().sum::<u32>() > 0, "penalties count draws");
+    drop((st, sc));
+    // Speculative.
+    let mut st = LanguageModel::new_state(&m, &ctx, p.len() + 16).unwrap();
+    let mut sc = m.new_scratch(&ctx).unwrap();
+    sc.begin_request();
+    LanguageModel::prefill(&m, &ctx, &mut st, &mut sc, &p, draw).unwrap();
+    assert_eq!(sc.next_token.to_u32().unwrap()[0], toks[0]);
+    m.draft_initial(&ctx, &mut st, &mut sc, toks[0], 1, &params, 1).unwrap();
+    // Rejected: a draft that is not t1.
+    let wrong = if toks[1] == 1000 { 1001 } else { 1000 };
+    let (draws, pending) =
+        m.verify(&ctx, &mut st, &mut sc, toks[0], &[wrong], &params, 1, 1).unwrap();
+    assert_eq!(draws[0], toks[1], "rejected step: row 0 draw");
+    m.finish_speculation(&ctx, &mut st, &mut sc, 0, true, pending).unwrap();
+    assert_eq!(sc.sampler().counts().unwrap(), counts[1], "counts after a rejection");
+    // Accepted: the draft is t2, so rows 0 and 1 draw t2 and t3.
+    let (draws, pending) =
+        m.verify(&ctx, &mut st, &mut sc, toks[1], &[toks[2]], &params, 2, 1).unwrap();
+    assert_eq!(draws, [toks[2], toks[3]], "accepted step: both rows' draws");
+    m.finish_speculation(&ctx, &mut st, &mut sc, 1, false, pending).unwrap();
+    assert_eq!(sc.sampler().counts().unwrap(), counts[3], "counts after an acceptance");
+    // Ordinary steps after both.
+    for k in 4..steps {
+        let t = sampled_step(&m, &ctx, &mut st, &sc, toks[k - 1], &params, k);
+        let got = sc.logits_last.to_f32().unwrap();
+        let r = rel(&got, &logits[k]);
+        eprintln!("step {k} after speculation: relative L2 {r:.2e}");
+        assert!(r < 5e-3, "step {k} logits differ (relative L2 {r:.2e})");
+        assert_eq!(t, toks[k], "step {k} after speculation");
+        assert_eq!(sc.sampler().counts().unwrap(), counts[k], "step {k} counts");
     }
 }
 
