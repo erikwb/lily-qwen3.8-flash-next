@@ -188,17 +188,25 @@ pub struct Gguf {
     index: BTreeMap<String, usize>,
 }
 
-/// Memory the parsed header may take (strings, arrays, the tensor table):
-/// a header that would need more is refused before anything is reserved.
+/// Memory the parsed header may take: strings, arrays, the metadata map,
+/// the tensor table and its index. Each is charged before it is reserved,
+/// with a conservative estimate of the map nodes and other overhead
+/// ([`ENTRY_OVERHEAD`]); a header that would need more is refused. It is an
+/// estimate of the parsed header's size, not a bound on allocator use.
 const HEADER_BUDGET: u64 = 2 << 30;
+
+/// Charged per string, map entry and table row beyond its own bytes (the
+/// allocation and B-tree node share; generous, so the budget errs low).
+const ENTRY_OVERHEAD: u64 = 64;
 
 /// Largest `general.alignment` accepted.
 const MAX_ALIGNMENT: u64 = 1 << 16;
 
 /// The header being read: every count and length is checked against the
-/// bytes left in the file and against [`HEADER_BUDGET`] before memory is
-/// reserved for it, and reservations are fallible, so a corrupt or
-/// truncated file is an error, never an abort.
+/// bytes left in the file and charged against [`HEADER_BUDGET`] before
+/// memory is reserved for it, and the large reservations are fallible, so a
+/// corrupt or truncated file is an error rather than an unbounded
+/// allocation.
 struct HeaderReader {
     r: BufReader<File>,
     pos: u64,
@@ -252,14 +260,14 @@ impl HeaderReader {
             n <= self.remaining(),
             "GGUF string of {n} bytes past the end of the file"
         );
-        self.charge(n)?;
+        self.charge(n.saturating_add(ENTRY_OVERHEAD))?;
         let n = usize::try_from(n)?;
         let mut b = Vec::new();
         b.try_reserve_exact(n)?;
         b.resize(n, 0);
         self.r.read_exact(&mut b)?;
         self.pos += n as u64;
-        Ok(String::from_utf8_lossy(&b).into_owned())
+        String::from_utf8(b).context("GGUF string is not UTF-8")
     }
 
     /// One metadata value of type `ty`; `nested` is set inside an array,
@@ -288,9 +296,7 @@ impl HeaderReader {
                 };
                 let n = self.u64()?;
                 let n = self.count(n, min, "array")?;
-                self.charge(
-                    (n as u64).saturating_mul(std::mem::size_of::<Value>() as u64),
-                )?;
+                self.charge((n as u64).saturating_mul(size_of::<Value>() as u64))?;
                 let mut v = Vec::new();
                 v.try_reserve_exact(n)?;
                 for _ in 0..n {
@@ -337,6 +343,7 @@ impl Gguf {
         let n_tensors = h.count(n_tensors, 32, "tensor")?;
         let mut metadata = BTreeMap::new();
         for _ in 0..n_kv {
+            h.charge(size_of::<(String, Value)>() as u64 + ENTRY_OVERHEAD)?;
             let key = h.string()?;
             let ty = h.u32()?;
             let value = h
@@ -348,15 +355,20 @@ impl Gguf {
             );
             metadata.insert(key, value);
         }
-        h.charge(
-            (n_tensors as u64).saturating_mul(std::mem::size_of::<TensorInfo>() as u64),
-        )?;
+        // The raw table, then the parsed one and its index (a second copy
+        // of each name) beside it.
+        let row = size_of::<(String, Vec<u64>, u32, u64)>()
+            + size_of::<TensorInfo>()
+            + size_of::<(String, usize)>();
+        h.charge((n_tensors as u64).saturating_mul(row as u64 + 3 * ENTRY_OVERHEAD))?;
         let mut raw = Vec::new();
         raw.try_reserve_exact(n_tensors)?;
         for _ in 0..n_tensors {
             let name = h.string()?;
             let nd = h.u32()?;
             ensure!((1..=4).contains(&nd), "tensor {name} has {nd} dimensions");
+            // The dimensions, twice, and the index's copy of the name.
+            h.charge(16 * u64::from(nd) + name.len() as u64)?;
             let mut dims = Vec::with_capacity(nd as usize);
             for _ in 0..nd {
                 let d = h.u64()?;

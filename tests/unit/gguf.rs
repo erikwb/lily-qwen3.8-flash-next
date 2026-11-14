@@ -233,7 +233,7 @@ fn malformed_tensor_tables_are_errors() {
 }
 
 #[test]
-fn malformed_metadata_is_an_error_not_an_abort() {
+fn malformed_metadata_is_an_error() {
     fn kv(key: &str, ty: u32, value: &[u8]) -> Vec<u8> {
         let mut b = Vec::new();
         b.extend((key.len() as u64).to_le_bytes());
@@ -295,4 +295,37 @@ fn malformed_metadata_is_an_error_not_an_abort() {
     twice.extend(kv("k", 4, &2u32.to_le_bytes()));
     let e = open_err("repeated-key", &gguf_bytes(0, 2, &twice, 64));
     assert!(e.contains("twice"), "{e}");
+    // A string that is not UTF-8.
+    let e = open_err(
+        "not-utf8",
+        &gguf_bytes(0, 1, &kv("k", 8, &[2, 0, 0, 0, 0, 0, 0, 0, 0xc3, 0x28]), 64),
+    );
+    assert!(e.contains("UTF-8"), "{e}");
+}
+
+#[test]
+fn a_header_past_the_memory_budget_is_refused() {
+    // 2^28 one-byte array elements fit a (sparse) 256 MiB file but would
+    // parse into several GiB of values.
+    let mut b = gguf_bytes(0, 1, &[], 0);
+    b.extend(1u64.to_le_bytes());
+    b.push(b'k');
+    b.extend(9u32.to_le_bytes());
+    b.extend(0u32.to_le_bytes());
+    b.extend((1u64 << 28).to_le_bytes());
+    let dir =
+        std::env::temp_dir().join(format!("lily-gguf-budget-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("budget.gguf");
+    std::fs::write(&path, &b).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(b.len() as u64 + (1 << 28))
+        .unwrap();
+    let r = Gguf::open(&path);
+    std::fs::remove_dir_all(&dir).ok();
+    let e = format!("{:#}", r.err().expect("accepted"));
+    assert!(e.contains("more memory"), "{e}");
 }
