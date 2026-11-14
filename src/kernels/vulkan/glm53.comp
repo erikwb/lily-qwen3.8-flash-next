@@ -1198,9 +1198,21 @@ void main() {
     const uint p0 = gl_WorkGroupID.x * 8u;
     const uint lane = gl_SubgroupInvocationID;
     const uint pools = (pos0 + i + 1u) / 4u;
-    for (uint o = lane; o < 8u * 128u; o += 32u) {
+    // Eight pools of 128 f16 (2 KB): four 16-byte loads a lane, all issued
+    // before the stores (a load an iteration waited 32 times).
+    uvec4 pv[4];
+    [[unroll]] for (uint t = 0u; t < 4u; t++) {
+        const uint o = 8u * (32u * t + lane); // f16 index in the 8 x 128 block
         const uint p = p0 + o / 128u;
-        pool_sh[o] = p < pools ? F16(arg(2) + 256u * uint64_t(p)).v[o % 128u] : float16_t(0.0);
+        pv[t] = p < pools ? U32x4(arg(2) + 256u * uint64_t(p) + 2u * (o % 128u)).v[0] : uvec4(0u);
+    }
+    [[unroll]] for (uint t = 0u; t < 4u; t++) {
+        const uint o = 8u * (32u * t + lane);
+        [[unroll]] for (uint c = 0u; c < 4u; c++) {
+            const vec2 v = unpackHalf2x16(pv[t][c]);
+            pool_sh[o + 2u * c] = float16_t(v.x);
+            pool_sh[o + 2u * c + 1u] = float16_t(v.y);
+        }
     }
     barrier();
     const uint64_t Q = arg(0) + 4u * (uint64_t(i) * 32u + lane) * 128u;
@@ -1229,16 +1241,17 @@ void main() {
 // lower pool, all pools when there are at most k), in ascending pool order,
 // and write their four token rows each, then the incomplete pool's tokens.
 // The count of rows goes to count[i]. A radix select on the scores' order-
-// preserving keys, four 8-bit digits, then an ordered compaction.
-// Grid m, 1024 threads. Buffers: 0 scores [m][P], 1 sel u32 [m][S], 2 count
+// preserving keys, four 8-bit digits, then an ordered compaction; the bin
+// choice and the compaction's offsets are subgroup scans (thread 0 walking
+// the 256 bins and the 1 024 offsets took 87 us a call at 4K context;
+// 2026-11-14). Grid m, 1024 threads. Buffers: 0 scores [m][P], 1 sel u32 [m][S], 2 count
 // u32 [m]. Params: 3 P, 4 S, 5 pos0, 6 k.
 // ---------------------------------------------------------------------------
 #ifdef KERNEL_glm53_indexer_topk
 shared uint hist[256];
 shared uint prefix_sh;
 shared uint need_sh;
-shared uint gt_sh[1024];
-shared uint eq_sh[1024];
+shared uint part_sh[2 * 32];
 uint glm53_key(float f) {
     const uint u = floatBitsToUint(f);
     return (u & 0x80000000u) != 0u ? ~u : u | 0x80000000u;
@@ -1270,15 +1283,28 @@ void main() {
                 if ((key & hi_mask) == (prefix & hi_mask)) atomicAdd(hist[(key >> shift) & 0xffu], 1u);
             }
             barrier();
-            if (tid == 0u) {
-                uint need = need_sh;
-                uint b = 255u;
-                for (;; b--) {
-                    if (hist[b] >= need || b == 0u) break;
-                    need -= hist[b];
+            // Bin b is chosen when the keys in bins >= b reach `need` and
+            // those in bins > b do not (bin 0 when none does): suffix sums
+            // from an inclusive scan over the 256 bins.
+            const uint need = need_sh;
+            const uint hb = tid < 256u ? hist[tid] : 0u;
+            const uint incl = subgroupInclusiveAdd(hb);
+            if (tid < 256u && gl_SubgroupInvocationID == 31u) part_sh[gl_SubgroupID] = incl;
+            barrier();
+            if (tid < 256u) {
+                uint before = 0u, total = 0u;
+                [[unroll]] for (uint g = 0u; g < 8u; g++) {
+                    const uint v = part_sh[g];
+                    before += g < gl_SubgroupID ? v : 0u;
+                    total += v;
                 }
-                prefix_sh = prefix | (b << shift);
-                need_sh = need;
+                const uint upto = before + incl; // bins <= tid
+                const uint at_or_above = total - upto + hb;
+                const uint above = total - upto;
+                if ((at_or_above >= need || tid == 0u) && (tid == 255u || above < need)) {
+                    prefix_sh = prefix | (tid << shift);
+                    need_sh = need - above;
+                }
             }
             barrier();
         }
@@ -1294,24 +1320,24 @@ void main() {
         gt += uint(key > thresh || pools <= k);
         eq += uint(key == thresh && pools > k);
     }
-    gt_sh[tid] = gt;
-    eq_sh[tid] = eq;
-    barrier();
-    if (tid == 0u) {
-        uint g = 0u, e = 0u;
-        for (uint t = 0u; t < 1024u; t++) {
-            const uint a = gt_sh[t], b = eq_sh[t];
-            gt_sh[t] = g;
-            eq_sh[t] = e;
-            g += a;
-            e += b;
-        }
-        prefix_sh = g; // pools strictly above the threshold
+    // Exclusive offsets over the threads: subgroup scans, then the 32
+    // subgroups' totals.
+    const uint gx = subgroupExclusiveAdd(gt), ex = subgroupExclusiveAdd(eq);
+    if (gl_SubgroupInvocationID == 31u) {
+        part_sh[gl_SubgroupID] = gx + gt;
+        part_sh[32u + gl_SubgroupID] = ex + eq;
     }
     barrier();
-    const uint total_gt = prefix_sh;
+    uint gbase = 0u, ebase = 0u, total_gt = 0u;
+    for (uint g = 0u; g < 32u; g++) {
+        const uint a = part_sh[g], b = part_sh[32u + g];
+        gbase += g < gl_SubgroupID ? a : 0u;
+        ebase += g < gl_SubgroupID ? b : 0u;
+        total_gt += a; // pools strictly above the threshold
+    }
+
     const uint eq_take = min(k, pools) - min(total_gt, min(k, pools));
-    uint g_at = gt_sh[tid], e_at = eq_sh[tid];
+    uint g_at = gbase + gx, e_at = ebase + ex;
     // Slots are in pool order: a pool's slot is the count of kept pools
     // before it, so a thread needs the kept equal ones before it too.
     for (uint p = begin; p < end; p++) {

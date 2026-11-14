@@ -665,6 +665,76 @@ fn dsa_timing() {
     }
 }
 
+/// The indexer's pool scores and top-k at decode (one row): 1 024 and
+/// 8 192 complete pools, the top 512 kept; best of five passes of 11 calls.
+#[test]
+#[ignore = "timing only"]
+fn indexer_topk_timing() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(72);
+    for pools in [1024usize, 8192] {
+        let cap = pools + 1;
+        let scores = tensor(&ctx, &f32s(&mut rng, cap, -1.0, 1.0));
+        let s = 2056;
+        let sel = Tensor::zeros(&ctx, &[s], DType::U32).unwrap();
+        let count = Tensor::zeros(&ctx, &[1], DType::U32).unwrap();
+        let mut best = f64::MAX;
+        for _ in 0..5 {
+            let pass = ctx.begin().unwrap();
+            for _ in 0..11 {
+                indexer_topk(
+                    &ctx,
+                    &pass,
+                    &scores,
+                    &sel,
+                    &count,
+                    1,
+                    cap,
+                    s,
+                    4 * pools,
+                    512,
+                )
+                .unwrap();
+            }
+            let t = std::time::Instant::now();
+            pass.commit_wait().unwrap();
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        println!("indexer_topk {pools:5} pools {:8.1} us", best / 11.0 * 1e6);
+        let iq = tensor(&ctx, &f32s(&mut rng, 32 * 128, -1.0, 1.0));
+        let w = tensor(&ctx, &f32s(&mut rng, 32, -1.0, 1.0));
+        let bytes: Vec<u8> = f32s(&mut rng, pools * 128, -1.0, 1.0)
+            .iter()
+            .flat_map(|&v| f16::from_f32(v).to_bits().to_le_bytes())
+            .collect();
+        let pooled =
+            Tensor::from_bytes(&ctx, &bytes, &[pools * 128], DType::F16).unwrap();
+        let mut best = f64::MAX;
+        for _ in 0..5 {
+            let pass = ctx.begin().unwrap();
+            for _ in 0..11 {
+                indexer_scores(
+                    &ctx,
+                    &pass,
+                    &iq,
+                    &w,
+                    &pooled,
+                    &scores,
+                    1,
+                    cap,
+                    4 * pools,
+                    0.01,
+                )
+                .unwrap();
+            }
+            let t = std::time::Instant::now();
+            pass.commit_wait().unwrap();
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        println!("indexer_scores {pools:5} pools {:8.1} us", best / 11.0 * 1e6);
+    }
+}
+
 #[test]
 fn indexer_pool_update_matches_cpu() {
     let ctx = ctx();
