@@ -71,6 +71,21 @@ enum Cmd {
         #[arg(long)]
         think: bool,
     },
+    /// Speed: prefill the first `prompt_len` tokens of a text file (after
+    /// `[gMASK]<sop>`), then decode `n` tokens greedily; `runs` times, each
+    /// on a fresh state.
+    Bench {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        text: PathBuf,
+        #[arg(long, default_value_t = 1024)]
+        prompt_len: usize,
+        #[arg(long, default_value_t = 256)]
+        n: usize,
+        #[arg(long, default_value_t = 3)]
+        runs: usize,
+    },
     /// Greedy generation from token ids.
     Generate {
         #[arg(long)]
@@ -98,6 +113,9 @@ fn main() -> Result<()> {
             score(&model, &fixture, &effort, limit, legacy)
         }
         Cmd::Chat { model, prompt, n, think } => chat(&model, &prompt, n, think),
+        Cmd::Bench { model, text, prompt_len, n, runs } => {
+            bench(&model, &text, prompt_len, n, runs)
+        }
     }
 }
 
@@ -421,4 +439,47 @@ fn profile_report(steps: usize) {
         );
     }
     eprintln!("  {:7.3}  kernels summed per step", total / n * 1e3);
+}
+
+fn bench(
+    path: &PathBuf,
+    text: &PathBuf,
+    prompt_len: usize,
+    n: usize,
+    runs: usize,
+) -> Result<()> {
+    let tok = lily::tokenizer::Tokenizer::from_gguf(path)?;
+    let text = std::fs::read_to_string(text)?;
+    let mut ids = tok.encode("[gMASK]<sop>")?;
+    let body = tok.encode(&text)?;
+    anyhow::ensure!(
+        body.len() + ids.len() >= prompt_len,
+        "text has {} tokens",
+        body.len()
+    );
+    ids.extend_from_slice(&body[..prompt_len - ids.len()]);
+    let ctx = MetalContext::new()?;
+    let model = Glm53Model::load(&ctx, path)?;
+    let vocab = model.cfg.vocab;
+    let mut sc = model.new_scratch(&ctx)?;
+    for run in 0..runs {
+        let mut st = model.new_state(&ctx, prompt_len + n + 8)?;
+        let t = Instant::now();
+        model.prefill(&ctx, &mut st, &mut sc, &ids)?;
+        let pf = t.elapsed().as_secs_f64();
+        let mut next = argmax(&sc.logits.to_f32()?[..vocab]) as u32;
+        let t = Instant::now();
+        for _ in 0..n {
+            model.forward(&ctx, &mut st, &mut sc, &[next], true)?;
+            next = argmax(&sc.logits.to_f32()?[..vocab]) as u32;
+        }
+        let dt = t.elapsed().as_secs_f64();
+        println!(
+            "run {run}: prompt {prompt_len}: prefill {pf:.2} s = {:.1} tok/s; decode {n} tokens {dt:.2} s = {:.2} tok/s ({:.2} ms/token)",
+            prompt_len as f64 / pf,
+            n as f64 / dt,
+            dt * 1e3 / n as f64
+        );
+    }
+    Ok(())
 }
