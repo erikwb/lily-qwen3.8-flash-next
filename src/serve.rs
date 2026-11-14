@@ -1693,7 +1693,8 @@ fn gguf_config(path: &Path) -> Result<Value> {
     let arch = g.architecture()?.to_string();
     let mut config = serde_json::json!({ "model_type": arch });
     if arch == crate::glm53::config::ARCH {
-        config["eos_token_id"] = serde_json::json!(crate::glm53::tokenizer::stop_ids(&g)?);
+        let stops = crate::glm53::tokenizer::stop_ids(&g)?;
+        config["eos_token_id"] = serde_json::json!(stops);
         config["max_position_embeddings"] =
             serde_json::json!(g.u64(&format!("{arch}.context_length"))?);
     }
