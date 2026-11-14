@@ -542,7 +542,12 @@ fn bench(
     Ok(())
 }
 
-fn rows(path: &PathBuf, text: &PathBuf, prompt_len: usize, n: usize) -> Result<()> {
+fn rows(
+    path: &std::path::Path,
+    text: &std::path::Path,
+    prompt_len: usize,
+    n: usize,
+) -> Result<()> {
     let tok = lily::tokenizer::Tokenizer::from_gguf(path)?;
     let mut ids = tok.encode("[gMASK]<sop>")?;
     let body = tok.encode(&std::fs::read_to_string(text)?)?;
