@@ -126,6 +126,51 @@ impl Config {
         Ok(c)
     }
 
+    /// GLM 5.3 Flash's shape as the published GGUF declares it (tests build
+    /// small variants from it).
+    pub fn glm53_flash() -> Self {
+        Self {
+            n_layer: 46,
+            n_trunk: 45,
+            hidden: 4096,
+            vocab: 154880,
+            ff_dense: 12288,
+            ff_expert: 2048,
+            n_expert: 288,
+            n_expert_used: 8,
+            n_leading_dense: 3,
+            expert_weight_scale: 2.5,
+            swiglu_limit: 10.0,
+            rms_eps: 1e-5,
+            n_head: 64,
+            key_dim: 256,
+            value_dim: 256,
+            q_lora: 1536,
+            kv_lora: 512,
+            indexer_heads: 32,
+            indexer_dim: 128,
+            indexer_top_k: 2048,
+            indexer_pool: 4,
+            kda_heads: 64,
+            kda_dim: 128,
+            kda_conv: 4,
+            kda_gate_lower_bound: -5.0,
+            n_hc: 4,
+            sinkhorn_iters: 20,
+            hc_eps: 1e-6,
+            context_length: 1 << 20,
+            kinds: (0..46)
+                .map(|il| {
+                    if il < 45 && il % 4 != 3 { LayerKind::Kda } else { LayerKind::Dsa }
+                })
+                .collect(),
+            bos: 154822,
+            eos: 154820,
+            eot: 154827,
+            eom: 154829,
+        }
+    }
+
     /// The shape GLM 5.3 Flash has; the kernels assume these numbers.
     pub fn validate(&self) -> Result<()> {
         let want: [(&str, usize, usize); 22] = [

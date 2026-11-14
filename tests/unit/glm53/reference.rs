@@ -55,14 +55,14 @@ fn swiglu_clamps_gate_above_and_up_both_sides() {
 
 #[test]
 fn indexer_selects_all_rows_up_to_the_limit() {
-    let cfg = test_config();
+    let cfg = Config::glm53_flash();
     let st = DsaState::default();
     assert_eq!(indexer_select(&cfg, &st, 2050, &[], &[]).len(), 2051);
 }
 
 #[test]
 fn indexer_selects_top_pools_and_tail() {
-    let mut cfg = test_config();
+    let mut cfg = Config::glm53_flash();
     cfg.indexer_top_k = 8; // 2 pools
     cfg.indexer_heads = 1;
     cfg.indexer_dim = 2;
@@ -79,7 +79,7 @@ fn indexer_selects_top_pools_and_tail() {
 #[test]
 fn kda_first_token_matches_closed_form() {
     // One head of width 2, zero state: S = k * v * beta (outer), o = S q.
-    let mut cfg = test_config();
+    let mut cfg = Config::glm53_flash();
     cfg.kda_heads = 1;
     cfg.kda_dim = 2;
     let mut st = KdaState::new(&cfg);
@@ -109,50 +109,5 @@ fn kda_first_token_matches_closed_form() {
     let expect = rmsnorm(&o, Some(&ones), cfg.rms_eps);
     for i in 0..2 {
         assert!((out[i] - expect[i]).abs() < 1e-5, "{} vs {}", out[i], expect[i]);
-    }
-}
-
-pub(crate) fn test_config() -> Config {
-    Config {
-        n_layer: 46,
-        n_trunk: 45,
-        hidden: 4096,
-        vocab: 154880,
-        ff_dense: 12288,
-        ff_expert: 2048,
-        n_expert: 288,
-        n_expert_used: 8,
-        n_leading_dense: 3,
-        expert_weight_scale: 2.5,
-        swiglu_limit: 10.0,
-        rms_eps: 1e-5,
-        n_head: 64,
-        key_dim: 256,
-        value_dim: 256,
-        q_lora: 1536,
-        kv_lora: 512,
-        indexer_heads: 32,
-        indexer_dim: 128,
-        indexer_top_k: 2048,
-        indexer_pool: 4,
-        kda_heads: 64,
-        kda_dim: 128,
-        kda_conv: 4,
-        kda_gate_lower_bound: -5.0,
-        n_hc: 4,
-        sinkhorn_iters: 20,
-        hc_eps: 1e-6,
-        context_length: 1 << 20,
-        kinds: (0..46)
-            .map(
-                |il| {
-                    if il < 45 && il % 4 != 3 { LayerKind::Kda } else { LayerKind::Dsa }
-                },
-            )
-            .collect(),
-        bos: 154822,
-        eos: 154820,
-        eot: 154827,
-        eom: 154829,
     }
 }
