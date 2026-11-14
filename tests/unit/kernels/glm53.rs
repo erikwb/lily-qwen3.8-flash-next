@@ -1149,3 +1149,40 @@ fn moe_grouped_timing() {
         println!("moe grouped {label:20} m {m:4}: {:8.1} us", best * 1e6);
     }
 }
+
+/// The prefill's dense GEMMs at the model's shapes for a run of 1 024 rows:
+/// best of three passes of four calls.
+#[test]
+#[ignore = "timing only"]
+fn gemm_timing() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(73);
+    let m = 1024;
+    for (label, ty, cols, rows) in [
+        ("kda_v Q8_0 8192x4096", GgmlType::Q8_0, 4096usize, 8192usize),
+        ("kda_out Q8_0 4096x8192", GgmlType::Q8_0, 8192, 4096),
+        ("kda_q Q4_K 8192x4096", GgmlType::Q4K, 4096, 8192),
+        ("f_b Q8_0 8192x128", GgmlType::Q8_0, 128, 8192),
+        ("shexp Q8_0 2048x4096", GgmlType::Q8_0, 4096, 2048),
+    ] {
+        let raw = random_blocks(&mut rng, ty, rows * cols);
+        let w = QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap();
+        let x = tensor(&ctx, &f32s(&mut rng, m * cols, -1.0, 1.0));
+        let y = zeros(&ctx, m * rows);
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let pass = ctx.begin().unwrap();
+            for _ in 0..4 {
+                gemm(&ctx, &pass, &w, &x, &y, m).unwrap();
+            }
+            let t = std::time::Instant::now();
+            pass.commit_wait().unwrap();
+            best = best.min(t.elapsed().as_secs_f64() / 4.0);
+        }
+        println!(
+            "gemm {label:24} m {m}: {:8.1} us  {:5.1} TFLOP/s",
+            best * 1e6,
+            2.0 * (m * rows * cols) as f64 / best / 1e12
+        );
+    }
+}

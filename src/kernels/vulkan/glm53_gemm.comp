@@ -1,11 +1,13 @@
 #version 460
-// GLM 5.3 Flash prefill GEMM: Y[m][n] = X[m] . W[n] for runs of prompt rows
-// (src/kernels/glm53.rs `gemm`), X f32, W GGUF blocks. A threadgroup of four
-// subgroups computes a 64-row x 64-column tile; each K step decodes one
-// 32-value task of 64 weight rows (glm53_quant.glsl, exact) and 64 rows of
-// X into bfloats in threadgroup memory, and each subgroup multiplies its
-// 32 x 32 quarter (2 x 2 blocks of 16 x 16) on the matrix units with f32
-// accumulators. Rows past M and N are clamped on load and not stored.
+// GLM 5.3 Flash prefill GEMMs (src/kernels/glm53.rs `gemm`, `moe_grouped`):
+// Y[m][n] = X[m] . W[n] for runs of prompt rows, W GGUF blocks decoded
+// exactly (glm53_quant.glsl) and rounded to bfloat, f32 accumulators on the
+// matrix units. Both follow Qwen's grouped GEMM (quant_grouped.glsl): a
+// threadgroup of four subgroups computes 64 rows x 64 columns, every thread
+// decodes 8 values of 4 weight rows of a 64-deep K step into a tile in the
+// lanes' order (one load per B operand), two tiles in turn, one barrier a
+// step; a subgroup owns 16 rows and all 64 columns and reads its rows of X
+// from device memory. Rows past M and N are clamped on load and not stored.
 // Batches (grid z) step X, W and Y by their own strides: the per-head
 // attn_k_b and attn_v_b projections.
 // Buffers: 0 X, 1 W, 2 Y. Params: 3 M, 4 N, 5 K, 6 row_bytes, 7 ldx,
@@ -22,6 +24,32 @@ uint glm53_bf16_bits(float f) {
 }
 
 #if defined(KERNEL_glm53_gemm_q8_0) || defined(KERNEL_glm53_gemm_q4_k) || \
+    defined(KERNEL_glm53_gemm_bf16) || defined(KERNEL_glm53_gemm_f32) || \
+    defined(KERNEL_glm53_gemm_moe_iq2_xxs) || defined(KERNEL_glm53_gemm_moe_q2_k)
+#define GM_STEP 64u
+// Vector (k - k0) / 2 * 16 + n / 4 of a step's tile holds weights k and
+// k + 1 of the tile's rows n .. n + 3 (quant_grouped.glsl's qg_tile).
+shared uvec4 gm_tile[2u * GM_STEP * 8u];
+
+uint gm_pair(uint lo, uint hi) { return (lo >> 16u) | (hi & 0xffff0000u); }
+uint gm_round(float f) {
+    const uint u = floatBitsToUint(f);
+    return u + 0x7fffu + ((u >> 16u) & 1u);
+}
+
+// A thread's share of a step's tile: weights k .. k + 8 of four rows
+// (decode8(row, k, w)), rounded and stored in the lanes' order at `at`.
+#define GM_STORE_TILE(at, w)                                                                  \
+    [[unroll]] for (uint i = 0u; i < 4u; i++) {                                               \
+        gm_tile[(at) + 16u * i] = uvec4(                                                      \
+            gm_pair(gm_round(w[0][2u * i]), gm_round(w[1][2u * i])),                          \
+            gm_pair(gm_round(w[2][2u * i]), gm_round(w[3][2u * i])),                          \
+            gm_pair(gm_round(w[0][2u * i + 1u]), gm_round(w[1][2u * i + 1u])),                \
+            gm_pair(gm_round(w[2][2u * i + 1u]), gm_round(w[3][2u * i + 1u])));               \
+    }
+#endif
+
+#if defined(KERNEL_glm53_gemm_q8_0) || defined(KERNEL_glm53_gemm_q4_k) || \
     defined(KERNEL_glm53_gemm_bf16) || defined(KERNEL_glm53_gemm_f32)
 #if defined(KERNEL_glm53_gemm_q8_0)
 #define GEMM_TYPE GLM53_Q8_0
@@ -33,11 +61,62 @@ uint glm53_bf16_bits(float f) {
 #define GEMM_TYPE GLM53_F32
 #endif
 
-// Tiles of 64 rows x 32 values as bfloats, rows 40 apart (80 bytes).
-#define TS 40u
-shared bfloat16_t xs[64 * TS];
-shared bfloat16_t ws[64 * TS];
+// Weights k .. k + 8 (k a multiple of 8) of `row`, as glm53_decode gives
+// them.
+void gd_decode8(uint64_t row, uint k, out float w[8]) {
+    if (GEMM_TYPE == GLM53_Q8_0) {
+        const uint64_t b = row + uint64_t(k >> 5u) * 34u;
+        const float d = glm53_h2f(uint(U16(b).v[0]));
+        [[unroll]] for (uint i = 0u; i < 4u; i++) {
+            const uint pair = uint(U16(b + 2u).v[((k & 31u) >> 1u) + i]);
+            w[2u * i] = d * float(int(pair << 24) >> 24);
+            w[2u * i + 1u] = d * float(int(pair << 16) >> 24);
+        }
+    } else if (GEMM_TYPE == GLM53_Q4_K) {
+        const uint64_t b = row + uint64_t(k >> 8u) * 144u;
+        const uint j = (k >> 5u) & 7u;
+        const uint dd = U32(b).v[0];
+        const float d = glm53_h2f(dd & 0xffffu);
+        const float dmin = glm53_h2f(dd >> 16u);
+        const uvec3 sw = uvec3(U32(b + 4u).v[0], U32(b + 8u).v[0], U32(b + 12u).v[0]);
+        #define Q4K_BYTE(i) ((sw[(i) >> 2u] >> (8u * ((i) & 3u))) & 0xffu)
+        uint sc, m;
+        if (j < 4u) {
+            sc = Q4K_BYTE(j) & 63u;
+            m = Q4K_BYTE(j + 4u) & 63u;
+        } else {
+            sc = (Q4K_BYTE(j + 4u) & 0xfu) | ((Q4K_BYTE(j - 4u) >> 6u) << 4u);
+            m = (Q4K_BYTE(j + 4u) >> 4u) | ((Q4K_BYTE(j) >> 6u) << 4u);
+        }
+        #undef Q4K_BYTE
+        const float scale = d * float(sc);
+        const float minv = dmin * float(m);
+        const uvec2 q = U32x2(b + 16u + (j >> 1u) * 32u + (k & 31u)).v[0] >> ((j & 1u) * 4u);
+        [[unroll]] for (uint i = 0u; i < 8u; i++) {
+            w[i] = scale * float((q[i >> 2u] >> (8u * (i & 3u))) & 0xfu) - minv;
+        }
+    } else if (GEMM_TYPE == GLM53_BF16) {
+        const uvec4 v = U32x4(row + 2u * k).v[0];
+        [[unroll]] for (uint c = 0u; c < 4u; c++) {
+            w[2u * c] = uintBitsToFloat(v[c] << 16u);
+            w[2u * c + 1u] = uintBitsToFloat(v[c] & 0xffff0000u);
+        }
+    } else {
+        const vec4 v0 = F32x4(row + 4u * k).v[0], v1 = F32x4(row + 4u * k + 16u).v[0];
+        [[unroll]] for (uint c = 0u; c < 4u; c++) {
+            w[c] = v0[c];
+            w[4u + c] = v1[c];
+        }
+    }
+}
 
+
+// The dense GEMM in the expert GEMM's layout (below): every thread decodes
+// 8 values of 4 weight rows of a 64-deep step into the tile in the lanes'
+// order, and a subgroup multiplies its 16 rows of X against all 64 columns,
+// reading X straight from device memory as floats and rounding to bfloat
+// only the elements its lanes hold (a lane of an A operand uses every other
+// value of eight). K must be a multiple of 64.
 void main() {
     const uint M = arg_u32(3);
     const uint N = arg_u32(4);
@@ -53,51 +132,71 @@ void main() {
     const uint n0 = gl_WorkGroupID.x * 64u;
     const uint tid = gl_LocalInvocationIndex;
     const uint sg = gl_SubgroupID;
-    const uint rb = (sg >> 1u) * 32u;
-    const uint cb = (sg & 1u) * 32u;
-    // This thread's staging row and half: each of the 128 threads decodes
-    // 16 weights of row tid / 2 and stages 16 values of X row tid / 2 (the
-    // decode is the K step's cost: half a task each, 2026-11-14).
-    const uint srow = tid >> 1u;
-    const uint hf = tid & 1u;
-    const uint64_t wrow = W + uint64_t(min(n0 + srow, N - 1u)) * row_bytes;
-    const uint64_t xrow = X + 4u * uint64_t(min(m0 + srow, M - 1u)) * ldx;
-    MatC c00 = MatC(0.0), c01 = MatC(0.0), c10 = MatC(0.0), c11 = MatC(0.0);
-    const uint tasks = K / GLM53_TASK;
-    for (uint t = 0u; t < tasks; t++) {
-        float v[16];
-        glm53_decode_half(GEMM_TYPE, wrow, t, hf, v);
-        vec4 xv[4];
-        [[unroll]] for (uint q = 0u; q < 4u; q++) xv[q] = F32x4(xrow + 128u * t + 64u * hf + 16u * q).v[0];
-        barrier();
-        [[unroll]] for (uint e = 0u; e < 16u; e++) {
-            ws[srow * TS + 16u * hf + e] = uintBitsToBFloat16EXT(uint16_t(glm53_bf16_bits(v[e])));
-            xs[srow * TS + 16u * hf + e] = uintBitsToBFloat16EXT(uint16_t(glm53_bf16_bits(xv[e >> 2u][e & 3u])));
+    const uint quad = tid & 15u, k8 = tid >> 4u;
+    uint64_t wr[4];
+    [[unroll]] for (uint r = 0u; r < 4u; r++) wr[r] = W + uint64_t(min(n0 + 4u * quad + r, N - 1u)) * row_bytes;
+    const uint rows = min(64u, M - m0);
+    const uint row0 = 16u * sg;
+    const bool working = row0 < rows;
+    const uint lane_row = mat_lane_row(), a_half = mat_a_half();
+    const bool odd = mat_a_odd() != 0u;
+    // The lanes' two rows of X, in vec4 units (ldx is a multiple of 4).
+    const uint xi0 = (m0 + min(row0 + lane_row, rows - 1u)) * (ldx / 4u) + 2u * a_half;
+    const uint xi1 = (m0 + min(row0 + lane_row + 1u, rows - 1u)) * (ldx / 4u) + 2u * a_half;
+    F32x4 xa = F32x4(X);
+    const uint lane_at = lane_row * 8u + mat_lane_col() / 4u;
+    MatC acc0 = MatC(0.0), acc1 = MatC(0.0), acc2 = MatC(0.0), acc3 = MatC(0.0);
+    for (uint k0 = 0u; k0 < K; k0 += GM_STEP) {
+        const uint tile_at = ((k0 / GM_STEP) & 1u) * (GM_STEP * 8u);
+        {
+            float w[4][8];
+            [[unroll]] for (uint r = 0u; r < 4u; r++) gd_decode8(wr[r], k0 + 8u * k8, w[r]);
+            GM_STORE_TILE(tile_at + 64u * k8 + quad, w)
         }
         barrier();
-        [[unroll]] for (uint kk = 0u; kk < 32u; kk += 16u) {
-            MatA a0, a1;
-            MatB b0, b1;
-            MAT_LOAD_A(a0, xs, (rb + 0u) * TS + kk, TS);
-            MAT_LOAD_A(a1, xs, (rb + 16u) * TS + kk, TS);
-            MAT_LOAD_B(b0, ws, (cb + 0u) * TS + kk, TS);
-            MAT_LOAD_B(b1, ws, (cb + 16u) * TS + kk, TS);
-            c00 = coopMatMulAdd(a0, b0, c00);
-            c01 = coopMatMulAdd(a0, b1, c01);
-            c10 = coopMatMulAdd(a1, b0, c10);
-            c11 = coopMatMulAdd(a1, b1, c11);
+        if (working) {
+            [[unroll]] for (uint kk = 0u; kk < GM_STEP; kk += 16u) {
+                const uint at = (k0 + kk) / 4u;
+                const vec4 p0 = xa.v[xi0 + at], p1 = xa.v[xi0 + at + 1u];
+                const vec4 q0 = xa.v[xi1 + at], q1 = xa.v[xi1 + at + 1u];
+                const uint b_at = tile_at + lane_at + kk * 8u;
+                const uvec4 b0 = gm_tile[b_at], b1 = gm_tile[b_at + 4u];
+                const uvec4 b2 = gm_tile[b_at + 8u], b3 = gm_tile[b_at + 12u];
+                MatA ma;
+                MatB mb;
+                // Element e of the lane's row is value 2 e + odd of the eight.
+                ma[0] = MAT_HI(gm_round(odd ? p0.y : p0.x));
+                ma[1] = MAT_HI(gm_round(odd ? p0.w : p0.z));
+                ma[2] = MAT_HI(gm_round(odd ? p1.y : p1.x));
+                ma[3] = MAT_HI(gm_round(odd ? p1.w : p1.z));
+                ma[4] = MAT_HI(gm_round(odd ? q0.y : q0.x));
+                ma[5] = MAT_HI(gm_round(odd ? q0.w : q0.z));
+                ma[6] = MAT_HI(gm_round(odd ? q1.y : q1.x));
+                ma[7] = MAT_HI(gm_round(odd ? q1.w : q1.z));
+                MAT_OF_WORDS(mb, b0)
+                acc0 = coopMatMulAdd(ma, mb, acc0);
+                MAT_OF_WORDS(mb, b1)
+                acc1 = coopMatMulAdd(ma, mb, acc1);
+                MAT_OF_WORDS(mb, b2)
+                acc2 = coopMatMulAdd(ma, mb, acc2);
+                MAT_OF_WORDS(mb, b3)
+                acc3 = coopMatMulAdd(ma, mb, acc3);
+            }
         }
     }
-    [[unroll]] for (uint e = 0u; e < 8u; e++) {
-        const uint r = mat_row(e);
-        const uint c = mat_col(e);
-        const uint m_a = m0 + rb + r, m_b = m0 + rb + 16u + r;
-        const uint n_a = n0 + cb + c, n_b = n0 + cb + 16u + c;
-        const uint y_a = m_a, y_b = m_b;
-        if (m_a < M && n_a < N) F32(Y + 4u * uint64_t(y_a) * ldy).v[n_a] = c00[e];
-        if (m_a < M && n_b < N) F32(Y + 4u * uint64_t(y_a) * ldy).v[n_b] = c01[e];
-        if (m_b < M && n_a < N) F32(Y + 4u * uint64_t(y_b) * ldy).v[n_a] = c10[e];
-        if (m_b < M && n_b < N) F32(Y + 4u * uint64_t(y_b) * ldy).v[n_b] = c11[e];
+    if (!working) return;
+    const uint col = n0 + mat_lane_col();
+    [[unroll]] for (uint h = 0u; h < 2u; h++) {
+        const uint r = row0 + lane_row + h;
+        if (r < rows) {
+            const uint64_t y = Y + 4u * uint64_t(m0 + r) * ldy;
+            [[unroll]] for (uint c = 0u; c < 4u; c++) {
+                if (col + c < N) F32(y).v[col + c] = acc0[4u * h + c];
+                if (col + 16u + c < N) F32(y).v[col + 16u + c] = acc1[4u * h + c];
+                if (col + 32u + c < N) F32(y).v[col + 32u + c] = acc2[4u * h + c];
+                if (col + 48u + c < N) F32(y).v[col + 48u + c] = acc3[4u * h + c];
+            }
+        }
     }
 }
 #endif
@@ -120,16 +219,6 @@ void main() {
 // expert), 7 K (a multiple of 256), 8 row_bytes, 9 x_shift.
 // ---------------------------------------------------------------------------
 #if defined(KERNEL_glm53_gemm_moe_iq2_xxs) || defined(KERNEL_glm53_gemm_moe_q2_k)
-#define GM_STEP 64u
-// Vector (k - k0) / 2 * 16 + n / 4 of a step's tile holds weights k and
-// k + 1 of the tile's rows n .. n + 3 (quant_grouped.glsl's qg_tile).
-shared uvec4 gm_tile[2u * GM_STEP * 8u];
-
-uint gm_pair(uint lo, uint hi) { return (lo >> 16u) | (hi & 0xffff0000u); }
-uint gm_round(float f) {
-    const uint u = floatBitsToUint(f);
-    return u + 0x7fffu + ((u >> 16u) & 1u);
-}
 
 // Weights k .. k + 8 (k a multiple of 8) of `row`.
 void gm_decode8(uint64_t row, uint k, out float w[8]) {
@@ -202,14 +291,7 @@ void main() {
         {
             float w[4][8];
             [[unroll]] for (uint r = 0u; r < 4u; r++) gm_decode8(wr[r], k0 + 8u * k8, w[r]);
-            const uint at = tile_at + 64u * k8 + quad;
-            [[unroll]] for (uint i = 0u; i < 4u; i++) {
-                gm_tile[at + 16u * i] = uvec4(
-                    gm_pair(gm_round(w[0][2u * i]), gm_round(w[1][2u * i])),
-                    gm_pair(gm_round(w[2][2u * i]), gm_round(w[3][2u * i])),
-                    gm_pair(gm_round(w[0][2u * i + 1u]), gm_round(w[1][2u * i + 1u])),
-                    gm_pair(gm_round(w[2][2u * i + 1u]), gm_round(w[3][2u * i + 1u])));
-            }
+            GM_STORE_TILE(tile_at + 64u * k8 + quad, w)
         }
         barrier();
         if (working) {
