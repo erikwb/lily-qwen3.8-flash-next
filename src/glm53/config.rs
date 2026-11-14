@@ -2,7 +2,7 @@
 //! checked against the numbers the kernels are written for (ds4's
 //! `DS4_SHAPE_GLM53` and `config_validate_glm53_model`).
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 
 use crate::gguf::{Gguf, Value};
 
@@ -63,8 +63,10 @@ impl Config {
     pub fn from_gguf(g: &Gguf) -> Result<Self> {
         let arch = g.architecture()?;
         ensure!(arch == ARCH, "GGUF architecture {arch:?}, expected {ARCH:?}");
-        let u =
-            |k: &str| -> Result<usize> { Ok(g.u64(&format!("{ARCH}.{k}"))? as usize) };
+        let u = |k: &str| -> Result<usize> {
+            let v = g.u64(&format!("{ARCH}.{k}"))?;
+            usize::try_from(v).with_context(|| format!("{ARCH}.{k} {v}"))
+        };
         let f = |k: &str| g.f32(&format!("{ARCH}.{k}"));
         let n_layer = u("block_count")?;
         let n_trunk = u("trunk_block_count")?;
@@ -87,8 +89,10 @@ impl Config {
                 .collect::<Result<Vec<_>>>()?,
             _ => anyhow::bail!("{ARCH}.layer_types missing"),
         };
+        // Checked before narrowing; validate() then checks the vocabulary.
         let tok = |k: &str| -> Result<u32> {
-            Ok(g.u64(&format!("tokenizer.ggml.{k}"))? as u32)
+            let v = g.u64(&format!("tokenizer.ggml.{k}"))?;
+            u32::try_from(v).with_context(|| format!("{k} {v} is not a token id"))
         };
         let c = Self {
             n_layer,
