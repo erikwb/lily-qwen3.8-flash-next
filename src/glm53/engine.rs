@@ -196,8 +196,9 @@ impl Glm53Model {
     ) -> Result<u32> {
         scratch.stage_mtp_token(token)?;
         let hidden = scratch.hidden.view(row * self.cfg.hidden, &[self.cfg.hidden])?;
+        let token = scratch.mtp_io.view(0, &[1])?;
         let pass = self.begin(ctx)?;
-        self.encode_mtp(ctx, &pass, state, scratch, &hidden, p, draft)?;
+        self.encode_mtp(ctx, &pass, state, scratch, &token, &hidden, p, draft)?;
         pass.commit_wait()?;
         state.mtp_next = Some(p + 1);
         Ok(scratch.mtp_io.to_u32()?[1])
@@ -374,19 +375,28 @@ impl LanguageModel for Glm53Model {
                 state.mtp_min = Some(pos0);
             }
             // Catch the head up on the accepted rows, then draft from the
-            // last one.
-            for r in 0..accepted {
-                self.mtp_step(ctx, state, scratch, draws[r], r, pos0 + r, false)?;
+            // last one, in one pass: the tokens are the verify pass's draws,
+            // already on the GPU.
+            let hidden = self.cfg.hidden;
+            let pass = self.begin(ctx)?;
+            for r in 0..=accepted {
+                let token = scratch.draws.view(r, &[1])?;
+                let h = scratch.hidden.view(r * hidden, &[hidden])?;
+                let draft = r == accepted;
+                self.encode_mtp(
+                    ctx,
+                    &pass,
+                    state,
+                    scratch,
+                    &token,
+                    &h,
+                    pos0 + r,
+                    draft,
+                )?;
             }
-            proposals.push(self.mtp_step(
-                ctx,
-                state,
-                scratch,
-                draws[accepted],
-                accepted,
-                pos0 + accepted,
-                true,
-            )?);
+            pass.commit_wait()?;
+            state.mtp_next = Some(pos0 + accepted + 1);
+            proposals.push(scratch.mtp_io.to_u32()?[1]);
         } else {
             state.mtp_next = None;
         }

@@ -969,7 +969,7 @@ impl Glm53Model {
     }
 
     /// One MTP step (ds4 `glm_graph_mtp_step`) at main position `p`: the
-    /// token at `p + 1` (`sc.mtp_io[0]`) and the main model's stream mean at
+    /// token at `p + 1` (`token`, U32 `[1]`) and the main model's stream mean at
     /// `p` (`hidden`, 4096 f32) through the nextn block, whose latent row `p`
     /// it writes; with `draft`, the shared head's greedy token for `p + 2`
     /// goes to `sc.mtp_io[1]`. The head attends its own rows from
@@ -982,6 +982,7 @@ impl Glm53Model {
         pass: &ComputePass<'_>,
         st: &Glm53State,
         sc: &Scratch,
+        token: &Tensor,
         hidden: &Tensor,
         p: usize,
         draft: bool,
@@ -993,13 +994,14 @@ impl Glm53Model {
         let limit = cfg.indexer_selected_limit();
         let s = limit.next_multiple_of(8);
         let first = st.mtp_min.unwrap_or(p).max((p + 1).saturating_sub(limit));
-        let mut rows = vec![u32::MAX; s];
-        for (slot, row) in (first..=p).enumerate() {
-            rows[slot] = row as u32;
+        if draft {
+            let mut rows = vec![u32::MAX; s];
+            for (slot, row) in (first..=p).enumerate() {
+                rows[slot] = row as u32;
+            }
+            write_words(&sc.mtp_sel, &rows)?;
         }
-        write_words(&sc.mtp_sel, &rows)?;
-        let token = sc.mtp_io.view(0, &[1])?;
-        k::embed(ctx, pass, &self.embed, &token, &sc.mtp_emb, 1)?;
+        k::embed(ctx, pass, &self.embed, token, &sc.mtp_emb, 1)?;
         pass.memory_barrier()?;
         let e = sc.mtp_emb.view(0, &[cfg.hidden])?;
         let cat_e = sc.mtp_cat.view(0, &[cfg.hidden])?;
