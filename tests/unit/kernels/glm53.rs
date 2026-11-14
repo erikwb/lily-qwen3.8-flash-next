@@ -397,8 +397,16 @@ fn kda_compare(tokens: usize, chunk: usize, seed: u64) {
         let og = f32s(&mut rng, n * p, -2.0, 2.0);
         let (tq, tk, tv, tg, tb, tog) = (t(&q), t(&k), t(&v), t(&g), t(&b), t(&og));
         let out = zeros(&ctx, n * p);
-        let inputs =
-            KdaInputs { q: &tq, k: &tk, v: &tv, gate: &tg, beta: &tb, out_gate: &tog };
+        let edges = zeros(&ctx, kda_edges_len(n, heads));
+        let inputs = KdaInputs {
+            q: &tq,
+            k: &tk,
+            v: &tv,
+            gate: &tg,
+            beta: &tb,
+            out_gate: &tog,
+            edges: Some(&edges),
+        };
         run(&ctx, |pass| {
             kda(&ctx, pass, &params, &inputs, &conv_state, &state, &out, n, None)
                 .unwrap()
@@ -434,12 +442,313 @@ fn kda_prefill_matches_cpu() {
     kda_compare(37, 16, 60);
 }
 
+/// A prompt run's prepare stage in KDA_CHUNK-token chunks gives the
+/// single-chunk run's results bit for bit: output, prepared q/k/v/decay,
+/// recurrent state, conv window and both snapshots, from a nonzero starting
+/// state, at row counts around the chunk boundaries and with snapshots on
+/// both sides of one, for four heads and one.
+#[test]
+fn kda_prefill_chunks_are_bit_exact() {
+    // The model's head count's kind (even) and an odd one (the edge copy's
+    // grid ends mid-threadgroup).
+    for heads in [4, 1] {
+        kda_chunks_case(heads);
+    }
+}
+
+fn kda_chunks_case(heads: usize) {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(76);
+    let p = heads * 128;
+    let c = kda_case(&mut rng, heads);
+    let t = |v: &Vec<f32>| tensor(&ctx, v);
+    let (qc, kc, vc, al, dt, on) = (
+        t(&c.q_conv),
+        t(&c.k_conv),
+        t(&c.v_conv),
+        t(&c.a_log),
+        t(&c.dt_bias),
+        t(&c.o_norm),
+    );
+    let params = KdaParams {
+        q_conv: &qc,
+        k_conv: &kc,
+        v_conv: &vc,
+        a_log: &al,
+        dt_bias: &dt,
+        o_norm: &on,
+        heads,
+        lower_bound: -5.0,
+        eps: 1e-5,
+    };
+    let conv0 = f32s(&mut rng, 9 * p, -1.0, 1.0);
+    let state0 = f32s(&mut rng, heads * 128 * 128, -0.2, 0.2);
+    let bits = |x: &Tensor| -> Vec<u32> {
+        x.to_f32().unwrap().iter().map(|v| v.to_bits()).collect()
+    };
+    let cases = [
+        (31, Some(30)),
+        (32, Some(31)),
+        (33, Some(32)),
+        (63, None),
+        (64, Some(33)),
+        (65, Some(64)),
+        (65, Some(30)),
+        (65, Some(31)),
+    ];
+    for (n, snap_row) in cases {
+        let raw: Vec<Vec<f32>> = [p, p, p, p, heads, p]
+            .iter()
+            .map(|&w| f32s(&mut rng, n * w, -2.0, 2.0))
+            .collect();
+        let mut got = Vec::new();
+        for chunk in [KDA_CHUNK, n] {
+            let x: Vec<Tensor> = raw.iter().map(t).collect();
+            let (conv, st) = (t(&conv0), t(&state0));
+            let (out, edges) = (zeros(&ctx, n * p), zeros(&ctx, n.div_ceil(3) * 9 * p));
+            let (sconv, sst) = (zeros(&ctx, 9 * p), zeros(&ctx, heads * 128 * 128));
+            let inputs = KdaInputs {
+                q: &x[0],
+                k: &x[1],
+                v: &x[2],
+                gate: &x[3],
+                beta: &x[4],
+                out_gate: &x[5],
+                edges: Some(&edges),
+            };
+            run(&ctx, |pass| {
+                let snap =
+                    snap_row.map(|row| KdaSnapshot { row, conv: &sconv, state: &sst });
+                kda_chunked(
+                    &ctx, pass, &params, &inputs, &conv, &st, &out, n, snap, chunk,
+                )
+                .unwrap()
+            });
+            let mut all: Vec<Vec<u32>> = x[..4].iter().map(bits).collect();
+            all.extend([bits(&out), bits(&st), bits(&conv), bits(&sconv), bits(&sst)]);
+            got.push(all);
+        }
+        for (k, name) in
+            ["q", "k", "v", "decay", "out", "state", "conv", "snap conv", "snap state"]
+                .iter()
+                .enumerate()
+        {
+            assert!(
+                got[0][k] == got[1][k],
+                "{name} differs at {n} rows, {heads} heads"
+            );
+        }
+    }
+}
+
+/// The indexer's top-k at the kept-count boundary (511, 512, 513 and 1 025
+/// complete pools; the top 512 kept) with random, all-equal and few-valued
+/// scores: the k highest, ties to the lower pool, in pool order, then the
+/// incomplete pool's tokens, padding past the count.
+#[test]
+fn indexer_topk_boundaries_and_ties() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(77);
+    let (k, s) = (512usize, 2056usize);
+    for pools in [511usize, 512, 513, 1025] {
+        for pattern in 0..3 {
+            let cap = pools + 1;
+            let sc: Vec<f32> = match pattern {
+                0 => f32s(&mut rng, cap, -1.0, 1.0),
+                1 => vec![0.25; cap],
+                _ => (0..cap).map(|_| (rng.gen_range(0..4u32) as f32) * 0.5).collect(),
+            };
+            let pos0 = 4 * pools + 1; // visible 4 pools + 2: a tail of two
+            let scores = tensor(&ctx, &sc);
+            let sel = Tensor::zeros(&ctx, &[s], DType::U32).unwrap();
+            let count = Tensor::zeros(&ctx, &[1], DType::U32).unwrap();
+            run(&ctx, |p| {
+                indexer_topk(&ctx, p, &scores, &sel, &count, 1, cap, s, pos0, k)
+                    .unwrap()
+            });
+            let mut order: Vec<usize> = (0..pools).collect();
+            order.sort_by(|&a, &b| sc[b].total_cmp(&sc[a]).then(a.cmp(&b)));
+            let mut kept: Vec<usize> = order[..k.min(pools)].to_vec();
+            kept.sort();
+            let mut expect: Vec<u32> =
+                kept.iter().flat_map(|&p| (4 * p as u32)..(4 * p as u32 + 4)).collect();
+            expect.extend([4 * pools as u32, 4 * pools as u32 + 1]);
+            let got = sel.to_u32().unwrap();
+            assert_eq!(
+                count.to_u32().unwrap()[0] as usize,
+                expect.len(),
+                "{pools} {pattern}"
+            );
+            assert_eq!(
+                &got[..expect.len()],
+                &expect[..],
+                "{pools} pools, pattern {pattern}"
+            );
+            assert!(got[expect.len()..].iter().all(|&v| v == u32::MAX));
+        }
+    }
+}
+
+/// Runs of more than one prepare chunk (KDA_CHUNK rows): 75-row runs of
+/// three chunks each, the second run continuing the first's state.
+#[test]
+fn kda_prefill_long_runs_match_cpu() {
+    kda_compare(150, 75, 75);
+}
+
 #[test]
 fn dsa_store_and_attend_match_cpu() {
+    // 42 cached rows then 3 rows of queries (SIMT kernels); 25 then a run
+    // of 20 (matrix units); runs from row 0 in partial tiles of the
+    // padded widths 8 and 16.
+    for (n, m, s) in [(45, 3, 64), (45, 20, 64), (5, 5, 8), (13, 13, 16)] {
+        dsa_causal_case(n, m, s, false);
+    }
+}
+
+/// Queries at and past f16's range on both routes (a tile with one goes
+/// through f32 on the matrix route): finite, and as the CPU computes.
+#[test]
+fn dsa_attend_large_queries_stay_finite() {
+    for m in [3, 20] {
+        dsa_causal_case(45, m, 64, true);
+    }
+}
+
+/// The matrix route's widths are padded to 8.
+#[test]
+fn dsa_attend_refuses_unpadded_prompt_widths() {
+    let ctx = ctx();
+    let (m, s) = (5, 5);
+    let cache = Tensor::zeros(&ctx, &[8 * 512], DType::F16).unwrap();
+    let qk = zeros(&ctx, m * 64 * 512);
+    let (scores, denom) = (zeros(&ctx, m * 64 * 8), zeros(&ctx, m * 64));
+    let (lat, partial) = (zeros(&ctx, m * 64 * 512), zeros(&ctx, 4 * 8 * 64 * 512));
+    let pass = ctx.begin().unwrap();
+    let r = dsa_attend(
+        &ctx,
+        &pass,
+        &qk,
+        &cache,
+        Rows::Causal { pos0: 0 },
+        &scores,
+        &denom,
+        &lat,
+        &partial,
+        m,
+        s,
+        1.0,
+    );
+    assert!(r.is_err());
+    // An empty selected width on the matrix route (its first weight loads
+    // run before its slot loop): refused too.
+    let one = zeros(&ctx, 1);
+    let sel = Tensor::zeros(&ctx, &[1], DType::U32).unwrap();
+    let r = dsa_attend(
+        &ctx,
+        &pass,
+        &qk,
+        &cache,
+        Rows::Selected { sel: &sel, count: 0 },
+        &one,
+        &denom,
+        &lat,
+        &partial,
+        m,
+        0,
+        1.0,
+    );
+    assert!(r.is_err());
+    pass.commit_wait().unwrap();
+}
+
+/// The scores stage on both routes against an f64 reference over 200 slots
+/// (four matrix tiles): f16's largest value alone stays on the matrix
+/// route, the next value past it (either sign) sends its query's tiles to
+/// f32, a NaN or infinite query value makes only its own head's scores
+/// non-finite, and slots past each row's count are -inf.
+#[test]
+fn dsa_scores_at_and_past_f16_range() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(78);
+    let (n, m) = (200usize, 6usize);
+    let s = n;
+    let pos0 = n - m;
+    let lat: Vec<f32> =
+        f32s(&mut rng, n * 512, -1.5, 1.5).into_iter().map(r::round_f16).collect();
+    let bytes: Vec<u8> =
+        lat.iter().flat_map(|&v| f16::from_f32(v).to_bits().to_le_bytes()).collect();
+    let cache = Tensor::from_bytes(&ctx, &bytes, &[n * 512], DType::F16).unwrap();
+    let mut qk = f32s(&mut rng, m * 64 * 512, -0.2, 0.2);
+    let at = |i: usize, h: usize, j: usize| (i * 64 + h) * 512 + j;
+    let past = f32::from_bits(65504f32.to_bits() + 1);
+    qk[at(0, 0, 0)] = 65504.0;
+    qk[at(0, 1, 3)] = -65504.0;
+    qk[at(1, 2, 1)] = past;
+    qk[at(2, 0, 2)] = -past;
+    qk[at(3, 3, 4)] = f32::NAN;
+    qk[at(4, 5, 6)] = f32::INFINITY;
+    let tqk = tensor(&ctx, &qk);
+    let scale = 1.0 / 16.0;
+    for mu in [true, false] {
+        let scores = zeros(&ctx, m * 64 * s);
+        run(&ctx, |p| {
+            dsa_scores(
+                &ctx,
+                p,
+                &tqk,
+                &cache,
+                Rows::Causal { pos0 },
+                &scores,
+                m,
+                s,
+                scale,
+                mu,
+            )
+            .unwrap()
+        });
+        let g = scores.to_f32().unwrap();
+        for i in 0..m {
+            let count = pos0 + i + 1;
+            for h in 0..64 {
+                let q = &qk[at(i, h, 0)..at(i, h, 0) + 512];
+                for slot in 0..s {
+                    let got = g[(i * 64 + h) * s + slot];
+                    if slot >= count {
+                        assert_eq!(
+                            got,
+                            f32::NEG_INFINITY,
+                            "mu {mu} row {i} head {h} slot {slot}"
+                        );
+                        continue;
+                    }
+                    if (i, h) == (3, 3) {
+                        assert!(got.is_nan(), "mu {mu}: NaN query gave {got}");
+                        continue;
+                    }
+                    if (i, h) == (4, 5) {
+                        assert!(!got.is_finite(), "mu {mu}: infinite query gave {got}");
+                        continue;
+                    }
+                    let k = &lat[slot * 512..(slot + 1) * 512];
+                    let terms = q.iter().zip(k).map(|(&a, &b)| a as f64 * b as f64);
+                    let want = terms.clone().sum::<f64>() * scale as f64;
+                    let mag: f64 = terms.map(f64::abs).sum();
+                    let tol = scale as f64 * (3e-6 * mag + 512.0 * 6e-8 * 2.0);
+                    assert!(
+                        got.is_finite() && (got as f64 - want).abs() <= tol,
+                        "mu {mu} row {i} head {h} slot {slot}: {got} against {want} (tol {tol})"
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn dsa_causal_case(n: usize, m: usize, s: usize, big: bool) {
     let ctx = ctx();
     let mut rng = StdRng::seed_from_u64(61);
     let cfg = crate::glm53::Config::glm53_flash();
-    let (n, m) = (45, 3); // 42 cached rows, then 3 rows of queries
     let kv_raw = f32s(&mut rng, n * 512, -2.0, 2.0);
     let w = f32s(&mut rng, 512, 0.5, 1.5);
     let cache = Tensor::zeros(&ctx, &[64 * 512], DType::F16).unwrap();
@@ -457,12 +766,26 @@ fn dsa_store_and_attend_match_cpu() {
         .collect();
     let diffs = gl.iter().zip(&latent).filter(|(a, b)| a != b).count();
     assert!(diffs * 1000 < latent.len(), "{diffs} f16 latent values differ");
-    let qk = f32s(&mut rng, m * 64 * 512, -0.2, 0.2);
+    let mut qk = f32s(&mut rng, m * 64 * 512, -0.2, 0.2);
+    if big {
+        // f16's largest value, the first values past it, far past it, and
+        // large values of both signs whose products cancel in part.
+        let at = |i: usize, h: usize, j: usize| (i * 64 + h) * 512 + j;
+        qk[at(0, 0, 0)] = 65536.0;
+        qk[at(0, 1, 5)] = -65536.0;
+        qk[at(1, 2, 7)] = 65520.0;
+        qk[at(m - 1, 3, 0)] = 1.0e6;
+        qk[at(m - 1, 3, 1)] = -1.0e6;
+        for j in 0..512 {
+            qk[at(1, 4, j)] = if j % 2 == 0 { 65504.0 } else { -65504.0 };
+            qk[at(2, 5, j)] = 3.0e4;
+        }
+    }
     let tqk = tensor(&ctx, &qk);
-    let s = 64;
     let scores = zeros(&ctx, m * 64 * s);
     let denom = zeros(&ctx, m * 64);
     let lat = zeros(&ctx, m * 64 * 512);
+    let partial = zeros(&ctx, 4 * 8 * 64 * 512);
     let pos0 = n - m;
     run(&ctx, |p| {
         dsa_attend(
@@ -474,6 +797,7 @@ fn dsa_store_and_attend_match_cpu() {
             &scores,
             &denom,
             &lat,
+            &partial,
             m,
             s,
             1.0 / 16.0,
@@ -481,6 +805,10 @@ fn dsa_store_and_attend_match_cpu() {
         .unwrap()
     });
     let glat = lat.to_f32().unwrap();
+    assert!(
+        glat[..m * 64 * 512].iter().all(|v| v.is_finite()),
+        "non-finite latent mix"
+    );
     for i in 0..m {
         let rows: Vec<usize> = (0..=pos0 + i).collect();
         for h in 0..64 {
@@ -508,6 +836,248 @@ fn dsa_store_and_attend_match_cpu() {
                 1e-4,
             );
         }
+    }
+}
+
+/// The attention over selected rows (the sparse and MTP paths): per-row
+/// lists with unused slots, against the CPU.
+#[test]
+fn dsa_attend_selected_matches_cpu() {
+    // Decode rows (SIMT kernels, the slots in chunks) and a prompt run
+    // (matrix units); a short selection and a full one (its last chunk full).
+    for (m, count) in [(2, 344), (6, 344), (2, 2056), (6, 2056)] {
+        dsa_selected_case(m, count);
+    }
+}
+
+fn dsa_selected_case(m: usize, count: usize) {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(70);
+    let (cached, s) = (700usize, 2056usize);
+    let lat_rows: Vec<f32> =
+        f32s(&mut rng, cached * 512, -1.5, 1.5).into_iter().map(r::round_f16).collect();
+    let bytes: Vec<u8> = lat_rows
+        .iter()
+        .flat_map(|&v| f16::from_f32(v).to_bits().to_le_bytes())
+        .collect();
+    let cache = Tensor::from_bytes(&ctx, &bytes, &[cached * 512], DType::F16).unwrap();
+    let mut sel = vec![u32::MAX; m * s];
+    let mut lists = Vec::new();
+    for i in 0..m {
+        let mut l = Vec::new();
+        for slot in 0..count {
+            // Every seventh slot unused; rows spread over the cache.
+            if slot % 7 != 3 {
+                let row = (slot * 131 + i * 17) % cached;
+                sel[i * s + slot] = row as u32;
+                l.push(row);
+            }
+        }
+        lists.push(l);
+    }
+    let tsel =
+        Tensor::from_bytes(&ctx, bytemuck::cast_slice(&sel), &[m * s], DType::U32)
+            .unwrap();
+    let qk = f32s(&mut rng, m * 64 * 512, -0.2, 0.2);
+    let tqk = tensor(&ctx, &qk);
+    let scores = zeros(&ctx, m * 64 * s);
+    let denom = zeros(&ctx, m * 64);
+    let lat = zeros(&ctx, m * 64 * 512);
+    // Bound here: the pass reads it until run's commit_wait returns.
+    let partial = zeros(&ctx, 4 * 8 * 64 * 512);
+    run(&ctx, |p| {
+        dsa_attend(
+            &ctx,
+            p,
+            &tqk,
+            &cache,
+            Rows::Selected { sel: &tsel, count },
+            &scores,
+            &denom,
+            &lat,
+            &partial,
+            m,
+            s,
+            1.0 / 16.0,
+        )
+        .unwrap()
+    });
+    let glat = lat.to_f32().unwrap();
+    for (i, rows) in lists.iter().enumerate() {
+        for h in 0..64 {
+            let ql = &qk[(i * 64 + h) * 512..(i * 64 + h + 1) * 512];
+            let sc: Vec<f32> = rows
+                .iter()
+                .map(|&t| r::dot(ql, &lat_rows[t * 512..(t + 1) * 512]) / 16.0)
+                .collect();
+            let mx = sc.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let e: Vec<f32> = sc.iter().map(|&x| (x - mx).exp()).collect();
+            let d: f32 = e.iter().sum();
+            let exp: Vec<f32> = (0..512)
+                .map(|j| {
+                    rows.iter()
+                        .zip(&e)
+                        .map(|(&t, &wt)| wt * lat_rows[t * 512 + j])
+                        .sum::<f32>()
+                        / d
+                })
+                .collect();
+            assert_close(
+                &glat[(i * 64 + h) * 512..(i * 64 + h + 1) * 512],
+                &exp,
+                1e-5,
+                1e-4,
+            );
+        }
+    }
+}
+
+/// DSA decode attention (scores, softmax, weighted latent sum) at the
+/// model's shapes: a dense run at 264 rows and the sparse 2 056-slot
+/// selection, `LILY_GLM53_ROWS` query rows (default 1), best of five serial
+/// passes of 11 layers' calls over 11 caches.
+#[test]
+#[ignore = "timing only"]
+fn dsa_timing() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(71);
+    let m: usize =
+        std::env::var("LILY_GLM53_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    let cached = 4112 + m;
+    let caches: Vec<Tensor> = (0..11)
+        .map(|_| {
+            let bytes: Vec<u8> = f32s(&mut rng, cached * 512, -1.5, 1.5)
+                .iter()
+                .flat_map(|&v| f16::from_f32(v).to_bits().to_le_bytes())
+                .collect();
+            Tensor::from_bytes(&ctx, &bytes, &[cached * 512], DType::F16).unwrap()
+        })
+        .collect();
+    let s_max = 2056;
+    let sel: Vec<u32> =
+        (0..m * s_max).map(|k| ((k % s_max) * 2 + k / s_max) as u32).collect();
+    let tsel =
+        Tensor::from_bytes(&ctx, bytemuck::cast_slice(&sel), &[m * s_max], DType::U32)
+            .unwrap();
+    let qk = tensor(&ctx, &f32s(&mut rng, m * 64 * 512, -0.2, 0.2));
+    let scores = zeros(&ctx, m * 64 * s_max);
+    let denom = zeros(&ctx, m * 64);
+    let lat = zeros(&ctx, m * 64 * 512);
+    let partial = zeros(&ctx, 4 * 8 * 64 * 512);
+    // Prompt runs: two layers (a 1 024-row call takes milliseconds), the
+    // dense case causal over the run itself.
+    let caches = if m > 4 { &caches[..2] } else { &caches[..] };
+    for (label, sparse) in [("dense 264 rows", false), ("selected 2056", true)] {
+        let s = if sparse { s_max } else { 264.max(m).next_multiple_of(8) };
+        let rows = if sparse {
+            Rows::Selected { sel: &tsel, count: s_max }
+        } else {
+            Rows::Causal { pos0: 264usize.saturating_sub(m) }
+        };
+        let mut best = f64::MAX;
+        for _ in 0..5 {
+            let pass = ctx.begin().unwrap();
+            for c in caches {
+                dsa_attend(
+                    &ctx, &pass, &qk, c, rows, &scores, &denom, &lat, &partial, m, s,
+                    0.0625,
+                )
+                .unwrap();
+            }
+            let t = std::time::Instant::now();
+            pass.commit_wait().unwrap();
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        println!(
+            "dsa {label:16} m={m} {:8.1} us a layer",
+            best / caches.len() as f64 * 1e6
+        );
+        // With LILY_KERNEL_PROFILE: each kernel alone, per layer.
+        let mut by: Vec<(&str, f64)> = Vec::new();
+        for p in crate::metal::profile::take() {
+            for k in &p.kernels {
+                match by.iter_mut().find(|(n, _)| *n == k.name) {
+                    Some(e) => e.1 += k.gpu_secs,
+                    None => by.push((k.name, k.gpu_secs)),
+                }
+            }
+        }
+        for (name, secs) in by {
+            println!(
+                "dsa   {name:28} {:8.1} us a layer",
+                secs / (5 * caches.len()) as f64 * 1e6
+            );
+        }
+    }
+}
+
+/// The indexer's pool scores and top-k at decode (one row): 1 024 and
+/// 8 192 complete pools, the top 512 kept; best of five passes of 11 calls.
+#[test]
+#[ignore = "timing only"]
+fn indexer_topk_timing() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(72);
+    for pools in [1024usize, 8192] {
+        let cap = pools + 1;
+        let scores = tensor(&ctx, &f32s(&mut rng, cap, -1.0, 1.0));
+        let s = 2056;
+        let sel = Tensor::zeros(&ctx, &[s], DType::U32).unwrap();
+        let count = Tensor::zeros(&ctx, &[1], DType::U32).unwrap();
+        let mut best = f64::MAX;
+        for _ in 0..5 {
+            let pass = ctx.begin().unwrap();
+            for _ in 0..11 {
+                indexer_topk(
+                    &ctx,
+                    &pass,
+                    &scores,
+                    &sel,
+                    &count,
+                    1,
+                    cap,
+                    s,
+                    4 * pools,
+                    512,
+                )
+                .unwrap();
+            }
+            let t = std::time::Instant::now();
+            pass.commit_wait().unwrap();
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        println!("indexer_topk {pools:5} pools {:8.1} us", best / 11.0 * 1e6);
+        let iq = tensor(&ctx, &f32s(&mut rng, 32 * 128, -1.0, 1.0));
+        let w = tensor(&ctx, &f32s(&mut rng, 32, -1.0, 1.0));
+        let bytes: Vec<u8> = f32s(&mut rng, pools * 128, -1.0, 1.0)
+            .iter()
+            .flat_map(|&v| f16::from_f32(v).to_bits().to_le_bytes())
+            .collect();
+        let pooled =
+            Tensor::from_bytes(&ctx, &bytes, &[pools * 128], DType::F16).unwrap();
+        let mut best = f64::MAX;
+        for _ in 0..5 {
+            let pass = ctx.begin().unwrap();
+            for _ in 0..11 {
+                indexer_scores(
+                    &ctx,
+                    &pass,
+                    &iq,
+                    &w,
+                    &pooled,
+                    &scores,
+                    1,
+                    cap,
+                    4 * pools,
+                    0.01,
+                )
+                .unwrap();
+            }
+            let t = std::time::Instant::now();
+            pass.commit_wait().unwrap();
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        println!("indexer_scores {pools:5} pools {:8.1} us", best / 11.0 * 1e6);
     }
 }
 
@@ -734,6 +1304,83 @@ fn hc_post_mix_and_pre2_match_cpu() {
     }
 }
 
+/// The HC pair of a sublayer boundary (`hc_post_mix` then `hc_pre2`, each
+/// its own level as in the step) at the model's shapes: best of five
+/// serial passes of `LILY_GLM53_REPEAT` (default 64) pairs over 128 copies
+/// of the control weights (100 MB: not cache resident, as in a step).
+/// `LILY_GLM53_ROWS` rows (default 1).
+#[test]
+#[ignore = "timing only"]
+fn hc_timing() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(69);
+    let env = |k: &str, d: usize| -> usize {
+        std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    };
+    let (repeat, m) = (env("LILY_GLM53_REPEAT", 64), env("LILY_GLM53_ROWS", 1));
+    let cfg = crate::glm53::Config::glm53_flash();
+    let hidden = cfg.hidden;
+    let fn_raw = random_blocks(&mut rng, GgmlType::Bf16, 24 * 4 * hidden);
+    let fns: Vec<QWeight> = (0..128)
+        .map(|_| {
+            QWeight::from_bytes(&ctx, &fn_raw, GgmlType::Bf16, 4 * hidden, 24).unwrap()
+        })
+        .collect();
+    let h = tensor(&ctx, &f32s(&mut rng, m * 4 * hidden, -0.01, 0.01));
+    let block = tensor(&ctx, &f32s(&mut rng, m * hidden, -1e-3, 1e-3));
+    let partial = zeros(&ctx, m * hc_mix_groups(hidden) * 25);
+    let scale = tensor(&ctx, &[0.8f32, 1.2, 1.7]);
+    let base = tensor(&ctx, &f32s(&mut rng, 24, -0.5, 0.5));
+    let norm = tensor(&ctx, &f32s(&mut rng, hidden, 0.5, 1.5));
+    let split = zeros(&ctx, m * 24);
+    let xn = zeros(&ctx, m * hidden);
+    for (label, part) in [("post_mix + pre2", 0), ("post_mix", 1), ("pre2", 2)] {
+        let mut best = f64::MAX;
+        for _ in 0..5 {
+            let pass = ctx.begin().unwrap();
+            for r in 0..repeat {
+                if part != 2 {
+                    let post = (r > 0).then_some((&block, &split));
+                    hc_post_mix(
+                        &ctx,
+                        &pass,
+                        &h,
+                        post,
+                        &fns[r % 128],
+                        &partial,
+                        m,
+                        hidden,
+                    )
+                    .unwrap();
+                }
+                if part != 1 {
+                    hc_pre2(
+                        &ctx,
+                        &pass,
+                        &partial,
+                        &scale,
+                        &base,
+                        &h,
+                        &norm,
+                        &split,
+                        &xn,
+                        m,
+                        hidden,
+                        20,
+                        1e-6,
+                        cfg.rms_eps,
+                    )
+                    .unwrap();
+                }
+            }
+            let t = std::time::Instant::now();
+            pass.commit_wait().unwrap();
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        println!("hc {label:20} m={m} {:8.1} us", best / repeat as f64 * 1e6);
+    }
+}
+
 #[test]
 fn gemv_sets_match_single_gemvs() {
     let ctx = ctx();
@@ -887,6 +1534,116 @@ fn moe_timing() {
     }
 }
 
+/// One-token KDA at the model's shape (64 heads), best of five serial
+/// passes of 34 layers' calls over 34 states (146 MB: as in a step); then a
+/// 1 024-row prompt run, best of three passes of three layers. (The prompt
+/// run's q, k, v and gate are prepared in place: later passes see their
+/// silu'd values, the same work.)
+#[test]
+#[ignore = "timing only"]
+fn kda_decode_timing() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(73);
+    let heads = 64;
+    let p = heads * 128;
+    let mk = |rng: &mut StdRng, n: usize, lo: f32, hi: f32| {
+        tensor(&ctx, &f32s(rng, n, lo, hi))
+    };
+    let (q, k, v) = (
+        mk(&mut rng, p, -1.0, 1.0),
+        mk(&mut rng, p, -1.0, 1.0),
+        mk(&mut rng, p, -1.0, 1.0),
+    );
+    let (g, beta, og) = (
+        mk(&mut rng, p, -1.0, 1.0),
+        mk(&mut rng, heads, -1.0, 1.0),
+        mk(&mut rng, p, -1.0, 1.0),
+    );
+    let convs: Vec<Tensor> = (0..3).map(|_| mk(&mut rng, 4 * p, -0.5, 0.5)).collect();
+    let (a_log, dt, on) = (
+        mk(&mut rng, heads, -1.0, 0.0),
+        mk(&mut rng, p, -0.5, 0.5),
+        mk(&mut rng, 128, 0.5, 1.5),
+    );
+    let layers: Vec<(Tensor, Tensor)> = (0..34)
+        .map(|_| (zeros(&ctx, 9 * p), mk(&mut rng, heads * 128 * 128, -0.1, 0.1)))
+        .collect();
+    let out = zeros(&ctx, p);
+    let edges = zeros(&ctx, kda_edges_len(1024, heads));
+    let params = KdaParams {
+        q_conv: &convs[0],
+        k_conv: &convs[1],
+        v_conv: &convs[2],
+        a_log: &a_log,
+        dt_bias: &dt,
+        o_norm: &on,
+        heads,
+        lower_bound: -5.0,
+        eps: 1e-5,
+    };
+    let x = KdaInputs {
+        q: &q,
+        k: &k,
+        v: &v,
+        gate: &g,
+        beta: &beta,
+        out_gate: &og,
+        edges: Some(&edges),
+    };
+    let mut best = f64::MAX;
+    for _ in 0..5 {
+        let pass = ctx.begin().unwrap();
+        for (conv, st) in &layers {
+            kda(&ctx, &pass, &params, &x, conv, st, &out, 1, None).unwrap();
+        }
+        let t = std::time::Instant::now();
+        pass.commit_wait().unwrap();
+        best = best.min(t.elapsed().as_secs_f64());
+    }
+    println!("kda_decode {:8.1} us a layer", best / 34.0 * 1e6);
+    // A prompt run of 1 024 rows (prepare, recurrence, output), three layers.
+    let n = 1024;
+    let big = |rng: &mut StdRng, w: usize| mk(rng, n * w, -1.0, 1.0);
+    let (q, k, v) = (big(&mut rng, p), big(&mut rng, p), big(&mut rng, p));
+    let (g, beta, og) = (big(&mut rng, p), big(&mut rng, heads), big(&mut rng, p));
+    let out = zeros(&ctx, n * p);
+    let x = KdaInputs {
+        q: &q,
+        k: &k,
+        v: &v,
+        gate: &g,
+        beta: &beta,
+        out_gate: &og,
+        edges: Some(&edges),
+    };
+    let mut best = f64::MAX;
+    for _ in 0..3 {
+        let pass = ctx.begin().unwrap();
+        for (conv, st) in &layers[..3] {
+            kda(&ctx, &pass, &params, &x, conv, st, &out, n, None).unwrap();
+        }
+        let t = std::time::Instant::now();
+        pass.commit_wait().unwrap();
+        best = best.min(t.elapsed().as_secs_f64());
+    }
+    println!("kda_prefill 1024 rows {:8.1} us a layer", best / 3.0 * 1e6);
+    // With LILY_KERNEL_PROFILE: each kernel alone, per layer of the run.
+    let mut by: Vec<(&str, f64)> = Vec::new();
+    for p in crate::metal::profile::take() {
+        for k in &p.kernels {
+            match by.iter_mut().find(|(n, _)| *n == k.name) {
+                Some(e) => e.1 += k.gpu_secs,
+                None => by.push((k.name, k.gpu_secs)),
+            }
+        }
+    }
+    for (name, secs) in by {
+        if name != "glm53_kda_decode" {
+            println!("kda_   {name:28} {:8.1} us a layer", secs / 9.0 * 1e6);
+        }
+    }
+}
+
 #[test]
 fn kda_snapshot_is_the_state_after_its_row() {
     let ctx = ctx();
@@ -937,8 +1694,16 @@ fn kda_snapshot_is_the_state_after_its_row() {
         let og = f32s(&mut rng, n * p, -2.0, 2.0);
         let (tq, tk, tv, tg, tb, tog) = (t(&q), t(&k), t(&v), t(&g), t(&b), t(&og));
         let out = zeros(&ctx, n * p);
-        let inputs =
-            KdaInputs { q: &tq, k: &tk, v: &tv, gate: &tg, beta: &tb, out_gate: &tog };
+        let edges = zeros(&ctx, kda_edges_len(n, heads));
+        let inputs = KdaInputs {
+            q: &tq,
+            k: &tk,
+            v: &tv,
+            gate: &tg,
+            beta: &tb,
+            out_gate: &tog,
+            edges: Some(&edges),
+        };
         let snap_conv = zeros(&ctx, 9 * p);
         let snap_state = zeros(&ctx, heads * 128 * 128);
         let snap = (n == 3).then_some(KdaSnapshot {

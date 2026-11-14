@@ -769,7 +769,7 @@ pub fn hc_post(
 
 /// Threadgroups (and partial sums per row) of [`hc_post_mix`].
 pub fn hc_mix_groups(hidden: usize) -> usize {
-    hidden / 128
+    hidden / 64
 }
 
 /// HC post of the previous sublayer (when `post` gives its output and the
@@ -792,7 +792,7 @@ pub fn hc_post_mix(
         fn_w.ty == GgmlType::Bf16 && fn_w.rows == 24 && fn_w.cols == 4 * hidden,
         "HC fn shape"
     );
-    ensure!(hidden.is_multiple_of(128), "hidden {hidden}");
+    ensure!(hidden.is_multiple_of(64), "hidden {hidden}");
     ensure!(partial.numel() >= m * hc_mix_groups(hidden) * 25, "partials");
     let (block, split) = post.unwrap_or((streams, streams));
     let pipeline = ctx.pipeline("glm53_hc_post_mix", SOURCE, MslVersion::V3_1)?;
@@ -808,7 +808,7 @@ pub fn hc_post_mix(
         &[&u32_bytes(hidden), &u32_bytes(usize::from(post.is_some()))],
         Grid::Threadgroups {
             groups: (hc_mix_groups(hidden), m, 1),
-            threadgroup: (64, 1, 1),
+            threadgroup: (32, 1, 1),
         },
     )
 }
@@ -957,6 +957,17 @@ pub struct KdaInputs<'a> {
     pub gate: &'a Tensor,
     pub beta: &'a Tensor,
     pub out_gate: &'a Tensor,
+    /// Scratch for runs of more than [`KDA_CHUNK`] rows: the raw rows
+    /// before each chunk, [`kda_edges_len`] f32.
+    pub edges: Option<&'a Tensor>,
+}
+
+/// Tokens a threadgroup of the KDA prefill's prepare stage walks.
+pub const KDA_CHUNK: usize = 32;
+
+/// The f32 values of the edge scratch for runs of up to `rows` rows.
+pub fn kda_edges_len(rows: usize, heads: usize) -> usize {
+    rows.div_ceil(KDA_CHUNK) * 9 * heads * 128
 }
 
 /// Where a run of KDA tokens also leaves the conv window and state as they
@@ -981,6 +992,25 @@ pub fn kda(
     rows: usize,
     snap: Option<KdaSnapshot<'_>>,
 ) -> Result<()> {
+    kda_chunked(ctx, pass, p, x, conv_state, state, out, rows, snap, KDA_CHUNK)
+}
+
+/// [`kda`] with prompt runs' prepare stage walking `chunk` tokens a
+/// threadgroup (tests compare chunkings bit for bit).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn kda_chunked(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    p: &KdaParams<'_>,
+    x: &KdaInputs<'_>,
+    conv_state: &Tensor,
+    state: &Tensor,
+    out: &Tensor,
+    rows: usize,
+    snap: Option<KdaSnapshot<'_>>,
+    chunk: usize,
+) -> Result<()> {
+    ensure!(chunk >= 3, "KDA prepare chunks of {chunk} tokens");
     let (snap_row, snap_conv, snap_state) = match &snap {
         Some(s) => {
             ensure!(s.row < rows, "KDA snapshot after row {} of {rows}", s.row);
@@ -1019,6 +1049,33 @@ pub fn kda(
             Grid::Threadgroups { groups: (1, p.heads, 1), threadgroup: (128, 1, 1) },
         );
     }
+    let chunks = rows.div_ceil(chunk);
+    let edges = match x.edges {
+        Some(e) if chunks > 1 => {
+            ensure!(e.numel() >= chunks * 9 * proj, "KDA edges");
+            let k =
+                ctx.pipeline("glm53_kda_prefill_edges", SOURCE, MslVersion::V3_1)?;
+            pass.dispatch_at(
+                &k,
+                &[
+                    x.q.binding(),
+                    x.k.binding(),
+                    x.v.binding(),
+                    conv_state.binding(),
+                    e.binding(),
+                ],
+                &[&u32_bytes(proj), &u32_bytes(chunk)],
+                Grid::Threadgroups {
+                    groups: ((9 * proj).div_ceil(256), chunks, 1),
+                    threadgroup: (256, 1, 1),
+                },
+            )?;
+            pass.memory_barrier()?;
+            e
+        }
+        None if chunks > 1 => anyhow::bail!("KDA run of {rows} rows without edges"),
+        _ => conv_state,
+    };
     let prepare =
         ctx.pipeline("glm53_kda_prefill_prepare", SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
@@ -1035,14 +1092,17 @@ pub fn kda(
             p.dt_bias.binding(),
             conv_state.binding(),
             snap_conv.binding(),
+            edges.binding(),
         ],
         &[
             &u32_bytes(p.heads),
             &u32_bytes(rows),
             &f32_bytes(p.lower_bound),
             &u32_bytes(snap_row),
+            &u32_bytes(chunk),
+            &u32_bytes(usize::from(chunks > 1)),
         ],
-        Grid::Threadgroups { groups: (p.heads, 1, 1), threadgroup: (128, 1, 1) },
+        Grid::Threadgroups { groups: (p.heads, chunks, 1), threadgroup: (128, 1, 1) },
     )?;
     pass.memory_barrier()?;
     let recurrence =
@@ -1099,6 +1159,16 @@ pub fn kv_store(
     )
 }
 
+/// The widest score row the attention kernels take (the latent mix keeps
+/// its row list in threadgroup memory): the dense window, 2 051 rows,
+/// rounded up; the sparse selection is as wide.
+pub const DSA_MAX_SLOTS: usize = 2056;
+
+/// The most chunks the latent mix splits its slots into; its
+/// partial sums take `m * DSA_LORA_CHUNKS * 64 * 512` f32 (rows past that
+/// size take one chunk).
+pub const DSA_LORA_CHUNKS: usize = 8;
+
 /// Which cache rows a DSA query attends.
 #[derive(Clone, Copy)]
 pub enum Rows<'t> {
@@ -1108,25 +1178,24 @@ pub enum Rows<'t> {
     Selected { sel: &'t Tensor, count: usize },
 }
 
-/// Absorbed DSA attention core over the latent cache: from `qk_low`
-/// (`[m][64][512]`) to the mixed latent `lat` (`[m][64][512]`), with scratch
-/// `scores` (`[m][64][s]`) and `denom` (`[m][64]`); `s` bounds every row's
-/// count.
+/// The scores stage of [`dsa_attend`] (`scores[i][h][s]`, -inf past each
+/// row's count): on the matrix route when `mu` (its widths a nonzero
+/// multiple of 8; a tile whose queries leave f16's range computes in f32),
+/// else on the SIMT kernel.
 #[allow(clippy::too_many_arguments)]
-pub fn dsa_attend(
+pub(crate) fn dsa_scores(
     ctx: &MetalContext,
     pass: &ComputePass<'_>,
     qk_low: &Tensor,
     cache: &Tensor,
     rows: Rows<'_>,
     scores: &Tensor,
-    denom: &Tensor,
-    lat: &Tensor,
     m: usize,
     s: usize,
     scale: f32,
+    mu: bool,
 ) -> Result<()> {
-    check_f32(&[qk_low, scores, denom, lat])?;
+    check_f32(&[qk_low, scores])?;
     ensure!(scores.numel() >= m * 64 * s, "scores of {}", scores.numel());
     let (pos0, sel, has_sel, n_sel) = match rows {
         Rows::Causal { pos0 } => {
@@ -1138,7 +1207,19 @@ pub fn dsa_attend(
             (0, sel, 1, count)
         }
     };
-    let scores_k = ctx.pipeline("glm53_dsa_scores", SOURCE, MslVersion::V3_1)?;
+    ensure!(s <= DSA_MAX_SLOTS, "attention over {s} slots");
+    // The matrix route's weight loads are four wide: rows padded to 8, and
+    // its first loads run before its slot loop (no empty rows).
+    ensure!(
+        !mu || (s >= 8 && s.is_multiple_of(8)),
+        "prompt attention over {s} slots (a nonzero multiple of 8)"
+    );
+    let (name, groups, tg) = if mu {
+        ("glm53_dsa_scores_mu", s.div_ceil(64), 128)
+    } else {
+        ("glm53_dsa_scores", s.div_ceil(32), 256)
+    };
+    let scores_k = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &scores_k,
         &[qk_low.binding(), cache.binding(), sel.binding(), scores.binding()],
@@ -1149,8 +1230,52 @@ pub fn dsa_attend(
             &u32_bytes(n_sel),
             &f32_bytes(scale),
         ],
-        Grid::Threadgroups { groups: (s.div_ceil(8), m, 1), threadgroup: (64, 1, 1) },
-    )?;
+        Grid::Threadgroups { groups: (groups, m, 1), threadgroup: (tg, 1, 1) },
+    )
+}
+
+/// Absorbed DSA attention core over the latent cache: from `qk_low`
+/// (`[m][64][512]`) to the mixed latent `lat` (`[m][64][512]`), with scratch
+/// `scores` (`[m][64][s]`) and `denom` (`[m][64]`); `s` bounds every row's
+/// count. More than [`GEMV_MAX_ROWS`] rows take the matrix route, which
+/// needs `s` a nonzero multiple of 8.
+#[allow(clippy::too_many_arguments)]
+pub fn dsa_attend(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    qk_low: &Tensor,
+    cache: &Tensor,
+    rows: Rows<'_>,
+    scores: &Tensor,
+    denom: &Tensor,
+    lat: &Tensor,
+    partial: &Tensor,
+    m: usize,
+    s: usize,
+    scale: f32,
+) -> Result<()> {
+    check_f32(&[qk_low, scores, denom, lat, partial])?;
+    ensure!(scores.numel() >= m * 64 * s, "scores of {}", scores.numel());
+    let (pos0, sel, has_sel, n_sel) = match rows {
+        Rows::Causal { pos0 } => {
+            ensure!(pos0 + m <= s, "causal rows past the scores' width {s}");
+            (pos0, qk_low, 0usize, 0usize)
+        }
+        Rows::Selected { sel, count } => {
+            ensure!(count <= s && sel.numel() >= m * s, "selection");
+            (0, sel, 1, count)
+        }
+    };
+    ensure!(s <= DSA_MAX_SLOTS, "attention over {s} slots");
+    // Prompt runs on the matrix units (glm53_dsa.comp); decode rows on the
+    // SIMT kernels.
+    // LILY_GLM53_DSA_F32=1 keeps prompt runs on the SIMT kernels (A/B of
+    // the matrix route's precision).
+    static F32_ONLY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let f32_only =
+        *F32_ONLY.get_or_init(|| std::env::var_os("LILY_GLM53_DSA_F32").is_some());
+    let mu = m > GEMV_MAX_ROWS && !f32_only;
+    dsa_scores(ctx, pass, qk_low, cache, rows, scores, m, s, scale, mu)?;
     pass.memory_barrier()?;
     let softmax = ctx.pipeline("glm53_dsa_softmax", SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
@@ -1160,6 +1285,30 @@ pub fn dsa_attend(
         Grid::Threadgroups { groups: (64, m, 1), threadgroup: (256, 1, 1) },
     )?;
     pass.memory_barrier()?;
+    if mu {
+        let lora = ctx.pipeline("glm53_dsa_lora_mu", SOURCE, MslVersion::V3_1)?;
+        return pass.dispatch_at(
+            &lora,
+            &[
+                scores.binding(),
+                denom.binding(),
+                cache.binding(),
+                sel.binding(),
+                lat.binding(),
+            ],
+            &[&u32_bytes(s), &u32_bytes(pos0), &u32_bytes(has_sel), &u32_bytes(n_sel)],
+            Grid::Threadgroups { groups: (8, m, 1), threadgroup: (128, 1, 1) },
+        );
+    }
+    // Slots split into chunks of at least 8 steps of 32 (at most
+    // DSA_LORA_CHUNKS) when the rows are few enough for the partials.
+    let steps = s.div_ceil(32);
+    let chunks = if m * DSA_LORA_CHUNKS * 64 * 512 <= partial.numel() {
+        (steps / 8).clamp(1, DSA_LORA_CHUNKS)
+    } else {
+        1
+    };
+    let chunk = steps.div_ceil(chunks) * 32;
     let lora = ctx.pipeline("glm53_dsa_lora", SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &lora,
@@ -1169,9 +1318,31 @@ pub fn dsa_attend(
             cache.binding(),
             sel.binding(),
             lat.binding(),
+            partial.binding(),
         ],
-        &[&u32_bytes(s), &u32_bytes(pos0), &u32_bytes(has_sel), &u32_bytes(n_sel)],
-        Grid::Threadgroups { groups: (64, 8, m), threadgroup: (64, 1, 1) },
+        &[
+            &u32_bytes(s),
+            &u32_bytes(pos0),
+            &u32_bytes(has_sel),
+            &u32_bytes(n_sel),
+            &u32_bytes(chunks),
+            &u32_bytes(chunk),
+        ],
+        Grid::Threadgroups { groups: (4, 8, m * chunks), threadgroup: (256, 1, 1) },
+    )?;
+    if chunks == 1 {
+        return Ok(());
+    }
+    pass.memory_barrier()?;
+    let reduce = ctx.pipeline("glm53_dsa_lora_reduce", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &reduce,
+        &[partial.binding(), denom.binding(), lat.binding()],
+        &[&u32_bytes(chunks)],
+        Grid::Threadgroups {
+            groups: (64 * 512 / 4 / 256, m, 1),
+            threadgroup: (256, 1, 1),
+        },
     )
 }
 

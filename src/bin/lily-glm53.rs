@@ -57,6 +57,14 @@ enum Cmd {
         /// rendering ds4's 100-case references were scored with.
         #[arg(long)]
         legacy: bool,
+        /// Raw text: the prompt after `[gMASK]<sop>` with no chat template,
+        /// the continuation right after it (the fixture needs no responses).
+        #[arg(long)]
+        raw: bool,
+        /// Write every scored token's NLL, greedy hit and top-2 margin to
+        /// this file (tab-separated: case, index, target, nll, hit, margin).
+        #[arg(long)]
+        dump: Option<PathBuf>,
     },
     /// Chat: renders one user message with the GGUF's template and decodes
     /// greedily, printing the text.
@@ -103,6 +111,19 @@ enum Cmd {
         #[arg(long)]
         chat: Option<String>,
     },
+    /// Step time by row count: after a prompt, forward passes of 1 to 4
+    /// rows (every row's logits, as a verify pass), each from the prompt's
+    /// state (restored); medians.
+    Rows {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        text: PathBuf,
+        #[arg(long, default_value_t = 256)]
+        prompt_len: usize,
+        #[arg(long, default_value_t = 24)]
+        n: usize,
+    },
     /// Greedy generation from token ids.
     Generate {
         #[arg(long)]
@@ -135,13 +156,14 @@ fn run() -> Result<()> {
         Cmd::Generate { model, tokens, n } => {
             generate(&model, &parse_tokens(&tokens)?, n)
         }
-        Cmd::Score { model, fixture, effort, limit, legacy } => {
-            score(&model, &fixture, &effort, limit, legacy)
+        Cmd::Score { model, fixture, effort, limit, legacy, raw, dump } => {
+            score(&model, &fixture, &effort, limit, legacy, raw, dump.as_deref())
         }
         Cmd::Chat { model, prompt, n, think } => chat(&model, &prompt, n, think),
         Cmd::Spec { model, text, prompt_len, n, runs, chat } => {
             spec(&model, &text, prompt_len, n, runs, chat.as_deref())
         }
+        Cmd::Rows { model, text, prompt_len, n } => rows(&model, &text, prompt_len, n),
         Cmd::Bench { model, text, prompt_len, n, runs } => {
             bench(&model, &text, prompt_len, n, runs)
         }
@@ -280,8 +302,12 @@ fn score(
     effort: &str,
     limit: Option<usize>,
     legacy: bool,
+    raw: bool,
+    dump: Option<&std::path::Path>,
 ) -> Result<()> {
     use lily::tokenizer::Tokenizer;
+    use std::io::Write as _;
+    let mut dump = dump.map(std::fs::File::create).transpose()?;
     let tok = Tokenizer::from_gguf(path)?;
     let ctx = MetalContext::new()?;
     let model = Glm53Model::load(&ctx, path)?;
@@ -312,8 +338,11 @@ fn score(
         };
         let prompt = std::fs::read_to_string(file("prompts", cols[1]))?;
         let cont = std::fs::read_to_string(file("continuations", cols[2]))?;
-        let resp: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(file("responses", cols[3]))?)?;
+        let resp: serde_json::Value = if raw {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&std::fs::read(file("responses", cols[3]))?)?
+        };
         let msg = &resp["choices"][0]["message"];
         let reasoning = msg["reasoning"]
             .as_str()
@@ -322,7 +351,9 @@ fn score(
         let api_prompt = resp["usage"]["prompt_tokens"].as_u64().unwrap_or(0) as usize;
         // ds4's render_glm_references.py: the official template with the
         // API's reasoning in the prefix.
-        let rendered = if legacy {
+        let rendered = if raw {
+            format!("[gMASK]<sop>{prompt}")
+        } else if legacy {
             format!("[gMASK]<sop><|user|>{prompt}<|assistant|><think></think>")
         } else {
             format!(
@@ -349,9 +380,27 @@ fn score(
             let logits = sc.logits.to_f32()?;
             for r in 0..chunk.len() {
                 let row = &logits[r * vocab..(r + 1) * vocab];
-                let target = c_ids[ci * lily::glm53::model::MAX_ROWS + r] as usize;
-                nll -= log_softmax_at(row, target);
-                let hit = argmax(row) == target;
+                let at = ci * lily::glm53::model::MAX_ROWS + r;
+                let target = c_ids[at] as usize;
+                let lp = log_softmax_at(row, target);
+                nll -= lp;
+                let top = argmax(row);
+                let hit = top == target;
+                if let Some(f) = dump.as_mut() {
+                    let second = row
+                        .iter()
+                        .enumerate()
+                        .filter(|&(i, _)| i != top)
+                        .map(|(_, &v)| v)
+                        .fold(f32::NEG_INFINITY, f32::max);
+                    writeln!(
+                        f,
+                        "{case}\t{at}\t{target}\t{:.6}\t{}\t{:.4}",
+                        -lp,
+                        u8::from(hit),
+                        row[top] - second
+                    )?;
+                }
                 agree += usize::from(hit);
                 if ci == 0 && r == 0 {
                     first = hit;
@@ -513,6 +562,10 @@ fn bench(
             digest = (digest ^ u64::from(next)).wrapping_mul(0x100000001b3);
         }
         let dt = t.elapsed().as_secs_f64();
+        if ctx.profiling() {
+            eprintln!("decode at prompt {prompt_len}, per step:");
+            profile_report(n);
+        }
         steps.sort_by(f64::total_cmp);
         println!(
             "run {run}: prompt {prompt_len}: prefill {pf:.2} s = {:.1} tok/s; decode {n} tokens {dt:.2} s = {:.2} tok/s; step median {:.2} ms p10 {:.2} ms; digest {digest:016x}",
@@ -522,6 +575,59 @@ fn bench(
             steps[n / 10],
         );
     }
+    Ok(())
+}
+
+fn rows(
+    path: &std::path::Path,
+    text: &std::path::Path,
+    prompt_len: usize,
+    n: usize,
+) -> Result<()> {
+    use lily::engine::DecodeStateApi;
+    anyhow::ensure!(n > 0, "--n must be at least 1");
+    let tok = lily::tokenizer::Tokenizer::from_gguf(path)?;
+    let mut ids = tok.encode("[gMASK]<sop>")?;
+    let body = tok.encode(&std::fs::read_to_string(text)?)?;
+    anyhow::ensure!(
+        prompt_len > ids.len(),
+        "--prompt-len must exceed the {}-token prefix",
+        ids.len()
+    );
+    let used = prompt_len - ids.len();
+    anyhow::ensure!(
+        body.len() >= used + 4,
+        "the text has {} tokens, {} needed",
+        body.len(),
+        used + 4
+    );
+    ids.extend_from_slice(&body[..used]);
+    let ctx = MetalContext::new()?;
+    let model = Glm53Model::load(&ctx, path)?;
+    let mut sc = model.new_scratch(&ctx)?;
+    let mut st = model.new_state(&ctx, prompt_len + 16)?;
+    model.prefill(&ctx, &mut st, &mut sc, &ids)?;
+    // Every timed pass starts from the prompt's state: the recurrent parts
+    // (KDA, indexer tails) restored, the caches rewritten from the position.
+    let snap = st.snapshot(&ctx)?;
+    let mut line = format!("rows: prompt {prompt_len}:");
+    for m in [1usize, 2, 3, 4, 1] {
+        let toks: Vec<u32> = body[used..used + m].to_vec();
+        let mut t = Vec::with_capacity(n);
+        for _ in 0..n {
+            st.restore(&ctx, &snap)?;
+            let s = Instant::now();
+            if m == 1 {
+                model.forward(&ctx, &mut st, &mut sc, &toks, true)?;
+            } else {
+                model.forward_all_logits(&ctx, &mut st, &mut sc, &toks)?;
+            }
+            t.push(s.elapsed().as_secs_f64() * 1e3);
+        }
+        t.sort_by(f64::total_cmp);
+        line += &format!(" m={m} {:.2} ms (p10 {:.2})", t[n / 2], t[n / 10]);
+    }
+    println!("{line}");
     Ok(())
 }
 
@@ -571,13 +677,29 @@ fn spec(
             Some(Draw { params: &greedy, step: 0 }),
         )?;
         let mut plain = vec![sc.next_token.to_u32()?[0]];
+        // Plain decoding's top-1 minus top-2 logit at each token.
+        let mut margins = vec![f32::NAN];
+        let _ = lily::metal::profile::take();
         let t = Instant::now();
         while plain.len() < n {
             let last = *plain.last().unwrap();
             model.forward(&ctx, &mut st, &mut sc, &[last], true)?;
-            plain.push(argmax(&sc.logits.to_f32()?[..model.cfg.vocab]) as u32);
+            let l = &sc.logits.to_f32()?[..model.cfg.vocab];
+            let top = argmax(l);
+            let second = l
+                .iter()
+                .enumerate()
+                .filter(|&(i, _)| i != top)
+                .map(|(_, &v)| v)
+                .fold(f32::NEG_INFINITY, f32::max);
+            margins.push(l[top] - second);
+            plain.push(top as u32);
         }
         let plain_s = t.elapsed().as_secs_f64();
+        if ctx.profiling() {
+            eprintln!("profile: plain decode, per step:");
+            profile_report(n - 1);
+        }
         // Speculative.
         let mut st = LanguageModel::new_state(&model, &ctx, ids.len() + n + 8)?;
         LanguageModel::prefill(
@@ -589,6 +711,7 @@ fn spec(
             Some(Draw { params: &greedy, step: 0 }),
         )?;
         let mut out = vec![sc.next_token.to_u32()?[0]];
+        let _ = lily::metal::profile::take();
         let t = Instant::now();
         let mut proposals = model.draft_initial(
             &ctx,
@@ -600,8 +723,10 @@ fn spec(
             out.len(),
         )?;
         let (mut steps, mut accepted) = (0usize, 0usize);
+        let (mut t_verify, mut t_finish) = (0f64, 0f64);
         while out.len() < n {
             let pending = *out.last().unwrap();
+            let tv = Instant::now();
             let (draws, pend) = model.verify(
                 &ctx,
                 &mut st,
@@ -616,18 +741,35 @@ fn spec(
             out.extend_from_slice(&draws[..=kept]);
             accepted += kept;
             steps += 1;
+            let tf = Instant::now();
+            t_verify += (tf - tv).as_secs_f64();
             proposals =
                 model.finish_speculation(&ctx, &mut st, &mut sc, kept, true, pend)?;
+            t_finish += tf.elapsed().as_secs_f64();
         }
         let spec_s = t.elapsed().as_secs_f64();
+        if ctx.profiling() {
+            eprintln!("profile: speculative, per step:");
+            profile_report(steps);
+        }
         out.truncate(n);
         let same = plain.iter().zip(&out).take_while(|(a, b)| a == b).count();
+        if same < n {
+            println!(
+                "first difference at token {same}: plain's top-2 margin there {:.4}, smallest margin before it {:.4}",
+                margins[same],
+                margins[1..same].iter().copied().fold(f32::INFINITY, f32::min)
+            );
+        }
         println!(
-            "run {run}: plain {:.2} tok/s; speculative {:.2} tok/s, {steps} steps, accepted {accepted}/{steps} ({:.0}%); same first {same}/{n} tokens; pos {}",
+            "run {run}: plain {:.2} tok/s; speculative {:.2} tok/s, {steps} steps, accepted {accepted}/{steps} ({:.0}%); same first {same}/{n} tokens; pos {}; per step: verify {:.2} ms, finish {:.2} ms; plain step {:.2} ms",
             n as f64 / plain_s,
             n as f64 / spec_s,
             100.0 * accepted as f64 / steps as f64,
-            st.pos()
+            st.pos(),
+            t_verify / steps as f64 * 1e3,
+            t_finish / steps as f64 * 1e3,
+            plain_s / (n - 1) as f64 * 1e3,
         );
         if run == 0 {
             println!("speculative text: {:?}", tok.decode(&out, false)?);

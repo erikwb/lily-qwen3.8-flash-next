@@ -481,6 +481,8 @@ pub struct Scratch {
     klow: Tensor,
     klow2: Tensor,
     kout: Tensor,
+    /// The conv windows before each chunk of a prompt run's KDA prepare.
+    kedges: Tensor,
     // DSA
     qr: Tensor,
     q: Tensor,
@@ -489,6 +491,8 @@ pub struct Scratch {
     scores: Tensor,
     denom: Tensor,
     lat: Tensor,
+    /// The DSA weighted sum's partial sums of a few rows' slot chunks.
+    dsa_partial: Tensor,
     heads: Tensor,
     ik: Tensor,
     ig: Tensor,
@@ -592,6 +596,7 @@ impl Scratch {
             klow: f(m * cfg.kda_dim)?,
             klow2: f(m * cfg.kda_dim)?,
             kout: f(m * p)?,
+            kedges: f(k::kda_edges_len(m, cfg.kda_heads))?,
             qr: f(m * cfg.q_lora)?,
             q: f(m * hq)?,
             kv_raw: f(m * cfg.kv_lora)?,
@@ -599,6 +604,7 @@ impl Scratch {
             scores: f(m * cfg.n_head * s)?,
             denom: f(m * cfg.n_head)?,
             lat: f(m * cfg.n_head * cfg.kv_lora)?,
+            dsa_partial: f(MAX_ROWS * k::DSA_LORA_CHUNKS * cfg.n_head * cfg.kv_lora)?,
             heads: f(m * cfg.n_head * cfg.value_dim)?,
             ik: f(m * cfg.indexer_dim)?,
             ig: f(m * cfg.indexer_dim)?,
@@ -963,7 +969,7 @@ impl Glm53Model {
     }
 
     /// One MTP step (ds4 `glm_graph_mtp_step`) at main position `p`: the
-    /// token at `p + 1` (`sc.mtp_io[0]`) and the main model's stream mean at
+    /// token at `p + 1` (`token`, U32 `[1]`) and the main model's stream mean at
     /// `p` (`hidden`, 4096 f32) through the nextn block, whose latent row `p`
     /// it writes; with `draft`, the shared head's greedy token for `p + 2`
     /// goes to `sc.mtp_io[1]`. The head attends its own rows from
@@ -976,6 +982,7 @@ impl Glm53Model {
         pass: &ComputePass<'_>,
         st: &Glm53State,
         sc: &Scratch,
+        token: &Tensor,
         hidden: &Tensor,
         p: usize,
         draft: bool,
@@ -987,13 +994,14 @@ impl Glm53Model {
         let limit = cfg.indexer_selected_limit();
         let s = limit.next_multiple_of(8);
         let first = st.mtp_min.unwrap_or(p).max((p + 1).saturating_sub(limit));
-        let mut rows = vec![u32::MAX; s];
-        for (slot, row) in (first..=p).enumerate() {
-            rows[slot] = row as u32;
+        if draft {
+            let mut rows = vec![u32::MAX; s];
+            for (slot, row) in (first..=p).enumerate() {
+                rows[slot] = row as u32;
+            }
+            write_words(&sc.mtp_sel, &rows)?;
         }
-        write_words(&sc.mtp_sel, &rows)?;
-        let token = sc.mtp_io.view(0, &[1])?;
-        k::embed(ctx, pass, &self.embed, &token, &sc.mtp_emb, 1)?;
+        k::embed(ctx, pass, &self.embed, token, &sc.mtp_emb, 1)?;
         pass.memory_barrier()?;
         let e = sc.mtp_emb.view(0, &[cfg.hidden])?;
         let cat_e = sc.mtp_cat.view(0, &[cfg.hidden])?;
@@ -1219,6 +1227,7 @@ impl Glm53Model {
                     gate: &sc.kgate,
                     beta: &sc.kbeta,
                     out_gate: &sc.kog,
+                    edges: Some(&sc.kedges),
                 };
                 let snap = snap.map(|row| k::KdaSnapshot {
                     row,
@@ -1370,6 +1379,7 @@ impl Glm53Model {
                     &sc.scores,
                     &sc.denom,
                     &sc.lat,
+                    &sc.dsa_partial,
                     m,
                     s,
                     1.0 / (cfg.key_dim as f32).sqrt(),
