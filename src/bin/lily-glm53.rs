@@ -104,7 +104,8 @@ enum Cmd {
         chat: Option<String>,
     },
     /// Step time by row count: after a prompt, forward passes of 1 to 4
-    /// rows (every row's logits, as a verify pass), each rewound; medians.
+    /// rows (every row's logits, as a verify pass), each from the prompt's
+    /// state (restored); medians.
     Rows {
         #[arg(long)]
         model: PathBuf,
@@ -548,20 +549,38 @@ fn rows(
     prompt_len: usize,
     n: usize,
 ) -> Result<()> {
+    use lily::engine::DecodeStateApi;
+    anyhow::ensure!(n > 0, "--n must be at least 1");
     let tok = lily::tokenizer::Tokenizer::from_gguf(path)?;
     let mut ids = tok.encode("[gMASK]<sop>")?;
     let body = tok.encode(&std::fs::read_to_string(text)?)?;
-    ids.extend_from_slice(&body[..prompt_len - ids.len()]);
+    anyhow::ensure!(
+        prompt_len > ids.len(),
+        "--prompt-len must exceed the {}-token prefix",
+        ids.len()
+    );
+    let used = prompt_len - ids.len();
+    anyhow::ensure!(
+        body.len() >= used + 4,
+        "the text has {} tokens, {} needed",
+        body.len(),
+        used + 4
+    );
+    ids.extend_from_slice(&body[..used]);
     let ctx = MetalContext::new()?;
     let model = Glm53Model::load(&ctx, path)?;
     let mut sc = model.new_scratch(&ctx)?;
     let mut st = model.new_state(&ctx, prompt_len + 16)?;
     model.prefill(&ctx, &mut st, &mut sc, &ids)?;
+    // Every timed pass starts from the prompt's state: the recurrent parts
+    // (KDA, indexer tails) restored, the caches rewritten from the position.
+    let snap = st.snapshot(&ctx)?;
     let mut line = format!("rows: prompt {prompt_len}:");
     for m in [1usize, 2, 3, 4, 1] {
-        let toks: Vec<u32> = body[prompt_len..prompt_len + m].to_vec();
+        let toks: Vec<u32> = body[used..used + m].to_vec();
         let mut t = Vec::with_capacity(n);
         for _ in 0..n {
+            st.restore(&ctx, &snap)?;
             let s = Instant::now();
             if m == 1 {
                 model.forward(&ctx, &mut st, &mut sc, &toks, true)?;
@@ -569,7 +588,6 @@ fn rows(
                 model.forward_all_logits(&ctx, &mut st, &mut sc, &toks)?;
             }
             t.push(s.elapsed().as_secs_f64() * 1e3);
-            st.pos -= m;
         }
         t.sort_by(f64::total_cmp);
         line += &format!(" m={m} {:.2} ms (p10 {:.2})", t[n / 2], t[n / 10]);
