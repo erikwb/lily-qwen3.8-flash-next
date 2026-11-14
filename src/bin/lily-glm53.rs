@@ -57,6 +57,14 @@ enum Cmd {
         /// rendering ds4's 100-case references were scored with.
         #[arg(long)]
         legacy: bool,
+        /// Raw text: the prompt after `[gMASK]<sop>` with no chat template,
+        /// the continuation right after it (the fixture needs no responses).
+        #[arg(long)]
+        raw: bool,
+        /// Write every scored token's NLL, greedy hit and top-2 margin to
+        /// this file (tab-separated: case, index, target, nll, hit, margin).
+        #[arg(long)]
+        dump: Option<PathBuf>,
     },
     /// Chat: renders one user message with the GGUF's template and decodes
     /// greedily, printing the text.
@@ -148,8 +156,8 @@ fn run() -> Result<()> {
         Cmd::Generate { model, tokens, n } => {
             generate(&model, &parse_tokens(&tokens)?, n)
         }
-        Cmd::Score { model, fixture, effort, limit, legacy } => {
-            score(&model, &fixture, &effort, limit, legacy)
+        Cmd::Score { model, fixture, effort, limit, legacy, raw, dump } => {
+            score(&model, &fixture, &effort, limit, legacy, raw, dump.as_deref())
         }
         Cmd::Chat { model, prompt, n, think } => chat(&model, &prompt, n, think),
         Cmd::Spec { model, text, prompt_len, n, runs, chat } => {
@@ -294,8 +302,12 @@ fn score(
     effort: &str,
     limit: Option<usize>,
     legacy: bool,
+    raw: bool,
+    dump: Option<&std::path::Path>,
 ) -> Result<()> {
     use lily::tokenizer::Tokenizer;
+    use std::io::Write as _;
+    let mut dump = dump.map(std::fs::File::create).transpose()?;
     let tok = Tokenizer::from_gguf(path)?;
     let ctx = MetalContext::new()?;
     let model = Glm53Model::load(&ctx, path)?;
@@ -326,8 +338,11 @@ fn score(
         };
         let prompt = std::fs::read_to_string(file("prompts", cols[1]))?;
         let cont = std::fs::read_to_string(file("continuations", cols[2]))?;
-        let resp: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(file("responses", cols[3]))?)?;
+        let resp: serde_json::Value = if raw {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&std::fs::read(file("responses", cols[3]))?)?
+        };
         let msg = &resp["choices"][0]["message"];
         let reasoning = msg["reasoning"]
             .as_str()
@@ -336,7 +351,9 @@ fn score(
         let api_prompt = resp["usage"]["prompt_tokens"].as_u64().unwrap_or(0) as usize;
         // ds4's render_glm_references.py: the official template with the
         // API's reasoning in the prefix.
-        let rendered = if legacy {
+        let rendered = if raw {
+            format!("[gMASK]<sop>{prompt}")
+        } else if legacy {
             format!("[gMASK]<sop><|user|>{prompt}<|assistant|><think></think>")
         } else {
             format!(
@@ -363,9 +380,27 @@ fn score(
             let logits = sc.logits.to_f32()?;
             for r in 0..chunk.len() {
                 let row = &logits[r * vocab..(r + 1) * vocab];
-                let target = c_ids[ci * lily::glm53::model::MAX_ROWS + r] as usize;
-                nll -= log_softmax_at(row, target);
-                let hit = argmax(row) == target;
+                let at = ci * lily::glm53::model::MAX_ROWS + r;
+                let target = c_ids[at] as usize;
+                let lp = log_softmax_at(row, target);
+                nll -= lp;
+                let top = argmax(row);
+                let hit = top == target;
+                if let Some(f) = dump.as_mut() {
+                    let second = row
+                        .iter()
+                        .enumerate()
+                        .filter(|&(i, _)| i != top)
+                        .map(|(_, &v)| v)
+                        .fold(f32::NEG_INFINITY, f32::max);
+                    writeln!(
+                        f,
+                        "{case}\t{at}\t{target}\t{:.6}\t{}\t{:.4}",
+                        -lp,
+                        u8::from(hit),
+                        row[top] - second
+                    )?;
+                }
                 agree += usize::from(hit);
                 if ci == 0 && r == 0 {
                     first = hit;
