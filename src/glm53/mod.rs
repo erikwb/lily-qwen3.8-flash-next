@@ -4,6 +4,8 @@
 //! loads ds4's published GGUF as it is.
 
 pub mod config;
+pub mod model;
 pub mod reference;
 
 pub use config::{Config, LayerKind};
+pub use model::{Glm53Model, Glm53State, LayerTrace, Scratch};

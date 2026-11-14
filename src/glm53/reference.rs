@@ -17,6 +17,8 @@
 
 use std::ops::Range;
 
+use rayon::prelude::*;
+
 use anyhow::{Context as _, Result, ensure};
 use half::f16;
 
@@ -65,13 +67,14 @@ impl Mat {
     /// `y = W x`.
     pub fn mv(&self, x: &[f32]) -> Vec<f32> {
         assert_eq!(x.len(), self.cols, "matvec width");
-        (0..self.rows).map(|r| dot(self.row(r), x)).collect()
+        (0..self.rows).into_par_iter().map(|r| dot(self.row(r), x)).collect()
     }
 
     /// `y[r] = W[r] . x[r / rows_per_x]`: per-head projections whose input
     /// differs per group of rows (`attn_k_b`, `attn_v_b`).
     pub fn mv_grouped(&self, x: &[f32], rows_per_x: usize) -> Vec<f32> {
         (0..self.rows)
+            .into_par_iter()
             .map(|r| {
                 let g = r / rows_per_x;
                 dot(self.row(r), &x[g * self.cols..(g + 1) * self.cols])
@@ -738,6 +741,7 @@ pub fn ffn(
         let u =
             src.rows(&format!("blk.{il}.ffn_up_exps.weight"), e * ff..(e + 1) * ff)?;
         let mid: Vec<f32> = (0..ff)
+            .into_par_iter()
             .map(|r| {
                 let gv = dot(&g[r * cfg.hidden..(r + 1) * cfg.hidden], xn);
                 let uv = dot(&u[r * cfg.hidden..(r + 1) * cfg.hidden], xn);
@@ -751,8 +755,12 @@ pub fn ffn(
             &format!("blk.{il}.ffn_down_exps.weight"),
             e * cfg.hidden..(e + 1) * cfg.hidden,
         )?;
-        for (r, m) in moe.iter_mut().enumerate() {
-            *m += dot(&dn[r * ff..(r + 1) * ff], &mids[k]);
+        let part: Vec<f32> = (0..cfg.hidden)
+            .into_par_iter()
+            .map(|r| dot(&dn[r * ff..(r + 1) * ff], &mids[k]))
+            .collect();
+        for (m, p) in moe.iter_mut().zip(part) {
+            *m += p;
         }
     }
     for (o, m) in out.iter_mut().zip(&moe) {
