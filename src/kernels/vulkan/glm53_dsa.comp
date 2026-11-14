@@ -22,11 +22,15 @@
 // The high and low f16 parts of four f32 values: the high part is the
 // value with its mantissa cut to f16's ten bits (exact in f16 in its
 // normal range), the low part the f16 rounding of the rest. (Taken as
-// f - f32(f16(f)), the compiler folded the low part to zero.) Valid for
-// |f| <= 65504: the scores kernel sends a tile with any query outside that
-// range (or not finite) through f32 instead; the latent mix's weights are
-// exp(score - max) in [0, 1]. Values below f16's normal range (6.1e-5)
-// keep about 2^-24 of absolute accuracy, not 22 significant bits.
+// f - f32(f16(f)), the compiler folded the low part to zero.) Their sum
+// keeps about 22 significant bits while the rest is itself in f16's
+// normal range (values from about 0.06 up); below that it goes subnormal
+// and the error is bounded in absolute terms, about 2^-24 (6e-8) under
+// IEEE rounding: 1e-4 comes back with a relative error of 1.7e-4, 0.01
+// with 9e-7. These bound the reconstruction, not a dot product with
+// cancellation. Valid for |f| <= 65504: the scores kernel sends a tile
+// with any query outside that range (or NaN) through f32 instead; the
+// latent mix's weights are exp(score - max) in [0, 1].
 void dsa_split(vec4 f, out f16vec4 hi, out f16vec4 lo) {
     const vec4 h = uintBitsToFloat(floatBitsToUint(f) & uvec4(0xffffe000u));
     hi = f16vec4(h);

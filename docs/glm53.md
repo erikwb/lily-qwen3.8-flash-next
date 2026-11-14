@@ -72,11 +72,13 @@ gives plain decoding's tokens only up to such ties.
 - Prompt runs compute DSA attention on the matrix units: the f32 queries
   and attention weights are split into an f16 high part (the value with its
   mantissa cut to ten bits) and the f16 rounding of the rest, multiplied
-  with the f16 latent rows into f32 accumulators: about 22 significant bits
-  for values in f16's normal range, an absolute 2^-24 below it. A score
-  tile whose queries leave f16's range (or are not finite) is computed in
-  f32. `LILY_GLM53_DSA_F32=1` keeps prompt runs on the f32 kernels. Decode
-  and verify rows compute attention in f32.
+  with the f16 latent rows into f32 accumulators. The split keeps about 22
+  significant bits while the rest is in f16's normal range (values from
+  about 0.06 up); below that its error is bounded in absolute terms, about
+  2^-24 (6e-8): 1e-4 comes back with a relative error of 1.7e-4. A score
+  tile whose queries leave f16's range (or are NaN) is computed in f32.
+  `LILY_GLM53_DSA_F32` (set to anything) keeps prompt runs on the f32
+  kernels. Decode and verify rows compute attention in f32.
 - The hyper-connection control projection scales its sums by the RMS after
   the dot products (ds4 normalizes first): the products differ in rounding
   only.
