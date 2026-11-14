@@ -529,6 +529,54 @@ fn kda_prefill_chunks_are_bit_exact() {
     }
 }
 
+/// The indexer's top-k at the kept-count boundary (511, 512, 513 and 1 025
+/// complete pools; the top 512 kept) with random, all-equal and few-valued
+/// scores: the k highest, ties to the lower pool, in pool order, then the
+/// incomplete pool's tokens, padding past the count.
+#[test]
+fn indexer_topk_boundaries_and_ties() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(77);
+    let (k, s) = (512usize, 2056usize);
+    for pools in [511usize, 512, 513, 1025] {
+        for pattern in 0..3 {
+            let cap = pools + 1;
+            let sc: Vec<f32> = match pattern {
+                0 => f32s(&mut rng, cap, -1.0, 1.0),
+                1 => vec![0.25; cap],
+                _ => (0..cap).map(|_| (rng.gen_range(0..4u32) as f32) * 0.5).collect(),
+            };
+            let pos0 = 4 * pools + 1; // visible 4 pools + 2: a tail of two
+            let scores = tensor(&ctx, &sc);
+            let sel = Tensor::zeros(&ctx, &[s], DType::U32).unwrap();
+            let count = Tensor::zeros(&ctx, &[1], DType::U32).unwrap();
+            run(&ctx, |p| {
+                indexer_topk(&ctx, p, &scores, &sel, &count, 1, cap, s, pos0, k)
+                    .unwrap()
+            });
+            let mut order: Vec<usize> = (0..pools).collect();
+            order.sort_by(|&a, &b| sc[b].total_cmp(&sc[a]).then(a.cmp(&b)));
+            let mut kept: Vec<usize> = order[..k.min(pools)].to_vec();
+            kept.sort();
+            let mut expect: Vec<u32> =
+                kept.iter().flat_map(|&p| (4 * p as u32)..(4 * p as u32 + 4)).collect();
+            expect.extend([4 * pools as u32, 4 * pools as u32 + 1]);
+            let got = sel.to_u32().unwrap();
+            assert_eq!(
+                count.to_u32().unwrap()[0] as usize,
+                expect.len(),
+                "{pools} {pattern}"
+            );
+            assert_eq!(
+                &got[..expect.len()],
+                &expect[..],
+                "{pools} pools, pattern {pattern}"
+            );
+            assert!(got[expect.len()..].iter().all(|&v| v == u32::MAX));
+        }
+    }
+}
+
 /// Runs of more than one prepare chunk (KDA_CHUNK rows): 75-row runs of
 /// three chunks each, the second run continuing the first's state.
 #[test]
