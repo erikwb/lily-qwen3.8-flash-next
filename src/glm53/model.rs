@@ -481,6 +481,8 @@ pub struct Scratch {
     klow: Tensor,
     klow2: Tensor,
     kout: Tensor,
+    /// The conv windows before each chunk of a prompt run's KDA prepare.
+    kedges: Tensor,
     // DSA
     qr: Tensor,
     q: Tensor,
@@ -594,6 +596,7 @@ impl Scratch {
             klow: f(m * cfg.kda_dim)?,
             klow2: f(m * cfg.kda_dim)?,
             kout: f(m * p)?,
+            kedges: f(k::kda_edges_len(m, cfg.kda_heads))?,
             qr: f(m * cfg.q_lora)?,
             q: f(m * hq)?,
             kv_raw: f(m * cfg.kv_lora)?,
@@ -1222,6 +1225,7 @@ impl Glm53Model {
                     gate: &sc.kgate,
                     beta: &sc.kbeta,
                     out_gate: &sc.kog,
+                    edges: Some(&sc.kedges),
                 };
                 let snap = snap.map(|row| k::KdaSnapshot {
                     row,

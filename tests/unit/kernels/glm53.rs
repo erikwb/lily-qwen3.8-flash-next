@@ -397,8 +397,16 @@ fn kda_compare(tokens: usize, chunk: usize, seed: u64) {
         let og = f32s(&mut rng, n * p, -2.0, 2.0);
         let (tq, tk, tv, tg, tb, tog) = (t(&q), t(&k), t(&v), t(&g), t(&b), t(&og));
         let out = zeros(&ctx, n * p);
-        let inputs =
-            KdaInputs { q: &tq, k: &tk, v: &tv, gate: &tg, beta: &tb, out_gate: &tog };
+        let edges = zeros(&ctx, kda_edges_len(n, heads));
+        let inputs = KdaInputs {
+            q: &tq,
+            k: &tk,
+            v: &tv,
+            gate: &tg,
+            beta: &tb,
+            out_gate: &tog,
+            edges: Some(&edges),
+        };
         run(&ctx, |pass| {
             kda(&ctx, pass, &params, &inputs, &conv_state, &state, &out, n, None)
                 .unwrap()
@@ -432,6 +440,13 @@ fn kda_decode_matches_cpu() {
 #[test]
 fn kda_prefill_matches_cpu() {
     kda_compare(37, 16, 60);
+}
+
+/// Runs of more than one prepare chunk (KDA_CHUNK rows): 75-row runs of
+/// three chunks each, the second run continuing the first's state.
+#[test]
+fn kda_prefill_long_runs_match_cpu() {
+    kda_compare(150, 75, 75);
 }
 
 #[test]
@@ -1188,6 +1203,116 @@ fn moe_timing() {
     }
 }
 
+/// One-token KDA at the model's shape (64 heads), best of five serial
+/// passes of 34 layers' calls over 34 states (146 MB: as in a step); then a
+/// 1 024-row prompt run, best of three passes of three layers. (The prompt
+/// run's q, k, v and gate are prepared in place: later passes see their
+/// silu'd values, the same work.)
+#[test]
+#[ignore = "timing only"]
+fn kda_decode_timing() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(73);
+    let heads = 64;
+    let p = heads * 128;
+    let mk = |rng: &mut StdRng, n: usize, lo: f32, hi: f32| {
+        tensor(&ctx, &f32s(rng, n, lo, hi))
+    };
+    let (q, k, v) = (
+        mk(&mut rng, p, -1.0, 1.0),
+        mk(&mut rng, p, -1.0, 1.0),
+        mk(&mut rng, p, -1.0, 1.0),
+    );
+    let (g, beta, og) = (
+        mk(&mut rng, p, -1.0, 1.0),
+        mk(&mut rng, heads, -1.0, 1.0),
+        mk(&mut rng, p, -1.0, 1.0),
+    );
+    let convs: Vec<Tensor> = (0..3).map(|_| mk(&mut rng, 4 * p, -0.5, 0.5)).collect();
+    let (a_log, dt, on) = (
+        mk(&mut rng, heads, -1.0, 0.0),
+        mk(&mut rng, p, -0.5, 0.5),
+        mk(&mut rng, 128, 0.5, 1.5),
+    );
+    let layers: Vec<(Tensor, Tensor)> = (0..34)
+        .map(|_| (zeros(&ctx, 9 * p), mk(&mut rng, heads * 128 * 128, -0.1, 0.1)))
+        .collect();
+    let out = zeros(&ctx, p);
+    let edges = zeros(&ctx, kda_edges_len(1024, heads));
+    let params = KdaParams {
+        q_conv: &convs[0],
+        k_conv: &convs[1],
+        v_conv: &convs[2],
+        a_log: &a_log,
+        dt_bias: &dt,
+        o_norm: &on,
+        heads,
+        lower_bound: -5.0,
+        eps: 1e-5,
+    };
+    let x = KdaInputs {
+        q: &q,
+        k: &k,
+        v: &v,
+        gate: &g,
+        beta: &beta,
+        out_gate: &og,
+        edges: Some(&edges),
+    };
+    let mut best = f64::MAX;
+    for _ in 0..5 {
+        let pass = ctx.begin().unwrap();
+        for (conv, st) in &layers {
+            kda(&ctx, &pass, &params, &x, conv, st, &out, 1, None).unwrap();
+        }
+        let t = std::time::Instant::now();
+        pass.commit_wait().unwrap();
+        best = best.min(t.elapsed().as_secs_f64());
+    }
+    println!("kda_decode {:8.1} us a layer", best / 34.0 * 1e6);
+    // A prompt run of 1 024 rows (prepare, recurrence, output), three layers.
+    let n = 1024;
+    let big = |rng: &mut StdRng, w: usize| mk(rng, n * w, -1.0, 1.0);
+    let (q, k, v) = (big(&mut rng, p), big(&mut rng, p), big(&mut rng, p));
+    let (g, beta, og) = (big(&mut rng, p), big(&mut rng, heads), big(&mut rng, p));
+    let out = zeros(&ctx, n * p);
+    let x = KdaInputs {
+        q: &q,
+        k: &k,
+        v: &v,
+        gate: &g,
+        beta: &beta,
+        out_gate: &og,
+        edges: Some(&edges),
+    };
+    let mut best = f64::MAX;
+    for _ in 0..3 {
+        let pass = ctx.begin().unwrap();
+        for (conv, st) in &layers[..3] {
+            kda(&ctx, &pass, &params, &x, conv, st, &out, n, None).unwrap();
+        }
+        let t = std::time::Instant::now();
+        pass.commit_wait().unwrap();
+        best = best.min(t.elapsed().as_secs_f64());
+    }
+    println!("kda_prefill 1024 rows {:8.1} us a layer", best / 3.0 * 1e6);
+    // With LILY_KERNEL_PROFILE: each kernel alone, per layer of the run.
+    let mut by: Vec<(&str, f64)> = Vec::new();
+    for p in crate::metal::profile::take() {
+        for k in &p.kernels {
+            match by.iter_mut().find(|(n, _)| *n == k.name) {
+                Some(e) => e.1 += k.gpu_secs,
+                None => by.push((k.name, k.gpu_secs)),
+            }
+        }
+    }
+    for (name, secs) in by {
+        if name != "glm53_kda_decode" {
+            println!("kda_   {name:28} {:8.1} us a layer", secs / 9.0 * 1e6);
+        }
+    }
+}
+
 #[test]
 fn kda_snapshot_is_the_state_after_its_row() {
     let ctx = ctx();
@@ -1238,8 +1363,16 @@ fn kda_snapshot_is_the_state_after_its_row() {
         let og = f32s(&mut rng, n * p, -2.0, 2.0);
         let (tq, tk, tv, tg, tb, tog) = (t(&q), t(&k), t(&v), t(&g), t(&b), t(&og));
         let out = zeros(&ctx, n * p);
-        let inputs =
-            KdaInputs { q: &tq, k: &tk, v: &tv, gate: &tg, beta: &tb, out_gate: &tog };
+        let edges = zeros(&ctx, kda_edges_len(n, heads));
+        let inputs = KdaInputs {
+            q: &tq,
+            k: &tk,
+            v: &tv,
+            gate: &tg,
+            beta: &tb,
+            out_gate: &tog,
+            edges: Some(&edges),
+        };
         let snap_conv = zeros(&ctx, 9 * p);
         let snap_state = zeros(&ctx, heads * 128 * 128);
         let snap = (n == 3).then_some(KdaSnapshot {

@@ -725,11 +725,14 @@ void main() {
 // silu'd, normalized q and k, silu'd v and the decay in place; the
 // recurrence walks the tokens for four value rows per threadgroup; output
 // normalizes and gates.
-// prepare: Grid heads. Buffers: 0 q, 1 k, 2 v, 3 raw_gate (-> decay),
-// 4 q_conv, 5 k_conv, 6 v_conv, 7 a_log, 8 dt_bias, 9 conv_state,
-// 10 conv snapshot. Params: 11 n_heads, 12 n_rows, 13 lower_bound,
-// 14 snap_row: after that token the conv window is also copied to the
-// snapshot (speculative decoding's rollback; ~0u for none).
+// prepare: Grid (heads, chunks of `chunk` tokens): each threadgroup walks
+// its chunk with the conv window in registers (one threadgroup a head
+// walking the whole run took 2.0 ms at 1 024 rows; 2026-11-14). Buffers:
+// 0 q, 1 k, 2 v, 3 raw_gate (-> decay), 4 q_conv, 5 k_conv, 6 v_conv,
+// 7 a_log, 8 dt_bias, 9 conv_state, 10 conv snapshot, 11 edges (chunks
+// past the first). Params: 12 n_heads, 13 n_rows, 14 lower_bound,
+// 15 snap_row: after that token the conv window is also copied to the
+// snapshot (speculative decoding's rollback; ~0u for none), 16 chunk.
 // ---------------------------------------------------------------------------
 #ifdef KERNEL_glm53_kda_prefill_prepare
 shared float sq[128];
@@ -739,52 +742,68 @@ shared float reduce_k[4];
 void main() {
     const uint D = 128u;
     const uint HISTORY = 3u;
-    const uint n_heads = arg_u32(11);
-    const uint n_rows = arg_u32(12);
-    const float lower_bound = arg_f32(13);
-    const uint snap_row = arg_u32(14);
+    const uint n_heads = arg_u32(12);
+    const uint n_rows = arg_u32(13);
+    const float lower_bound = arg_f32(14);
+    const uint snap_row = arg_u32(15);
+    const uint chunk = arg_u32(16);
+    const bool use_edges = arg_u32(17) != 0u;
     const uint head = gl_WorkGroupID.x;
+    const uint c = gl_WorkGroupID.y;
     const uint tid = gl_LocalInvocationIndex;
     const uint lane = gl_SubgroupInvocationID;
     const uint sg = gl_SubgroupID;
     const uint projection = n_heads * D;
     const uint channel = head * D + tid;
-    const uint64_t qs = arg(9);
-    const uint64_t ks = qs + 4u * HISTORY * projection;
-    const uint64_t vs = ks + 4u * HISTORY * projection;
+    // The window before the chunk: the conv state for a single chunk, else
+    // the edge copy (glm53_kda_prefill_edges; the last chunk rewrites the
+    // conv state while the first may still read it).
+    const uint64_t win = use_edges ? arg(11) + 4u * uint64_t(c) * 9u * projection : arg(9);
+    float wq[3], wk[3], wv[3];
+    [[unroll]] for (uint w = 0u; w < HISTORY; w++) {
+        wq[w] = F32(win).v[w * projection + channel];
+        wk[w] = F32(win).v[(HISTORY + w) * projection + channel];
+        wv[w] = F32(win).v[(2u * HISTORY + w) * projection + channel];
+    }
+    float cq[4], ck[4], cv[4];
+    [[unroll]] for (uint w = 0u; w < 4u; w++) {
+        cq[w] = F32(arg(4)).v[channel * 4u + w];
+        ck[w] = F32(arg(5)).v[channel * 4u + w];
+        cv[w] = F32(arg(6)).v[channel * 4u + w];
+    }
+    const float dt = F32(arg(8)).v[channel];
     const float a = exp(F32(arg(7)).v[head]);
-    for (uint token = 0u; token < n_rows; token++) {
+    const uint first = c * chunk;
+    const uint last = min(first + chunk, n_rows);
+    for (uint token = first; token < last; token++) {
         const uint64_t index = uint64_t(token) * projection + channel;
-        float q_acc = 0.0, k_acc = 0.0, v_acc = 0.0;
-        [[unroll]] for (uint w = 0u; w < HISTORY; w++) {
-            q_acc = fma(F32(qs).v[w * projection + channel], F32(arg(4)).v[channel * 4u + w], q_acc);
-            k_acc = fma(F32(ks).v[w * projection + channel], F32(arg(5)).v[channel * 4u + w], k_acc);
-            v_acc = fma(F32(vs).v[w * projection + channel], F32(arg(6)).v[channel * 4u + w], v_acc);
-        }
         const float q_new = F32(arg(0) + 4u * index).v[0];
         const float k_new = F32(arg(1) + 4u * index).v[0];
         const float v_new = F32(arg(2) + 4u * index).v[0];
-        q_acc = fma(q_new, F32(arg(4)).v[channel * 4u + 3u], q_acc);
-        k_acc = fma(k_new, F32(arg(5)).v[channel * 4u + 3u], k_acc);
-        v_acc = fma(v_new, F32(arg(6)).v[channel * 4u + 3u], v_acc);
-        F32(qs).v[channel] = F32(qs).v[projection + channel];
-        F32(qs).v[projection + channel] = F32(qs).v[2u * projection + channel];
-        F32(qs).v[2u * projection + channel] = q_new;
-        F32(ks).v[channel] = F32(ks).v[projection + channel];
-        F32(ks).v[projection + channel] = F32(ks).v[2u * projection + channel];
-        F32(ks).v[2u * projection + channel] = k_new;
-        F32(vs).v[channel] = F32(vs).v[projection + channel];
-        F32(vs).v[projection + channel] = F32(vs).v[2u * projection + channel];
-        F32(vs).v[2u * projection + channel] = v_new;
+        const float raw_gate = F32(arg(3) + 4u * index).v[0];
+        float q_acc = 0.0, k_acc = 0.0, v_acc = 0.0;
+        [[unroll]] for (uint w = 0u; w < HISTORY; w++) {
+            q_acc = fma(wq[w], cq[w], q_acc);
+            k_acc = fma(wk[w], ck[w], k_acc);
+            v_acc = fma(wv[w], cv[w], v_acc);
+        }
+        q_acc = fma(q_new, cq[3], q_acc);
+        k_acc = fma(k_new, ck[3], k_acc);
+        v_acc = fma(v_new, cv[3], v_acc);
+        wq[0] = wq[1]; wq[1] = wq[2]; wq[2] = q_new;
+        wk[0] = wk[1]; wk[1] = wk[2]; wk[2] = k_new;
+        wv[0] = wv[1]; wv[1] = wv[2]; wv[2] = v_new;
         if (token == snap_row) {
-            [[unroll]] for (uint w = 0u; w < 9u; w++) {
-                F32(arg(10)).v[w * projection + channel] = F32(qs).v[w * projection + channel];
+            [[unroll]] for (uint w = 0u; w < HISTORY; w++) {
+                F32(arg(10)).v[w * projection + channel] = wq[w];
+                F32(arg(10)).v[(HISTORY + w) * projection + channel] = wk[w];
+                F32(arg(10)).v[(2u * HISTORY + w) * projection + channel] = wv[w];
             }
         }
         sq[tid] = q_acc / (1.0 + exp(-q_acc));
         sk[tid] = k_acc / (1.0 + exp(-k_acc));
         F32(arg(2) + 4u * index).v[0] = v_acc / (1.0 + exp(-v_acc));
-        const float gate = F32(arg(3) + 4u * index).v[0] + F32(arg(8)).v[channel];
+        const float gate = raw_gate + dt;
         F32(arg(3) + 4u * index).v[0] = exp(lower_bound * (1.0 / (1.0 + exp(-a * gate))));
         barrier();
         const float q_sumsq = subgroupAdd(sq[tid] * sq[tid]);
@@ -800,6 +819,34 @@ void main() {
         F32(arg(1) + 4u * index).v[0] = sk[tid] * inversesqrt(k_total + 1.0e-6);
         barrier();
     }
+    // The run's last chunk leaves the window after its last token.
+    if (last == n_rows) {
+        [[unroll]] for (uint w = 0u; w < HISTORY; w++) {
+            F32(arg(9)).v[w * projection + channel] = wq[w];
+            F32(arg(9)).v[(HISTORY + w) * projection + channel] = wk[w];
+            F32(arg(9)).v[(2u * HISTORY + w) * projection + channel] = wv[w];
+        }
+    }
+}
+#endif
+
+// The conv window before each chunk of glm53_kda_prefill_prepare (which
+// overwrites its rows in place), in the conv state's layout: edges[0] is
+// the conv state, edges[c][x][w] = x row c * chunk - 3 + w. Grid
+// (9 * projection / 256, chunks), 256 threads. Buffers: 0 q, 1 k, 2 v,
+// 3 conv state, 4 edges. Params: 5 projection, 6 chunk.
+#ifdef KERNEL_glm53_kda_prefill_edges
+void main() {
+    const uint projection = arg_u32(5);
+    const uint chunk = arg_u32(6);
+    const uint c = gl_WorkGroupID.y;
+    const uint o = gl_GlobalInvocationID.x; // [x][w][channel]
+    const uint x = o / (3u * projection);
+    const uint w = (o / projection) % 3u;
+    const uint ch = o % projection;
+    const uint64_t src = x == 0u ? arg(0) : x == 1u ? arg(1) : arg(2);
+    F32(arg(4)).v[c * 9u * projection + o] =
+        c == 0u ? F32(arg(3)).v[o] : F32(src).v[(c * chunk - 3u + w) * projection + ch];
 }
 #endif
 
@@ -819,20 +866,36 @@ void main() {
     const uint k0 = lane * 4u;
     const uint64_t sp = arg(5) + 4u * ((uint64_t(head) * D + value) * D + k0);
     vec4 h = F32x4(sp).v[0];
-    for (uint token = 0u; token < n_rows; token++) {
-        const uint64_t base = uint64_t(token) * projection + head * D;
-        const vec4 q4 = F32x4(arg(0) + 4u * (base + k0)).v[0];
-        const vec4 k4 = F32x4(arg(1) + 4u * (base + k0)).v[0];
-        const vec4 decay4 = F32x4(arg(3) + 4u * (base + k0)).v[0];
-        h *= decay4;
-        const float hk = subgroupAdd(dot(h, k4));
-        const float beta = 1.0 / (1.0 + exp(-F32(arg(4)).v[token * n_heads + head]));
-        const float delta_v = (F32(arg(2) + 4u * base).v[value] - hk) * beta;
-        h = fma(k4, vec4(delta_v), h);
-        const float result = subgroupAdd(dot(h, q4));
-        if (lane == 0u) F32(arg(6) + 4u * base).v[value] = result;
-        if (token == snap_row) {
-            F32x4(arg(7) + 4u * ((uint64_t(head) * D + value) * D + k0)).v[0] = h;
+    // Blocks of eight tokens, each block's inputs loaded before its first
+    // token is used (a token a loop step waited for its loads every step:
+    // 5.5 ms a call at 1 024 rows; 2026-11-14). Rows past n_rows load the
+    // last row and are skipped.
+    for (uint t0 = 0u; t0 < n_rows; t0 += 8u) {
+        vec4 qb[8], kb[8], db[8];
+        float vb[8], bb[8];
+        [[unroll]] for (uint u = 0u; u < 8u; u++) {
+            const uint token = min(t0 + u, n_rows - 1u);
+            const uint64_t base = uint64_t(token) * projection + head * D;
+            qb[u] = F32x4(arg(0) + 4u * (base + k0)).v[0];
+            kb[u] = F32x4(arg(1) + 4u * (base + k0)).v[0];
+            db[u] = F32x4(arg(3) + 4u * (base + k0)).v[0];
+            vb[u] = F32(arg(2) + 4u * base).v[value];
+            bb[u] = F32(arg(4)).v[token * n_heads + head];
+        }
+        [[unroll]] for (uint u = 0u; u < 8u; u++) {
+            const uint token = t0 + u;
+            if (token >= n_rows) break;
+            const uint64_t base = uint64_t(token) * projection + head * D;
+            h *= db[u];
+            const float hk = subgroupAdd(dot(h, kb[u]));
+            const float beta = 1.0 / (1.0 + exp(-bb[u]));
+            const float delta_v = (vb[u] - hk) * beta;
+            h = fma(kb[u], vec4(delta_v), h);
+            const float result = subgroupAdd(dot(h, qb[u]));
+            if (lane == 0u) F32(arg(6) + 4u * base).v[value] = result;
+            if (token == snap_row) {
+                F32x4(arg(7) + 4u * ((uint64_t(head) * D + value) * D + k0)).v[0] = h;
+            }
         }
     }
     F32x4(sp).v[0] = h;

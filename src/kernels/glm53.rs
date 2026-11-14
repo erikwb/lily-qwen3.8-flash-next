@@ -957,6 +957,17 @@ pub struct KdaInputs<'a> {
     pub gate: &'a Tensor,
     pub beta: &'a Tensor,
     pub out_gate: &'a Tensor,
+    /// Scratch for runs of more than [`KDA_CHUNK`] rows: the raw rows
+    /// before each chunk, [`kda_edges_len`] f32.
+    pub edges: Option<&'a Tensor>,
+}
+
+/// Tokens a threadgroup of the KDA prefill's prepare stage walks.
+pub const KDA_CHUNK: usize = 32;
+
+/// The f32 values of the edge scratch for runs of up to `rows` rows.
+pub fn kda_edges_len(rows: usize, heads: usize) -> usize {
+    rows.div_ceil(KDA_CHUNK) * 9 * heads * 128
 }
 
 /// Where a run of KDA tokens also leaves the conv window and state as they
@@ -1019,6 +1030,33 @@ pub fn kda(
             Grid::Threadgroups { groups: (1, p.heads, 1), threadgroup: (128, 1, 1) },
         );
     }
+    let chunks = rows.div_ceil(KDA_CHUNK);
+    let edges = match x.edges {
+        Some(e) if chunks > 1 => {
+            ensure!(e.numel() >= kda_edges_len(rows, p.heads), "KDA edges");
+            let k =
+                ctx.pipeline("glm53_kda_prefill_edges", SOURCE, MslVersion::V3_1)?;
+            pass.dispatch_at(
+                &k,
+                &[
+                    x.q.binding(),
+                    x.k.binding(),
+                    x.v.binding(),
+                    conv_state.binding(),
+                    e.binding(),
+                ],
+                &[&u32_bytes(proj), &u32_bytes(KDA_CHUNK)],
+                Grid::Threadgroups {
+                    groups: (9 * proj / 256, chunks, 1),
+                    threadgroup: (256, 1, 1),
+                },
+            )?;
+            pass.memory_barrier()?;
+            e
+        }
+        None if chunks > 1 => anyhow::bail!("KDA run of {rows} rows without edges"),
+        _ => conv_state,
+    };
     let prepare =
         ctx.pipeline("glm53_kda_prefill_prepare", SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
@@ -1035,14 +1073,17 @@ pub fn kda(
             p.dt_bias.binding(),
             conv_state.binding(),
             snap_conv.binding(),
+            edges.binding(),
         ],
         &[
             &u32_bytes(p.heads),
             &u32_bytes(rows),
             &f32_bytes(p.lower_bound),
             &u32_bytes(snap_row),
+            &u32_bytes(KDA_CHUNK),
+            &u32_bytes(usize::from(chunks > 1)),
         ],
-        Grid::Threadgroups { groups: (p.heads, 1, 1), threadgroup: (128, 1, 1) },
+        Grid::Threadgroups { groups: (p.heads, chunks, 1), threadgroup: (128, 1, 1) },
     )?;
     pass.memory_barrier()?;
     let recurrence =
