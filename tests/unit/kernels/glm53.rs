@@ -766,3 +766,117 @@ fn gemv_sets_match_single_gemvs() {
         }
     }
 }
+
+/// Bandwidth of the GEMVs at the model's shapes: `LILY_GLM53_REPEAT`
+/// (default 16) dispatches over four weight copies (so the cache does not
+/// hold them) in one pass, best of five passes.
+#[test]
+#[ignore = "timing only"]
+fn gemv_timing() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(66);
+    let repeat: usize = std::env::var("LILY_GLM53_REPEAT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(16);
+    let shapes = [
+        ("kda_v Q8_0 8192x4096", GgmlType::Q8_0, 4096, 8192, 1),
+        ("kda_out Q8_0 4096x8192", GgmlType::Q8_0, 8192, 4096, 1),
+        ("kda_q Q4_K 8192x4096", GgmlType::Q4K, 4096, 8192, 1),
+        ("shexp Q8_0 2048x4096", GgmlType::Q8_0, 4096, 2048, 1),
+        ("head Q8_0 154880x4096", GgmlType::Q8_0, 4096, 154880, 1),
+        ("kda_v Q8_0 m=4", GgmlType::Q8_0, 4096, 8192, 4),
+    ];
+    for (label, ty, cols, rows, m) in shapes {
+        let copies = if rows > 100_000 { 1 } else { 4 };
+        let ws: Vec<QWeight> = (0..copies)
+            .map(|_| {
+                let raw = random_blocks(&mut rng, ty, rows * cols);
+                QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap()
+            })
+            .collect();
+        let x = tensor(&ctx, &f32s(&mut rng, m * cols, -1.0, 1.0));
+        let y = zeros(&ctx, m * rows);
+        let mut best = f64::MAX;
+        for _ in 0..5 {
+            let pass = ctx.begin().unwrap();
+            for r in 0..repeat {
+                gemv(&ctx, &pass, &ws[r % copies], &x, &y, m).unwrap();
+            }
+            let t = std::time::Instant::now();
+            pass.commit_wait().unwrap();
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        let bytes = ws[0].row_bytes * rows;
+        let per = best / repeat as f64;
+        println!(
+            "{label:28} {:8.1} us  {:6.1} GB/s",
+            per * 1e6,
+            bytes as f64 / per / 1e9
+        );
+    }
+}
+
+/// The routed experts' kernels at the model's shapes (8 of 288 experts,
+/// gate/up IQ2_XXS 2048 x 4096, down Q2_K 4096 x 2048), one row, best of
+/// five passes of `LILY_GLM53_REPEAT` layers each over four weight copies.
+#[test]
+#[ignore = "timing only"]
+fn moe_timing() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(67);
+    let repeat: usize = std::env::var("LILY_GLM53_REPEAT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(16);
+    let (experts, hidden, ff, used) = (16, 4096, 2048, 8);
+    let mk = |rng: &mut StdRng, ty, cols, rows| {
+        let raw = random_blocks(rng, ty, rows * cols);
+        QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap()
+    };
+    let layers: Vec<(QWeight, QWeight, QWeight)> = (0..4)
+        .map(|_| {
+            (
+                mk(&mut rng, GgmlType::Iq2Xxs, hidden, experts * ff),
+                mk(&mut rng, GgmlType::Iq2Xxs, hidden, experts * ff),
+                mk(&mut rng, GgmlType::Q2K, ff, experts * hidden),
+            )
+        })
+        .collect();
+    let x = tensor(&ctx, &f32s(&mut rng, hidden, -1.0, 1.0));
+    let sel: Vec<u32> = (0..used as u32).map(|i| i * 2).collect();
+    let tsel =
+        Tensor::from_bytes(&ctx, bytemuck::cast_slice(&sel), &[used], DType::U32)
+            .unwrap();
+    let tw = tensor(&ctx, &vec![0.3f32; used]);
+    let mid = zeros(&ctx, used * ff);
+    let out = zeros(&ctx, hidden);
+    for (label, part) in [("gate_up", 0), ("down", 1)] {
+        let mut best = f64::MAX;
+        for _ in 0..5 {
+            let pass = ctx.begin().unwrap();
+            for r in 0..repeat {
+                let (g, u, d) = &layers[r % 4];
+                if part == 0 {
+                    moe_gate_up(
+                        &ctx, &pass, g, u, ff, &x, &tsel, &tw, &mid, 1, used, 10.0,
+                    )
+                    .unwrap();
+                } else {
+                    moe_down(&ctx, &pass, d, hidden, &mid, &tsel, None, &out, 1, used)
+                        .unwrap();
+                }
+            }
+            let t = std::time::Instant::now();
+            pass.commit_wait().unwrap();
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        let bytes = if part == 0 { 2 * used * ff * 1056 } else { used * hidden * 672 };
+        let per = best / repeat as f64;
+        println!(
+            "moe {label:24} {:8.1} us  {:6.1} GB/s",
+            per * 1e6,
+            bytes as f64 / per / 1e9
+        );
+    }
+}
