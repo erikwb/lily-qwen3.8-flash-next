@@ -615,12 +615,23 @@ fn spec(
             Some(Draw { params: &greedy, step: 0 }),
         )?;
         let mut plain = vec![sc.next_token.to_u32()?[0]];
+        // Plain decoding's top-1 minus top-2 logit at each token.
+        let mut margins = vec![f32::NAN];
         let _ = lily::metal::profile::take();
         let t = Instant::now();
         while plain.len() < n {
             let last = *plain.last().unwrap();
             model.forward(&ctx, &mut st, &mut sc, &[last], true)?;
-            plain.push(argmax(&sc.logits.to_f32()?[..model.cfg.vocab]) as u32);
+            let l = &sc.logits.to_f32()?[..model.cfg.vocab];
+            let top = argmax(l);
+            let second = l
+                .iter()
+                .enumerate()
+                .filter(|&(i, _)| i != top)
+                .map(|(_, &v)| v)
+                .fold(f32::NEG_INFINITY, f32::max);
+            margins.push(l[top] - second);
+            plain.push(top as u32);
         }
         let plain_s = t.elapsed().as_secs_f64();
         if ctx.profiling() {
@@ -681,6 +692,13 @@ fn spec(
         }
         out.truncate(n);
         let same = plain.iter().zip(&out).take_while(|(a, b)| a == b).count();
+        if same < n {
+            println!(
+                "first difference at token {same}: plain's top-2 margin there {:.4}, smallest margin before it {:.4}",
+                margins[same],
+                margins[1..same].iter().copied().fold(f32::INFINITY, f32::min)
+            );
+        }
         println!(
             "run {run}: plain {:.2} tok/s; speculative {:.2} tok/s, {steps} steps, accepted {accepted}/{steps} ({:.0}%); same first {same}/{n} tokens; pos {}; per step: verify {:.2} ms, finish {:.2} ms; plain step {:.2} ms",
             n as f64 / plain_s,
