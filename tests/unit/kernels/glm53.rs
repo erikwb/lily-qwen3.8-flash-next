@@ -1007,6 +1007,41 @@ fn gemm_matches_cpu() {
     }
 }
 
+/// The dense GEMM walks K in 64-deep steps: widths of 64 are computed,
+/// widths that are not a multiple of 64 are refused before anything is
+/// encoded.
+#[test]
+fn gemm_k_widths() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(75);
+    let (rows, m) = (40, 5);
+    for cols in [32usize, 64, 96] {
+        let raw = random_blocks(&mut rng, GgmlType::Q8_0, rows * cols);
+        let w = QWeight::from_bytes(&ctx, &raw, GgmlType::Q8_0, cols, rows).unwrap();
+        let x = f32s(&mut rng, m * cols, -1.0, 1.0);
+        let tx = tensor(&ctx, &x);
+        let y = zeros(&ctx, m * rows);
+        let pass = ctx.begin().unwrap();
+        let r = gemm(&ctx, &pass, &w, &tx, &y, m);
+        pass.commit_wait().unwrap();
+        if cols % 64 != 0 {
+            assert!(r.is_err(), "K = {cols} accepted");
+            continue;
+        }
+        r.unwrap();
+        let cpu = mat(GgmlType::Q8_0, &raw, rows, cols);
+        let g = y.to_f32().unwrap();
+        for i in 0..m {
+            let e = cpu.mv(&x[i * cols..(i + 1) * cols]);
+            let scale: f32 =
+                (e.iter().map(|v| v * v).sum::<f32>() / rows as f32).sqrt();
+            for (a, b) in g[i * rows..(i + 1) * rows].iter().zip(&e) {
+                assert!((a - b).abs() <= 2e-2 * scale + 1e-6, "K = {cols}: {a} vs {b}");
+            }
+        }
+    }
+}
+
 #[test]
 fn gemm_batched_matches_grouped_gemv() {
     // attn_k_b's shape for 4 heads, 70 rows: per head a 512 x 256 block.

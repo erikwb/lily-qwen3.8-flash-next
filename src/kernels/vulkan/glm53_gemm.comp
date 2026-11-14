@@ -117,7 +117,7 @@ void gd_decode8(uint64_t row, uint k, out float w[8]) {
 // order, and a subgroup multiplies its 16 rows of X against all 64 columns,
 // reading X straight from device memory as floats and rounding to bfloat
 // only the elements its lanes hold (a lane of an A operand uses every other
-// value of eight). K must be a multiple of 64.
+// value of eight). K must be a multiple of 64 (gemm_with checks it).
 void main() {
     const uint M = arg_u32(3);
     const uint N = arg_u32(4);

@@ -277,7 +277,12 @@ pub fn gemm_with(
     l: GemmLayout,
 ) -> Result<()> {
     check_f32(&[x, y])?;
-    ensure!(w.cols.is_multiple_of(32), "GEMM row of {} values", w.cols);
+    // The kernel walks K in 64-deep steps with no tail.
+    ensure!(
+        w.cols.is_multiple_of(64),
+        "GEMM row of {} values (a multiple of 64)",
+        w.cols
+    );
     ensure!(
         l.ldx % 4 == 0 && l.x_batch % 4 == 0,
         "GEMM activations must be 16-byte aligned"
