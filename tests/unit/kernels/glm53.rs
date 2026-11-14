@@ -787,6 +787,11 @@ fn gemv_timing() {
         ("shexp Q8_0 2048x4096", GgmlType::Q8_0, 4096, 2048, 1),
         ("head Q8_0 154880x4096", GgmlType::Q8_0, 4096, 154880, 1),
         ("kda_v Q8_0 m=4", GgmlType::Q8_0, 4096, 8192, 4),
+        ("router F32 288x4096", GgmlType::F32, 4096, 288, 1),
+        ("kv_a Q8_0 512x4096", GgmlType::Q8_0, 4096, 512, 1),
+        ("q_a Q8_0 1536x4096", GgmlType::Q8_0, 4096, 1536, 1),
+        ("f_b Q8_0 8192x128", GgmlType::Q8_0, 128, 8192, 1),
+        ("attn_out Q8_0 4096x16384", GgmlType::Q8_0, 16384, 4096, 1),
     ];
     for (label, ty, cols, rows, m) in shapes {
         let copies = if rows > 100_000 { 1 } else { 4 };
