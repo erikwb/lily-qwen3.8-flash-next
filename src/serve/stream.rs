@@ -4,7 +4,7 @@
 
 use anyhow::Result;
 
-use super::tools::{ParsedToolCall, ToolSchema, parse_tool_call};
+use super::tools::{ParsedToolCall, ToolGrammar, ToolSchema, parse_tool_call_as};
 use crate::thinking::ReasoningScan;
 
 const THINK_END: &str = "</think>";
@@ -50,6 +50,8 @@ pub struct OutputParser<D: FnMut(&[u32]) -> Result<String>> {
     /// Text of the current phase not yet emitted.
     buf: String,
     tools: Option<Vec<ToolSchema>>,
+    /// The syntax of the model's tool calls.
+    tool_grammar: ToolGrammar,
     stop_strings: Vec<String>,
     raw: bool,
     /// Set once a stop string matched; further tokens are ignored.
@@ -83,6 +85,7 @@ impl<D: FnMut(&[u32]) -> Result<String>> OutputParser<D> {
             phase,
             buf: String::new(),
             tools: config.tools,
+            tool_grammar: ToolGrammar::Qwen,
             stop_strings: config.stop_strings,
             raw: config.raw,
             stopped: false,
@@ -92,6 +95,12 @@ impl<D: FnMut(&[u32]) -> Result<String>> OutputParser<D> {
             tool_call_ends_thinking: config.tool_call_ends_thinking,
             reasoning_scan: ReasoningScan::new(),
         }
+    }
+
+    /// Parses tool calls in `grammar` (Qwen's unless set).
+    pub fn with_tool_grammar(mut self, grammar: ToolGrammar) -> Self {
+        self.tool_grammar = grammar;
+        self
     }
 
     /// Where a `<tool_call>` ends the reasoning in `buf` (at a line start,
@@ -290,7 +299,7 @@ impl<D: FnMut(&[u32]) -> Result<String>> OutputParser<D> {
                     self.buf = rest;
                     self.phase = Phase::Content;
                     let tools = self.tools.as_deref().unwrap_or(&[]);
-                    match parse_tool_call(&block, tools) {
+                    match parse_tool_call_as(self.tool_grammar, &block, tools) {
                         Ok(call) => {
                             self.tool_calls_emitted += 1;
                             events.push(Event::ToolCall(call));

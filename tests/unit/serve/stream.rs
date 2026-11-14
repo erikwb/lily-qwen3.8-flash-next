@@ -417,3 +417,55 @@ fn a_stop_string_after_a_budget_close_ends_the_content() {
     assert_eq!(content, "The answer in");
     assert!(p.stopped);
 }
+
+/// The tool-call grammar is the model's: a GLM call is a call under GLM's
+/// grammar and the raw block under Qwen's (the default), and prose in a
+/// `<tool_call>` block is text under both.
+#[test]
+fn tool_calls_parse_in_the_model_s_grammar() {
+    use crate::serve::tools::ToolGrammar;
+    static GLM: &[&str] = &[
+        "<tool_call>",
+        "get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value>",
+        "</tool_call>",
+        "some prose",
+        "noargs",
+    ];
+    let tools = Some(
+        ToolSchema::from_request(&[serde_json::json!({"type": "function", "function": {
+            "name": "get_weather",
+            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}
+        }})])
+        .unwrap(),
+    );
+    let config = || ParserConfig {
+        thinking_open: false,
+        tools: tools.clone(),
+        stop_strings: vec![],
+        raw: false,
+        tool_call_ends_thinking: false,
+    };
+    let parse = |grammar: Option<ToolGrammar>, ids: &[u32]| {
+        let mut p = OutputParser::new(detok(GLM), config());
+        if let Some(g) = grammar {
+            p = p.with_tool_grammar(g);
+        }
+        text_of(&run(&mut p, ids))
+    };
+    let (_, content, calls) = parse(Some(ToolGrammar::Glm), &[0, 1, 2]);
+    assert_eq!(calls.len(), 1, "{content:?}");
+    assert_eq!(calls[0].name, "get_weather");
+    assert_eq!(calls[0].arguments, r#"{"city":"Paris"}"#);
+    let (_, _, calls) = parse(Some(ToolGrammar::Glm), &[0, 4, 2]);
+    assert_eq!((calls[0].name.as_str(), calls[0].arguments.as_str()), ("noargs", "{}"));
+    for grammar in [None, Some(ToolGrammar::Qwen)] {
+        let (_, content, calls) = parse(grammar, &[0, 1, 2]);
+        assert!(calls.is_empty());
+        assert!(content.contains("get_weather<arg_key>"), "{content:?}");
+    }
+    for grammar in [Some(ToolGrammar::Glm), Some(ToolGrammar::Qwen)] {
+        let (_, content, calls) = parse(grammar, &[0, 3, 2]);
+        assert!(calls.is_empty(), "prose became a call under {grammar:?}");
+        assert!(content.contains("some prose"), "{content:?}");
+    }
+}

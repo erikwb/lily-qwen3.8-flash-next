@@ -86,6 +86,8 @@ pub struct Tokenizer {
     /// nothink to keep histories prefix-cacheable. Newer templates
     /// (`preserve_thinking`) keep every block themselves.
     legacy_nothink_rewrite: bool,
+    /// The syntax of the model's tool calls (GLM's for a GGUF tokenizer).
+    tool_grammar: crate::serve::tools::ToolGrammar,
 }
 
 /// Everything a chat prompt render needs, in the template's own vocabulary.
@@ -109,6 +111,10 @@ impl Tokenizer {
     /// `tokenizer_config.json`'s `chat_template` second — newer HF exports
     /// use the standalone file, older ones inline it.
     pub fn from_model_dir(dir: &Path) -> Result<Self> {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if crate::gguf::is_gguf(dir) {
+            return Self::from_gguf(dir);
+        }
         let tokenizer_path = dir.join("tokenizer.json");
         let inner = tokenizers::Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| anyhow::anyhow!("{e}"))
@@ -128,6 +134,25 @@ impl Tokenizer {
 
         let template = Self::load_template(dir, &config)?;
         Self::new(inner, &config, template)
+    }
+
+    /// GLM's tokenizer and template from a GGUF file's metadata
+    /// (`crate::glm53::tokenizer`). The template renders an empty reasoning
+    /// block into earlier assistant turns itself, so lily's nothink rewrite
+    /// of history is off.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub fn from_gguf(path: &Path) -> Result<Self> {
+        let g = crate::gguf::Gguf::open(path)?;
+        let json = crate::glm53::tokenizer::tokenizer_json(&g)?;
+        let inner = tokenizers::Tokenizer::from_bytes(json.as_bytes())
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .context("building the GGUF's tokenizer")?;
+        let template = crate::glm53::tokenizer::chat_template(&g)?;
+        let mut t = Self::new(inner, &serde_json::Value::Null, template)?;
+        t.add_stop_tokens(&crate::glm53::tokenizer::stop_ids(&g)?);
+        t.legacy_nothink_rewrite = false;
+        t.tool_grammar = crate::serve::tools::ToolGrammar::Glm;
+        Ok(t)
     }
 
     /// The tokenizer from its parts: the loaded `tokenizer.json`, the parsed
@@ -205,7 +230,15 @@ impl Tokenizer {
             stop_tokens.push(id);
         }
 
-        Ok(Self { inner, text, specials, env, stop_tokens, legacy_nothink_rewrite })
+        Ok(Self {
+            inner,
+            text,
+            specials,
+            env,
+            stop_tokens,
+            legacy_nothink_rewrite,
+            tool_grammar: Default::default(),
+        })
     }
 
     /// Renders one prompt through the checkpoint's template exactly as given.
@@ -334,6 +367,11 @@ impl Tokenizer {
             ctx = minijinja::context! { ..ctx, ..Value::from_serialize(serde_json::Value::Object(extra)) };
         }
         Ok(template.render(ctx)?)
+    }
+
+    /// The syntax the model writes tool calls in.
+    pub fn tool_grammar(&self) -> crate::serve::tools::ToolGrammar {
+        self.tool_grammar
     }
 
     /// The id of the token spelled `text` (an added token such as

@@ -218,6 +218,7 @@ fn run() -> Result<()> {
     SAMPLER.set(params).expect("sampler set once");
     match checkpoint_model_type(&cli.model)?.as_str() {
         "qwen4_exp" => bench::<Qwen4ExpModel>(&cli),
+        lily::glm53::config::ARCH => bench::<lily::glm53::Glm53Model>(&cli),
         other => anyhow::bail!("unsupported model_type {other:?}"),
     }
 }

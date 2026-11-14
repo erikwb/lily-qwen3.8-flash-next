@@ -63,6 +63,16 @@ matches the weights (`docs/qwen38-flash-next-checkpoint-format.md`).
     --src ~/models/Qwen3.8-Flash-Next --dst ~/models/Qwen3.8-Flash-Next-lily-q4 --vision-only
 ```
 
+## reference/glm53/
+
+For GLM 5.3 Flash ([docs/glm53.md](../docs/glm53.md)): `gguf_dump.py` prints a
+GGUF's metadata and tensor table as JSON (`python3 -I gguf_dump.py FILE.gguf
+[tokenizer.json]`, header only), and `gguf_dequant_golden.c` writes
+`tests/goldens/gguf_dequant.bin`, the block decoders' golden values computed
+with ds4's quantizer and formulas (build it against ds4's `gguf-tools/quants.c`;
+the command is in the file's header). The model's own tool is the
+`lily-glm53` binary (`compare`, `score`, `bench`, `spec`, `chat`).
+
 ## reference/hf_reference.py
 
 Runs the model truncated to N layers on the CPU with transformers, either on

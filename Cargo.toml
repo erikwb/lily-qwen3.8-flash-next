@@ -28,6 +28,10 @@ name = "lily-probe"
 path = "src/bin/lily-probe.rs"
 
 [[bin]]
+name = "lily-glm53"
+path = "src/bin/lily-glm53.rs"
+
+[[bin]]
 name = "lily-vision-probe"
 path = "src/bin/lily-vision-probe.rs"
 
@@ -43,7 +47,8 @@ half = { version = "2.7.1", features = ["bytemuck"] }
 # generated them and the tool schemas in the order the client sent them.
 # Sorted keys made every multi-parameter tool call re-render differently
 # from the tokens the session cache holds.
-minijinja = { version = "2.5", features = ["loader", "json", "preserve_order"] }
+# `loop_controls` for GLM 5.3's template (`{% break %}`).
+minijinja = { version = "2.5", features = ["loader", "json", "preserve_order", "loop_controls"] }
 # `pycompat` supplies the Python string methods (`startswith`, `split`, ...)
 # that Hugging Face chat templates use and that minijinja does not implement
 # natively. Without it the Qwen template dies on `content.startswith(...)`.

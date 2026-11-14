@@ -7,6 +7,7 @@ pub mod attention;
 pub mod elementwise;
 pub mod gdn;
 pub mod gemm;
+pub mod glm53;
 pub mod hc;
 pub mod moe;
 pub mod norm;
