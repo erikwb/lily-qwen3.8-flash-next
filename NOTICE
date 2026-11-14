@@ -70,6 +70,31 @@ implementations here are lily's.
 
 --------------------------------------------------------------------------------
 
+ds4 (antirez's ds4.c)
+https://github.com/antirez/ds4
+
+  MIT License. Copyright (c) 2026 The ds4.c authors, Copyright (c)
+  2023-2026 The ggml authors, Copyright (c) 2023 DeepSeek.
+
+  lily serves GLM 5.3 Flash from ds4's published GGUF and follows ds4's
+  implementation of the model: the graph (src/glm53/), the GGUF block
+  formats and their value formulas including the IQ2_XXS grid and sign
+  tables (src/gguf.rs, src/kernels/vulkan/glm53_quant.glsl,
+  glm53_iq2xxs_grid.glsl), and these kernels in
+  src/kernels/vulkan/glm53.comp, ported from ds4's Metal sources:
+
+    glm53_kda_decode, glm53_kda_prefill_prepare / _recurrence / _output
+      metal/glm53_kda.metal (from the kimi-k3 branch)
+    glm53_indexer_pool_update
+      metal/dsv4_misc.metal, kernel_glm53_indexer_pool_update
+    the Sinkhorn split of glm53_hc_pre / glm53_hc_pre2
+      ds4.c, hc_split_sinkhorn_one
+
+  tools/reference/glm53/gguf_dequant_golden.c computes its golden values
+  with ds4's formulas and quantizer (gguf-tools/quants.c).
+
+--------------------------------------------------------------------------------
+
 The web dashboard (dashboard/, embedded in the server binary from
 dashboard/dist/) bundles:
 
