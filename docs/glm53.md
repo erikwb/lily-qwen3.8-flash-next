@@ -9,8 +9,9 @@ is, on the Linux/Vulkan backend. The implementation follows antirez's ds4
 - File: `GLM-5.3-Flash-Q2.gguf` from `antirez/glm-5.3-flash-gguf`, 96.5 GB
   (routed experts IQ2_XXS gate/up and Q2_K down, the rest Q8_0, Q4_K, BF16
   and F32). Other GLM GGUFs load only if every tensor has the shape and one of
-  the block types the kernels read (`src/glm53/schema.rs`); the loader refuses
-  anything else before mapping it.
+  the block types the kernels read, and the tensors one dispatch reads
+  together share a type (`src/glm53/schema.rs`); the loader refuses anything
+  else before mapping it.
 - Backend: Vulkan only (GLSL kernels in `src/kernels/vulkan/glm53*.comp`),
   written and measured on an M5 Max under Honeykrisp. There are no Metal
   kernels yet.
@@ -39,9 +40,9 @@ template are read from it).
   GLM and Qwen3.8-Flash-Next do not fit in 128 GB together.
 
 On the M5 Max a long compute command holds other GPU clients back until it
-ends; a prefill pass of 1 024 rows is one, and without Mesa's compute kick
-(aurora-silicon/mesa #260) the desktop's work can wait past the kernel
-driver's timeout. Run GLM on a Mesa with the kick.
+ends; a per-layer prefill pass processing 1 024 rows is one, and without
+Mesa's compute kick (aurora-silicon/mesa #260) the desktop's work can wait
+past the kernel driver's timeout. Run GLM on a Mesa with the kick.
 
 Memory: the 96.5 GB of weights in the page cache, about 1.5 GB of scratch
 for prefill runs of 1 024 rows, and the sessions.
@@ -57,14 +58,17 @@ engine interface, the tokenizer and template built from the GGUF, and a CPU
 reference of every operation. Decode and the speculative verify pass use the
 GEMV kernels on f32 activations (up to four rows); prompts run in runs of
 1 024 rows on the matrix units, routed experts grouped by expert, one pass a
-layer.
+layer. A pass of several rows rounds differently from a one-row decode step;
+where two experts tie at the top-8 boundary (seen to 1e-6 after a
+pseudo-random prompt) the two can route differently, so speculative decoding
+gives plain decoding's tokens only up to such ties.
 
 ## Differences from ds4
 
 - The MTP head attends at most the last 2 051 rows of its run (ds4: the whole
   run). It changes only how often drafts are accepted, never the output.
 - Prefill GEMMs round both operands to bfloat16 (f32 accumulators); decode
-  works on f32 activations. Quality is within ds4's own spread (below).
+  works on f32 activations. Quality is close to ds4's (below).
 - The hyper-connection control projection scales its sums by the RMS after
   the dot products (ds4 normalizes first): the products differ in rounding
   only.
@@ -79,7 +83,8 @@ LILY_GLM53_GGUF=<path> cargo test --release --lib glm53 -- --ignored --test-thre
 The ignored tests load the real file: the header against the schema,
 speculative steps against ordinary decoding (accepted and rejected drafts,
 rollback across an indexer pool past the sparse window, snapshot restore and
-fork), and cancelled prefill. `lily-glm53` (`src/bin/lily-glm53.rs`) compares
+fork), sampled speculation against ordinary sampling (the same draws and
+penalty counts after a rejection and an acceptance), and cancelled prefill. `lily-glm53` (`src/bin/lily-glm53.rs`) compares
 the GPU with the CPU reference layer by layer (`compare`), scores ds4's
 official GLM 5.3 Flash continuations from its `gguf-tools/quality-testing`
 (`score`, `--legacy` for ds4's reference rendering), and measures prefill,
