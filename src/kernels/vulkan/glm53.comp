@@ -833,14 +833,15 @@ void main() {
 // The conv window before each chunk of glm53_kda_prefill_prepare (which
 // overwrites its rows in place), in the conv state's layout: edges[0] is
 // the conv state, edges[c][x][w] = x row c * chunk - 3 + w. Grid
-// (9 * projection / 256, chunks), 256 threads. Buffers: 0 q, 1 k, 2 v,
-// 3 conv state, 4 edges. Params: 5 projection, 6 chunk.
+// (ceil(9 * projection / 256), chunks), 256 threads. Buffers: 0 q, 1 k, 2 v,
+// 3 conv state, 4 edges. Params: 5 projection, 6 chunk. Grid x rounds up.
 #ifdef KERNEL_glm53_kda_prefill_edges
 void main() {
     const uint projection = arg_u32(5);
     const uint chunk = arg_u32(6);
     const uint c = gl_WorkGroupID.y;
     const uint o = gl_GlobalInvocationID.x; // [x][w][channel]
+    if (o >= 9u * projection) return;
     const uint x = o / (3u * projection);
     const uint w = (o / projection) % 3u;
     const uint ch = o % projection;

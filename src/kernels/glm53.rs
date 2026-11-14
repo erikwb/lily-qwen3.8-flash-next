@@ -992,6 +992,25 @@ pub fn kda(
     rows: usize,
     snap: Option<KdaSnapshot<'_>>,
 ) -> Result<()> {
+    kda_chunked(ctx, pass, p, x, conv_state, state, out, rows, snap, KDA_CHUNK)
+}
+
+/// [`kda`] with prompt runs' prepare stage walking `chunk` tokens a
+/// threadgroup (tests compare chunkings bit for bit).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn kda_chunked(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    p: &KdaParams<'_>,
+    x: &KdaInputs<'_>,
+    conv_state: &Tensor,
+    state: &Tensor,
+    out: &Tensor,
+    rows: usize,
+    snap: Option<KdaSnapshot<'_>>,
+    chunk: usize,
+) -> Result<()> {
+    ensure!(chunk >= 3, "KDA prepare chunks of {chunk} tokens");
     let (snap_row, snap_conv, snap_state) = match &snap {
         Some(s) => {
             ensure!(s.row < rows, "KDA snapshot after row {} of {rows}", s.row);
@@ -1030,10 +1049,10 @@ pub fn kda(
             Grid::Threadgroups { groups: (1, p.heads, 1), threadgroup: (128, 1, 1) },
         );
     }
-    let chunks = rows.div_ceil(KDA_CHUNK);
+    let chunks = rows.div_ceil(chunk);
     let edges = match x.edges {
         Some(e) if chunks > 1 => {
-            ensure!(e.numel() >= kda_edges_len(rows, p.heads), "KDA edges");
+            ensure!(e.numel() >= chunks * 9 * proj, "KDA edges");
             let k =
                 ctx.pipeline("glm53_kda_prefill_edges", SOURCE, MslVersion::V3_1)?;
             pass.dispatch_at(
@@ -1045,9 +1064,9 @@ pub fn kda(
                     conv_state.binding(),
                     e.binding(),
                 ],
-                &[&u32_bytes(proj), &u32_bytes(KDA_CHUNK)],
+                &[&u32_bytes(proj), &u32_bytes(chunk)],
                 Grid::Threadgroups {
-                    groups: (9 * proj / 256, chunks, 1),
+                    groups: ((9 * proj).div_ceil(256), chunks, 1),
                     threadgroup: (256, 1, 1),
                 },
             )?;
@@ -1080,7 +1099,7 @@ pub fn kda(
             &u32_bytes(rows),
             &f32_bytes(p.lower_bound),
             &u32_bytes(snap_row),
-            &u32_bytes(KDA_CHUNK),
+            &u32_bytes(chunk),
             &u32_bytes(usize::from(chunks > 1)),
         ],
         Grid::Threadgroups { groups: (p.heads, chunks, 1), threadgroup: (128, 1, 1) },

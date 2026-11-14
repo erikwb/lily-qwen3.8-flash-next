@@ -442,6 +442,93 @@ fn kda_prefill_matches_cpu() {
     kda_compare(37, 16, 60);
 }
 
+/// A prompt run's prepare stage in KDA_CHUNK-token chunks gives the
+/// single-chunk run's results bit for bit: output, prepared q/k/v/decay,
+/// recurrent state, conv window and both snapshots, from a nonzero starting
+/// state, at row counts around the chunk boundaries and with snapshots on
+/// both sides of one.
+#[test]
+fn kda_prefill_chunks_are_bit_exact() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(76);
+    let heads = 4;
+    let p = heads * 128;
+    let c = kda_case(&mut rng, heads);
+    let t = |v: &Vec<f32>| tensor(&ctx, v);
+    let (qc, kc, vc, al, dt, on) = (
+        t(&c.q_conv),
+        t(&c.k_conv),
+        t(&c.v_conv),
+        t(&c.a_log),
+        t(&c.dt_bias),
+        t(&c.o_norm),
+    );
+    let params = KdaParams {
+        q_conv: &qc,
+        k_conv: &kc,
+        v_conv: &vc,
+        a_log: &al,
+        dt_bias: &dt,
+        o_norm: &on,
+        heads,
+        lower_bound: -5.0,
+        eps: 1e-5,
+    };
+    let conv0 = f32s(&mut rng, 9 * p, -1.0, 1.0);
+    let state0 = f32s(&mut rng, heads * 128 * 128, -0.2, 0.2);
+    let bits = |x: &Tensor| -> Vec<u32> {
+        x.to_f32().unwrap().iter().map(|v| v.to_bits()).collect()
+    };
+    let cases = [
+        (31, Some(30)),
+        (32, Some(31)),
+        (33, Some(32)),
+        (63, None),
+        (64, Some(33)),
+        (65, Some(64)),
+    ];
+    for (n, snap_row) in cases {
+        let raw: Vec<Vec<f32>> = [p, p, p, p, heads, p]
+            .iter()
+            .map(|&w| f32s(&mut rng, n * w, -2.0, 2.0))
+            .collect();
+        let mut got = Vec::new();
+        for chunk in [KDA_CHUNK, n] {
+            let x: Vec<Tensor> = raw.iter().map(t).collect();
+            let (conv, st) = (t(&conv0), t(&state0));
+            let (out, edges) = (zeros(&ctx, n * p), zeros(&ctx, n.div_ceil(3) * 9 * p));
+            let (sconv, sst) = (zeros(&ctx, 9 * p), zeros(&ctx, heads * 128 * 128));
+            let inputs = KdaInputs {
+                q: &x[0],
+                k: &x[1],
+                v: &x[2],
+                gate: &x[3],
+                beta: &x[4],
+                out_gate: &x[5],
+                edges: Some(&edges),
+            };
+            run(&ctx, |pass| {
+                let snap =
+                    snap_row.map(|row| KdaSnapshot { row, conv: &sconv, state: &sst });
+                kda_chunked(
+                    &ctx, pass, &params, &inputs, &conv, &st, &out, n, snap, chunk,
+                )
+                .unwrap()
+            });
+            let mut all: Vec<Vec<u32>> = x[..4].iter().map(bits).collect();
+            all.extend([bits(&out), bits(&st), bits(&conv), bits(&sconv), bits(&sst)]);
+            got.push(all);
+        }
+        for (k, name) in
+            ["q", "k", "v", "decay", "out", "state", "conv", "snap conv", "snap state"]
+                .iter()
+                .enumerate()
+        {
+            assert!(got[0][k] == got[1][k], "{name} differs at {n} rows");
+        }
+    }
+}
+
 /// Runs of more than one prepare chunk (KDA_CHUNK rows): 75-row runs of
 /// three chunks each, the second run continuing the first's state.
 #[test]
