@@ -103,6 +103,18 @@ enum Cmd {
         #[arg(long)]
         chat: Option<String>,
     },
+    /// Step time by row count: after a prompt, forward passes of 1 to 4
+    /// rows (every row's logits, as a verify pass), each rewound; medians.
+    Rows {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        text: PathBuf,
+        #[arg(long, default_value_t = 256)]
+        prompt_len: usize,
+        #[arg(long, default_value_t = 24)]
+        n: usize,
+    },
     /// Greedy generation from token ids.
     Generate {
         #[arg(long)]
@@ -142,6 +154,7 @@ fn run() -> Result<()> {
         Cmd::Spec { model, text, prompt_len, n, runs, chat } => {
             spec(&model, &text, prompt_len, n, runs, chat.as_deref())
         }
+        Cmd::Rows { model, text, prompt_len, n } => rows(&model, &text, prompt_len, n),
         Cmd::Bench { model, text, prompt_len, n, runs } => {
             bench(&model, &text, prompt_len, n, runs)
         }
@@ -525,6 +538,37 @@ fn bench(
     Ok(())
 }
 
+fn rows(path: &PathBuf, text: &PathBuf, prompt_len: usize, n: usize) -> Result<()> {
+    let tok = lily::tokenizer::Tokenizer::from_gguf(path)?;
+    let mut ids = tok.encode("[gMASK]<sop>")?;
+    let body = tok.encode(&std::fs::read_to_string(text)?)?;
+    ids.extend_from_slice(&body[..prompt_len - ids.len()]);
+    let ctx = MetalContext::new()?;
+    let model = Glm53Model::load(&ctx, path)?;
+    let mut sc = model.new_scratch(&ctx)?;
+    let mut st = model.new_state(&ctx, prompt_len + 16)?;
+    model.prefill(&ctx, &mut st, &mut sc, &ids)?;
+    let mut line = format!("rows: prompt {prompt_len}:");
+    for m in [1usize, 2, 3, 4, 1] {
+        let toks: Vec<u32> = body[prompt_len..prompt_len + m].to_vec();
+        let mut t = Vec::with_capacity(n);
+        for _ in 0..n {
+            let s = Instant::now();
+            if m == 1 {
+                model.forward(&ctx, &mut st, &mut sc, &toks, true)?;
+            } else {
+                model.forward_all_logits(&ctx, &mut st, &mut sc, &toks)?;
+            }
+            t.push(s.elapsed().as_secs_f64() * 1e3);
+            st.pos -= m;
+        }
+        t.sort_by(f64::total_cmp);
+        line += &format!(" m={m} {:.2} ms (p10 {:.2})", t[n / 2], t[n / 10]);
+    }
+    println!("{line}");
+    Ok(())
+}
+
 fn spec(
     path: &PathBuf,
     text: &PathBuf,
@@ -571,6 +615,7 @@ fn spec(
             Some(Draw { params: &greedy, step: 0 }),
         )?;
         let mut plain = vec![sc.next_token.to_u32()?[0]];
+        let _ = lily::metal::profile::take();
         let t = Instant::now();
         while plain.len() < n {
             let last = *plain.last().unwrap();
@@ -578,6 +623,10 @@ fn spec(
             plain.push(argmax(&sc.logits.to_f32()?[..model.cfg.vocab]) as u32);
         }
         let plain_s = t.elapsed().as_secs_f64();
+        if ctx.profiling() {
+            eprintln!("profile: plain decode, per step:");
+            profile_report(n - 1);
+        }
         // Speculative.
         let mut st = LanguageModel::new_state(&model, &ctx, ids.len() + n + 8)?;
         LanguageModel::prefill(
@@ -589,6 +638,7 @@ fn spec(
             Some(Draw { params: &greedy, step: 0 }),
         )?;
         let mut out = vec![sc.next_token.to_u32()?[0]];
+        let _ = lily::metal::profile::take();
         let t = Instant::now();
         let mut proposals = model.draft_initial(
             &ctx,
@@ -600,8 +650,10 @@ fn spec(
             out.len(),
         )?;
         let (mut steps, mut accepted) = (0usize, 0usize);
+        let (mut t_verify, mut t_finish) = (0f64, 0f64);
         while out.len() < n {
             let pending = *out.last().unwrap();
+            let tv = Instant::now();
             let (draws, pend) = model.verify(
                 &ctx,
                 &mut st,
@@ -616,18 +668,28 @@ fn spec(
             out.extend_from_slice(&draws[..=kept]);
             accepted += kept;
             steps += 1;
+            let tf = Instant::now();
+            t_verify += (tf - tv).as_secs_f64();
             proposals =
                 model.finish_speculation(&ctx, &mut st, &mut sc, kept, true, pend)?;
+            t_finish += tf.elapsed().as_secs_f64();
         }
         let spec_s = t.elapsed().as_secs_f64();
+        if ctx.profiling() {
+            eprintln!("profile: speculative, per step:");
+            profile_report(steps);
+        }
         out.truncate(n);
         let same = plain.iter().zip(&out).take_while(|(a, b)| a == b).count();
         println!(
-            "run {run}: plain {:.2} tok/s; speculative {:.2} tok/s, {steps} steps, accepted {accepted}/{steps} ({:.0}%); same first {same}/{n} tokens; pos {}",
+            "run {run}: plain {:.2} tok/s; speculative {:.2} tok/s, {steps} steps, accepted {accepted}/{steps} ({:.0}%); same first {same}/{n} tokens; pos {}; per step: verify {:.2} ms, finish {:.2} ms; plain step {:.2} ms",
             n as f64 / plain_s,
             n as f64 / spec_s,
             100.0 * accepted as f64 / steps as f64,
-            st.pos()
+            st.pos(),
+            t_verify / steps as f64 * 1e3,
+            t_finish / steps as f64 * 1e3,
+            plain_s / (n - 1) as f64 * 1e3,
         );
         if run == 0 {
             println!("speculative text: {:?}", tok.decode(&out, false)?);
