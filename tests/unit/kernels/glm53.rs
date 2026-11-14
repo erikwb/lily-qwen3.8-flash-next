@@ -734,6 +734,83 @@ fn hc_post_mix_and_pre2_match_cpu() {
     }
 }
 
+/// The HC pair of a sublayer boundary (`hc_post_mix` then `hc_pre2`, each
+/// its own level as in the step) at the model's shapes: best of five
+/// serial passes of `LILY_GLM53_REPEAT` (default 64) pairs over 128 copies
+/// of the control weights (100 MB: not cache resident, as in a step).
+/// `LILY_GLM53_ROWS` rows (default 1).
+#[test]
+#[ignore = "timing only"]
+fn hc_timing() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(69);
+    let env = |k: &str, d: usize| -> usize {
+        std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    };
+    let (repeat, m) = (env("LILY_GLM53_REPEAT", 64), env("LILY_GLM53_ROWS", 1));
+    let cfg = crate::glm53::Config::glm53_flash();
+    let hidden = cfg.hidden;
+    let fn_raw = random_blocks(&mut rng, GgmlType::Bf16, 24 * 4 * hidden);
+    let fns: Vec<QWeight> = (0..128)
+        .map(|_| {
+            QWeight::from_bytes(&ctx, &fn_raw, GgmlType::Bf16, 4 * hidden, 24).unwrap()
+        })
+        .collect();
+    let h = tensor(&ctx, &f32s(&mut rng, m * 4 * hidden, -0.01, 0.01));
+    let block = tensor(&ctx, &f32s(&mut rng, m * hidden, -1e-3, 1e-3));
+    let partial = zeros(&ctx, m * hc_mix_groups(hidden) * 25);
+    let scale = tensor(&ctx, &[0.8f32, 1.2, 1.7]);
+    let base = tensor(&ctx, &f32s(&mut rng, 24, -0.5, 0.5));
+    let norm = tensor(&ctx, &f32s(&mut rng, hidden, 0.5, 1.5));
+    let split = zeros(&ctx, m * 24);
+    let xn = zeros(&ctx, m * hidden);
+    for (label, part) in [("post_mix + pre2", 0), ("post_mix", 1), ("pre2", 2)] {
+        let mut best = f64::MAX;
+        for _ in 0..5 {
+            let pass = ctx.begin().unwrap();
+            for r in 0..repeat {
+                if part != 2 {
+                    let post = (r > 0).then_some((&block, &split));
+                    hc_post_mix(
+                        &ctx,
+                        &pass,
+                        &h,
+                        post,
+                        &fns[r % 128],
+                        &partial,
+                        m,
+                        hidden,
+                    )
+                    .unwrap();
+                }
+                if part != 1 {
+                    hc_pre2(
+                        &ctx,
+                        &pass,
+                        &partial,
+                        &scale,
+                        &base,
+                        &h,
+                        &norm,
+                        &split,
+                        &xn,
+                        m,
+                        hidden,
+                        20,
+                        1e-6,
+                        cfg.rms_eps,
+                    )
+                    .unwrap();
+                }
+            }
+            let t = std::time::Instant::now();
+            pass.commit_wait().unwrap();
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        println!("hc {label:20} m={m} {:8.1} us", best / repeat as f64 * 1e6);
+    }
+}
+
 #[test]
 fn gemv_sets_match_single_gemvs() {
     let ctx = ctx();

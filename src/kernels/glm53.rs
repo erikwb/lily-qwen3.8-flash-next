@@ -769,7 +769,7 @@ pub fn hc_post(
 
 /// Threadgroups (and partial sums per row) of [`hc_post_mix`].
 pub fn hc_mix_groups(hidden: usize) -> usize {
-    hidden / 128
+    hidden / 64
 }
 
 /// HC post of the previous sublayer (when `post` gives its output and the
@@ -792,7 +792,7 @@ pub fn hc_post_mix(
         fn_w.ty == GgmlType::Bf16 && fn_w.rows == 24 && fn_w.cols == 4 * hidden,
         "HC fn shape"
     );
-    ensure!(hidden.is_multiple_of(128), "hidden {hidden}");
+    ensure!(hidden.is_multiple_of(64), "hidden {hidden}");
     ensure!(partial.numel() >= m * hc_mix_groups(hidden) * 25, "partials");
     let (block, split) = post.unwrap_or((streams, streams));
     let pipeline = ctx.pipeline("glm53_hc_post_mix", SOURCE, MslVersion::V3_1)?;
@@ -808,7 +808,7 @@ pub fn hc_post_mix(
         &[&u32_bytes(hidden), &u32_bytes(usize::from(post.is_some()))],
         Grid::Threadgroups {
             groups: (hc_mix_groups(hidden), m, 1),
-            threadgroup: (64, 1, 1),
+            threadgroup: (32, 1, 1),
         },
     )
 }

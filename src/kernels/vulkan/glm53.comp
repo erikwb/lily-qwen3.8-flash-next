@@ -1242,34 +1242,40 @@ void main() {
 #endif
 
 // ---------------------------------------------------------------------------
-// HC post fused with the next control projection's partial sums. Thread
-// owns two hidden positions d of all four streams: when has_post it first
+// HC post fused with the next control projection's partial sums. Lane owns
+// two hidden positions d of all four streams: when has_post it first
 // applies the post mix of the previous sublayer (H[dst][d] = block[d] *
 // post[dst] + sum_src comb[dst + 4 src] * H[src][d], in place: no other
-// thread reads its d), then adds its eight values' share of the 24 rows of
-// fn . H and of sum(H^2). Each threadgroup (64 threads, 128 positions)
+// lane reads its d), then adds its eight values' share of the 24 rows of
+// fn . H and of sum(H^2). Each threadgroup (one subgroup, 64 positions)
 // writes 25 partial sums; glm53_hc_pre2 reduces them. fn rows are
-// [24][4 * hidden] bf16 over the streams' flat order.
-// Grid (hidden / 128, m), 64 threads. Buffers: 0 H [m][4][hidden], 1 block
+// [24][4 * hidden] bf16 over the streams' flat order. Every load is issued
+// before the first use: the scheduler leaves a row's loads next to their
+// use, so a row at a time waited for memory 24 times (29 us a call; 2026-11-14).
+// Grid (hidden / 64, m), 32 threads. Buffers: 0 H [m][4][hidden], 1 block
 // [m][hidden], 2 split [m][24], 3 fn bf16, 4 partial [m][groups][25].
 // Params: 5 hidden, 6 has_post.
 // ---------------------------------------------------------------------------
 #ifdef KERNEL_glm53_hc_post_mix
-shared float red[2 * 25];
 void main() {
     const uint hidden = arg_u32(5);
     const bool has_post = arg_u32(6) != 0u;
     const uint i = gl_WorkGroupID.y;
     const uint g = gl_WorkGroupID.x;
     const uint groups = gl_NumWorkGroups.x;
-    const uint tid = gl_LocalInvocationIndex;
-    const uint d = g * 128u + 2u * tid;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint d = g * 64u + 2u * lane;
     const uint64_t Hs = arg(0) + 16u * uint64_t(i) * hidden;
     vec2 h[4];
-    [[unroll]] for (uint s = 0u; s < 4u; s++) h[s] = vec2(F32(Hs).v[s * hidden + d], F32(Hs).v[s * hidden + d + 1u]);
+    [[unroll]] for (uint s = 0u; s < 4u; s++) h[s] = uintBitsToFloat(U32x2(Hs + 4u * (s * hidden + d)).v[0]);
+    const uint64_t W = arg(3);
+    const uint row_words = 2u * hidden; // 4 * hidden bf16 = 2 * hidden words
+    uint w[24][4];
+    [[unroll]] for (uint r = 0u; r < 24u; r++)
+        [[unroll]] for (uint s = 0u; s < 4u; s++) w[r][s] = U32(W).v[r * row_words + (s * hidden + d) / 2u];
     if (has_post) {
         const uint64_t S = arg(2) + 96u * uint64_t(i);
-        const vec2 b = vec2(F32(arg(1)).v[i * hidden + d], F32(arg(1)).v[i * hidden + d + 1u]);
+        const vec2 b = uintBitsToFloat(U32x2(arg(1) + 4u * (i * hidden + d)).v[0]);
         vec2 o[4];
         [[unroll]] for (uint dst = 0u; dst < 4u; dst++) {
             vec2 acc = b * F32(S).v[4u + dst];
@@ -1281,33 +1287,20 @@ void main() {
         }
         [[unroll]] for (uint s = 0u; s < 4u; s++) {
             h[s] = o[s];
-            F32(Hs).v[s * hidden + d] = o[s].x;
-            F32(Hs).v[s * hidden + d + 1u] = o[s].y;
+            U32x2(Hs + 4u * (s * hidden + d)).v[0] = floatBitsToUint(o[s]);
         }
     }
     float ss = 0.0;
     [[unroll]] for (uint s = 0u; s < 4u; s++) ss += dot(h[s], h[s]);
-    const uint lane = gl_SubgroupInvocationID;
-    const uint sg = gl_SubgroupID;
-    ss = subgroupAdd(ss);
-    if (lane == 0u) red[sg * 25u + 24u] = ss;
-    const uint64_t W = arg(3);
-    const uint row_words = 2u * hidden; // 4 * hidden bf16 = 2 * hidden words
-    for (uint r = 0u; r < 24u; r++) {
-        const uint64_t R = W + 4u * uint64_t(r) * row_words;
+    float mine = subgroupAdd(ss);
+    [[unroll]] for (uint r = 0u; r < 24u; r++) {
         float acc = 0.0;
-        [[unroll]] for (uint s = 0u; s < 4u; s++) {
-            const uint w = U32(R).v[(s * hidden + d) / 2u];
-            acc += uintBitsToFloat(w << 16u) * h[s].x + uintBitsToFloat(w & 0xffff0000u) * h[s].y;
-        }
+        [[unroll]] for (uint s = 0u; s < 4u; s++)
+            acc += uintBitsToFloat(w[r][s] << 16u) * h[s].x + uintBitsToFloat(w[r][s] & 0xffff0000u) * h[s].y;
         acc = subgroupAdd(acc);
-        if (lane == 0u) red[sg * 25u + r] = acc;
+        mine = lane == r ? acc : mine;
     }
-    barrier();
-    if (tid < 25u) {
-        const uint64_t P = arg(4) + 4u * (uint64_t(i) * groups + g) * 25u;
-        F32(P).v[tid] = red[tid] + red[25u + tid];
-    }
+    if (lane < 25u) F32(arg(4)).v[(i * groups + g) * 25u + lane] = mine;
 }
 #endif
 
@@ -1317,7 +1310,9 @@ void main() {
 // the products differ only in rounding), the Sinkhorn split on sixteen
 // lanes (lane j holds comb[j], src j % 4, dst j / 4), the weighted stream
 // sum and its RMSNorm with `norm`. One threadgroup of 256 per row, each
-// thread sixteen positions held in registers.
+// thread sixteen positions held in registers, loaded first. (The comb in
+// every lane's registers instead of the shuffles was slower: 9.3 against
+// 7.3 us a call; 2026-11-14.)
 // Grid m, 256 threads. Buffers: 0 partial [m][groups][25], 1 scale [3],
 // 2 base [24], 3 H, 4 norm, 5 split out [m][24], 6 xn out [m][hidden].
 // Params: 7 hidden, 8 iters, 9 hc_eps, 10 rms_eps, 11 groups.
@@ -1335,11 +1330,32 @@ void main() {
     const uint i = gl_WorkGroupID.x;
     const uint tid = gl_LocalInvocationIndex;
     const uint lane = gl_SubgroupInvocationID;
-    if (tid < 25u) {
+    // The streams and the norm weights first: their loads are in flight
+    // through the reduction and the split.
+    const uint64_t Hs = arg(3) + 16u * uint64_t(i) * hidden;
+    vec4 hv[4][4], nw[4];
+    [[unroll]] for (uint q = 0u; q < 4u; q++) {
+        const uint d = 16u * tid + 4u * q;
+        [[unroll]] for (uint s = 0u; s < 4u; s++) hv[q][s] = F32x4(Hs + 4u * (s * hidden + d)).v[0];
+        nw[q] = F32x4(arg(4) + 4u * d).v[0];
+    }
+    // hidden is 4096 here: 64 groups. Thread (v = tid / 8, j = tid % 8)
+    // sums groups j, j + 8, ... of value v, all loads in flight together,
+    // then the eight lanes of v add up. (The groups' sum in order, 25
+    // threads, costs 2.8 us more: 10.1 against 7.3 us; 2026-11-14.)
+    {
+        const uint v = tid >> 3u, j = tid & 7u;
         const uint64_t P = arg(0) + 4u * uint64_t(i) * groups * 25u;
         float acc = 0.0;
-        for (uint g = 0u; g < groups; g++) acc += F32(P).v[g * 25u + tid];
-        mix_sh[tid] = acc;
+        if (v < 25u) {
+            float part[8];
+            [[unroll]] for (uint k = 0u; k < 8u; k++) part[k] = F32(P).v[(j + 8u * k) * 25u + v];
+            [[unroll]] for (uint k = 0u; k < 8u; k++) acc += part[k];
+        }
+        acc += subgroupShuffleXor(acc, 1u);
+        acc += subgroupShuffleXor(acc, 2u);
+        acc += subgroupShuffleXor(acc, 4u);
+        if (v < 25u && j == 0u) mix_sh[v] = acc;
     }
     barrier();
     if (gl_SubgroupID == 0u) {
@@ -1374,14 +1390,11 @@ void main() {
     }
     barrier();
     if (tid < 24u) F32(arg(5)).v[24u * i + tid] = sp[tid];
-    const uint64_t Hs = arg(3) + 16u * uint64_t(i) * hidden;
     const float p0 = sp[0], p1 = sp[1], p2 = sp[2], p3 = sp[3];
     vec4 x[4];
     float ss = 0.0;
     [[unroll]] for (uint q = 0u; q < 4u; q++) {
-        const uint d = 16u * tid + 4u * q;
-        x[q] = F32x4(Hs + 4u * d).v[0] * p0 + F32x4(Hs + 4u * (hidden + d)).v[0] * p1 +
-               F32x4(Hs + 4u * (2u * hidden + d)).v[0] * p2 + F32x4(Hs + 4u * (3u * hidden + d)).v[0] * p3;
+        x[q] = hv[q][0] * p0 + hv[q][1] * p1 + hv[q][2] * p2 + hv[q][3] * p3;
         ss += dot(x[q], x[q]);
     }
     ss = subgroupAdd(ss);
@@ -1392,7 +1405,7 @@ void main() {
     const uint64_t O = arg(6) + 4u * uint64_t(i) * hidden;
     [[unroll]] for (uint q = 0u; q < 4u; q++) {
         const uint d = 16u * tid + 4u * q;
-        F32x4(O + 4u * d).v[0] = x[q] * scale * F32x4(arg(4) + 4u * d).v[0];
+        F32x4(O + 4u * d).v[0] = x[q] * scale * nw[q];
     }
 }
 #endif
