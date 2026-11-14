@@ -896,7 +896,8 @@ impl Glm53Model {
             tail(&pass)?;
             return pass.commit_wait();
         }
-        let mut pending = std::collections::VecDeque::new();
+        let mut pending: std::collections::VecDeque<crate::metal::PendingPass<'_>> =
+            std::collections::VecDeque::new();
         let mut tail = Some(tail);
         for il in 0..n {
             let pass = self.begin(ctx)?;
@@ -911,14 +912,16 @@ impl Glm53Model {
                 None,
                 il..il + 1,
             )?;
+            // At most two passes in flight: wait for the oldest before
+            // submitting a third.
+            while pending.len() >= 2 {
+                pending.pop_front().expect("in flight").wait()?;
+            }
             if il + 1 == n {
                 (tail.take().expect("tail runs once"))(&pass)?;
                 pass.commit_wait()?;
             } else {
                 pending.push_back(pass.commit()?);
-                if pending.len() > 2 {
-                    pending.pop_front().expect("in flight").wait()?;
-                }
             }
         }
         for p in pending {
