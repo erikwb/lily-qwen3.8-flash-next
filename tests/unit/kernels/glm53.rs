@@ -650,6 +650,89 @@ fn dsa_attend_refuses_unpadded_prompt_widths() {
     pass.commit_wait().unwrap();
 }
 
+/// The scores stage on both routes against an f64 reference over 200 slots
+/// (four matrix tiles): f16's largest value alone stays on the matrix
+/// route, the next value past it (either sign) sends its query's tiles to
+/// f32, a NaN or infinite query value makes only its own head's scores
+/// non-finite, and slots past each row's count are -inf.
+#[test]
+fn dsa_scores_at_and_past_f16_range() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(78);
+    let (n, m) = (200usize, 6usize);
+    let s = n;
+    let pos0 = n - m;
+    let lat: Vec<f32> =
+        f32s(&mut rng, n * 512, -1.5, 1.5).into_iter().map(r::round_f16).collect();
+    let bytes: Vec<u8> =
+        lat.iter().flat_map(|&v| f16::from_f32(v).to_bits().to_le_bytes()).collect();
+    let cache = Tensor::from_bytes(&ctx, &bytes, &[n * 512], DType::F16).unwrap();
+    let mut qk = f32s(&mut rng, m * 64 * 512, -0.2, 0.2);
+    let at = |i: usize, h: usize, j: usize| (i * 64 + h) * 512 + j;
+    let past = f32::from_bits(65504f32.to_bits() + 1);
+    qk[at(0, 0, 0)] = 65504.0;
+    qk[at(0, 1, 3)] = -65504.0;
+    qk[at(1, 2, 1)] = past;
+    qk[at(2, 0, 2)] = -past;
+    qk[at(3, 3, 4)] = f32::NAN;
+    qk[at(4, 5, 6)] = f32::INFINITY;
+    let tqk = tensor(&ctx, &qk);
+    let scale = 1.0 / 16.0;
+    for mu in [true, false] {
+        let scores = zeros(&ctx, m * 64 * s);
+        run(&ctx, |p| {
+            dsa_scores(
+                &ctx,
+                p,
+                &tqk,
+                &cache,
+                Rows::Causal { pos0 },
+                &scores,
+                m,
+                s,
+                scale,
+                mu,
+            )
+            .unwrap()
+        });
+        let g = scores.to_f32().unwrap();
+        for i in 0..m {
+            let count = pos0 + i + 1;
+            for h in 0..64 {
+                let q = &qk[at(i, h, 0)..at(i, h, 0) + 512];
+                for slot in 0..s {
+                    let got = g[(i * 64 + h) * s + slot];
+                    if slot >= count {
+                        assert_eq!(
+                            got,
+                            f32::NEG_INFINITY,
+                            "mu {mu} row {i} head {h} slot {slot}"
+                        );
+                        continue;
+                    }
+                    if (i, h) == (3, 3) {
+                        assert!(got.is_nan(), "mu {mu}: NaN query gave {got}");
+                        continue;
+                    }
+                    if (i, h) == (4, 5) {
+                        assert!(!got.is_finite(), "mu {mu}: infinite query gave {got}");
+                        continue;
+                    }
+                    let k = &lat[slot * 512..(slot + 1) * 512];
+                    let terms = q.iter().zip(k).map(|(&a, &b)| a as f64 * b as f64);
+                    let want = terms.clone().sum::<f64>() * scale as f64;
+                    let mag: f64 = terms.map(f64::abs).sum();
+                    let tol = scale as f64 * (3e-6 * mag + 512.0 * 6e-8 * 2.0);
+                    assert!(
+                        got.is_finite() && (got as f64 - want).abs() <= tol,
+                        "mu {mu} row {i} head {h} slot {slot}: {got} against {want} (tol {tol})"
+                    );
+                }
+            }
+        }
+    }
+}
+
 fn dsa_causal_case(n: usize, m: usize, s: usize, big: bool) {
     let ctx = ctx();
     let mut rng = StdRng::seed_from_u64(61);
