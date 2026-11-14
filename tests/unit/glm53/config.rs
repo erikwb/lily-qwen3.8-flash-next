@@ -16,4 +16,6 @@ fn real_header_validates() {
     assert_eq!(c.expert_weight_scale, 2.5);
     assert_eq!(c.kda_gate_lower_bound, -5.0);
     assert_eq!(g.tensors.len(), 1412);
+    crate::glm53::schema::validate(&g, &c)
+        .expect("the published file matches the schema");
 }

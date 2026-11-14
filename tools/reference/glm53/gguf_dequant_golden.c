@@ -1,7 +1,13 @@
 /* Golden dequantization data for lily's GGUF block decoders. Blocks come from
  * ds4's quantizer (gguf-tools/quants.c) and from random bytes; every value is
  * decoded with ds4's reference formulas (ds4.c: q2_k_value_f32,
- * ds4_vec_dot_q4_K_f32, ds4_vec_dot_iq2_xxs_f32, the Q8_0 matvec reference). */
+ * ds4_vec_dot_q4_K_f32, ds4_vec_dot_iq2_xxs_f32, the Q8_0 matvec reference).
+ *
+ * Build and run against a ds4 checkout (b3f5018), from a scratch directory:
+ *   sed -n 1264,1344p $DS4/ds4.c > iq2tables.inc   # kmask/ksigns/grid tables
+ *   cc -O1 -ffp-contract=off -I $DS4/gguf-tools gguf_dequant_golden.c \
+ *       $DS4/gguf-tools/quants.c -lm -lpthread -o gen
+ *   ./gen tests/goldens/gguf_dequant.bin */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

@@ -244,6 +244,13 @@ Add `--q4-xl` for the q4-xl checkpoint (`--dst
 Max. `--layers 4` writes the small checkpoint the tests use. [tools/README.md](tools/README.md) has the other
 flags and the reference harnesses.
 
+## GLM 5.3 Flash
+
+On Linux (Vulkan) lily also serves GLM 5.3 Flash from antirez's Q2 GGUF:
+`lily --model GLM-5.3-Flash-Q2.gguf --cache-bytes 9G --pin-weights off`.
+[docs/glm53.md](docs/glm53.md) has the checkpoint, the memory it needs, what
+differs from the reference implementation and what is not implemented yet.
+
 ## Tests
 
 ```sh
