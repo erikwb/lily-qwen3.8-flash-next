@@ -38,6 +38,11 @@ template are read from it).
   (`src/instance.rs`) before mapping anything, like every other loader, and
   GLM and Qwen3.8-Flash-Next do not fit in 128 GB together.
 
+On the M5 Max a long compute command holds other GPU clients back until it
+ends; a prefill pass of 1 024 rows is one, and without Mesa's compute kick
+(aurora-silicon/mesa #260) the desktop's work can wait past the kernel
+driver's timeout. Run GLM on a Mesa with the kick.
+
 Memory: the 96.5 GB of weights in the page cache, about 1.5 GB of scratch
 for prefill runs of 1 024 rows, and the sessions.
 
