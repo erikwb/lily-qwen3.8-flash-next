@@ -204,6 +204,54 @@ impl Glm53Model {
     }
 }
 
+impl Glm53Model {
+    /// Feeds `tokens` in runs of [`PREFILL_ROWS`], drawing after the last
+    /// when `draw`; before committing each run, stops if `stop` says so
+    /// (the state then sits at a run boundary). Returns the tokens fed.
+    fn prefill_chunks(
+        &self,
+        ctx: &MetalContext,
+        state: &mut Glm53State,
+        scratch: &mut Scratch,
+        tokens: &[u32],
+        draw: Option<Draw<'_>>,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<usize> {
+        ensure!(!tokens.is_empty(), "empty prefill");
+        state.ensure_capacity(ctx, state.pos + tokens.len())?;
+        let chunks: Vec<&[u32]> = tokens.chunks(PREFILL_ROWS).collect();
+        let mut fed = 0;
+        for (i, chunk) in chunks.iter().enumerate() {
+            if stop() {
+                return Ok(fed);
+            }
+            let last = i + 1 == chunks.len();
+            scratch.stage_tokens(chunk)?;
+            let logits =
+                if last && draw.is_some() { Logits::Last } else { Logits::None };
+            let sampler = scratch.sampler();
+            self.run_rows(ctx, state, scratch, chunk.len(), logits, |pass| {
+                if let (true, Some(d)) = (last, draw) {
+                    let out = scratch.next_token.view(0, &[1])?;
+                    sample_f32(
+                        ctx,
+                        pass,
+                        &scratch.logits_last,
+                        sampler,
+                        d.params,
+                        d.step,
+                        &out,
+                    )?;
+                }
+                Ok(())
+            })?;
+            state.pos += chunk.len();
+            fed += chunk.len();
+        }
+        Ok(fed)
+    }
+}
+
 impl LanguageModel for Glm53Model {
     type State = Glm53State;
     type Scratch = Scratch;
@@ -396,33 +444,24 @@ impl LanguageModel for Glm53Model {
         tokens: &[u32],
         draw: Option<Draw<'_>>,
     ) -> Result<()> {
-        ensure!(!tokens.is_empty(), "empty prefill");
-        state.ensure_capacity(ctx, state.pos + tokens.len())?;
-        let chunks: Vec<&[u32]> = tokens.chunks(PREFILL_ROWS).collect();
-        for (i, chunk) in chunks.iter().enumerate() {
-            let last = i + 1 == chunks.len();
-            scratch.stage_tokens(chunk)?;
-            let logits =
-                if last && draw.is_some() { Logits::Last } else { Logits::None };
-            let sampler = scratch.sampler();
-            self.run_rows(ctx, state, scratch, chunk.len(), logits, |pass| {
-                if let (true, Some(d)) = (last, draw) {
-                    let out = scratch.next_token.view(0, &[1])?;
-                    sample_f32(
-                        ctx,
-                        pass,
-                        &scratch.logits_last,
-                        sampler,
-                        d.params,
-                        d.step,
-                        &out,
-                    )?;
-                }
-                Ok(())
-            })?;
-            state.pos += chunk.len();
-        }
-        Ok(())
+        self.prefill_chunks(ctx, state, scratch, tokens, draw, &|| false).map(drop)
+    }
+
+    fn prefill_chunk_tokens(&self) -> Option<usize> {
+        Some(PREFILL_ROWS)
+    }
+
+    fn prefill_until(
+        &self,
+        ctx: &MetalContext,
+        state: &mut Glm53State,
+        scratch: &mut Scratch,
+        tokens: &[u32],
+        vision: Option<&crate::qwen4exp::VisionInput<'_>>,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<usize> {
+        ensure!(vision.is_none(), "GLM 5.3 Flash has no vision path");
+        self.prefill_chunks(ctx, state, scratch, tokens, None, stop)
     }
 
     fn prepare_step_inputs(

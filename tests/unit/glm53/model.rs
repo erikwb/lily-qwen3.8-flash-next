@@ -120,3 +120,50 @@ fn speculative_cycle_after_a_long_prefill() {
         last = draws[kept];
     }
 }
+
+/// Loads the published file for the real-weight tests.
+fn real_model(ctx: &MetalContext) -> Glm53Model {
+    use crate::engine::{LanguageModel, LoadOptions};
+    let path = std::env::var("LILY_GLM53_GGUF").expect("LILY_GLM53_GGUF");
+    let options = LoadOptions { mtp_drafts: 1, ..Default::default() };
+    <Glm53Model as LanguageModel>::load(ctx, std::path::Path::new(&path), &options).expect("load")
+}
+
+/// A prompt of `n` ordinary text tokens.
+fn prompt(n: usize) -> Vec<u32> {
+    (0..n as u32).map(|i| 1000 + (i * 7919) % 50_000).collect()
+}
+
+/// prefill_until stops at a run boundary before committing it and reports
+/// what it fed; the rest fed afterwards gives exactly what one prefill of
+/// the whole prompt gives.
+#[test]
+#[ignore = "requires LILY_GLM53_GGUF"]
+fn prefill_until_stops_at_run_boundaries_and_resumes_exactly() {
+    use crate::engine::{DecodeStateApi, Draw, LanguageModel};
+    use crate::kernels::sample::SamplingParams;
+    let ctx = MetalContext::new().expect("context");
+    let m = real_model(&ctx);
+    assert_eq!(m.prefill_chunk_tokens(), Some(PREFILL_ROWS));
+    let p = prompt(2 * PREFILL_ROWS + 100);
+    let greedy = SamplingParams::greedy();
+    let draw = || Some(Draw { params: &greedy, step: 0 });
+    let mut sc = m.new_scratch(&ctx).unwrap();
+    let mut st = LanguageModel::new_state(&m, &ctx, p.len()).unwrap();
+    assert_eq!(m.prefill_until(&ctx, &mut st, &mut sc, &p, None, &|| true).unwrap(), 0);
+    assert_eq!(st.pos(), 0);
+    let asked = std::cell::Cell::new(0);
+    let stop = || {
+        asked.set(asked.get() + 1);
+        asked.get() > 1
+    };
+    let fed = m.prefill_until(&ctx, &mut st, &mut sc, &p, None, &stop).unwrap();
+    assert_eq!((fed, st.pos()), (PREFILL_ROWS, PREFILL_ROWS));
+    LanguageModel::prefill(&m, &ctx, &mut st, &mut sc, &p[fed..], draw()).unwrap();
+    let resumed = sc.logits_last.to_f32().unwrap();
+    let resumed_draw = sc.next_token.to_u32().unwrap()[0];
+    let mut whole = LanguageModel::new_state(&m, &ctx, p.len()).unwrap();
+    LanguageModel::prefill(&m, &ctx, &mut whole, &mut sc, &p, draw()).unwrap();
+    assert_eq!(sc.logits_last.to_f32().unwrap(), resumed, "same runs, same logits");
+    assert_eq!(sc.next_token.to_u32().unwrap()[0], resumed_draw);
+}
