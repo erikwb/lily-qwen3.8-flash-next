@@ -888,7 +888,8 @@ impl<M: LanguageModel> Engine<M> {
                 raw: p.kind == Kind::Completion,
                 tool_call_ends_thinking: p.thinking.tool_call_ends_thinking,
             },
-        );
+        )
+        .with_tool_grammar(tokenizer.tool_grammar());
         // The thinking controls, when the request asked for any and the
         // prompt opens a reasoning block (the generation prompt ends with
         // `<think>\n`; a raw completion's prompt may too). Off, the decode is

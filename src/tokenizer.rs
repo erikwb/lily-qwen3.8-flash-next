@@ -86,6 +86,8 @@ pub struct Tokenizer {
     /// nothink to keep histories prefix-cacheable. Newer templates
     /// (`preserve_thinking`) keep every block themselves.
     legacy_nothink_rewrite: bool,
+    /// The syntax of the model's tool calls (GLM's for a GGUF tokenizer).
+    tool_grammar: crate::serve::tools::ToolGrammar,
 }
 
 /// Everything a chat prompt render needs, in the template's own vocabulary.
@@ -149,6 +151,7 @@ impl Tokenizer {
         let mut t = Self::new(inner, &serde_json::Value::Null, template)?;
         t.add_stop_tokens(&crate::glm53::tokenizer::stop_ids(&g)?);
         t.legacy_nothink_rewrite = false;
+        t.tool_grammar = crate::serve::tools::ToolGrammar::Glm;
         Ok(t)
     }
 
@@ -227,7 +230,15 @@ impl Tokenizer {
             stop_tokens.push(id);
         }
 
-        Ok(Self { inner, text, specials, env, stop_tokens, legacy_nothink_rewrite })
+        Ok(Self {
+            inner,
+            text,
+            specials,
+            env,
+            stop_tokens,
+            legacy_nothink_rewrite,
+            tool_grammar: Default::default(),
+        })
     }
 
     /// Renders one prompt through the checkpoint's template exactly as given.
@@ -356,6 +367,11 @@ impl Tokenizer {
             ctx = minijinja::context! { ..ctx, ..Value::from_serialize(serde_json::Value::Object(extra)) };
         }
         Ok(template.render(ctx)?)
+    }
+
+    /// The syntax the model writes tool calls in.
+    pub fn tool_grammar(&self) -> crate::serve::tools::ToolGrammar {
+        self.tool_grammar
     }
 
     /// The id of the token spelled `text` (an added token such as

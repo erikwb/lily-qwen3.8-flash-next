@@ -171,26 +171,59 @@ fn tool_schemas_render_in_the_order_the_client_sent() {
 
 #[test]
 fn parses_glm_tool_calls() {
+    let glm = |block: &str| parse_tool_call_as(ToolGrammar::Glm, block, &schemas());
     let block = "read_file<arg_key>path</arg_key><arg_value>src/main.rs</arg_value>\
                  <arg_key>offset</arg_key><arg_value>42</arg_value>\
                  <arg_key>tags</arg_key><arg_value>[\"a\", \"b\"]</arg_value>\
                  <arg_key>maybe</arg_key><arg_value>123</arg_value>";
-    let call = parse_tool_call(block, &schemas()).expect("parse");
+    let call = glm(block).expect("parse");
     assert_eq!(call.name, "read_file");
     let args: serde_json::Value = serde_json::from_str(&call.arguments).unwrap();
     assert_eq!(args["path"], "src/main.rs");
     assert_eq!(args["offset"], 42);
     assert_eq!(args["tags"], serde_json::json!(["a", "b"]));
     assert_eq!(args["maybe"], "123");
-    let call = parse_tool_call("noargs", &schemas()).expect("no arguments");
+    // A call without arguments is the bare name, surrounding newlines too.
+    let call = glm("noargs").expect("no arguments");
     assert_eq!((call.name.as_str(), call.arguments.as_str()), ("noargs", "{}"));
+    let call = glm("\nmcp__fs.list_dir\n").expect("bare name");
+    assert_eq!(call.name, "mcp__fs.list_dir");
     // A multi-line string value is kept as written.
-    let call = parse_tool_call(
-        "read_file<arg_key>path</arg_key><arg_value>a\nb\n</arg_value>",
-        &schemas(),
-    )
-    .unwrap();
-    assert_eq!(serde_json::from_str::<serde_json::Value>(&call.arguments).unwrap()["path"], "a\nb\n");
-    assert!(parse_tool_call("read_file<arg_key>path</arg_key>", &schemas()).is_err());
-    assert!(parse_tool_call("<arg_key>x</arg_key><arg_value>1</arg_value>", &schemas()).is_err());
+    let call =
+        glm("read_file<arg_key>path</arg_key><arg_value>a\nb\n</arg_value>").unwrap();
+    let args: serde_json::Value = serde_json::from_str(&call.arguments).unwrap();
+    assert_eq!(args["path"], "a\nb\n");
+    // Not calls: prose, markup, a key without a value, a value without a name.
+    for bad in [
+        "some malformed response",
+        "I will call read_file now",
+        "<function=read_file></function>",
+        "read_file<arg_key>path</arg_key>",
+        "<arg_key>x</arg_key><arg_value>1</arg_value>",
+        "read_file trailing<arg_key>x</arg_key><arg_value>1</arg_value>",
+        "",
+    ] {
+        assert!(glm(bad).is_err(), "{bad:?} parsed as a GLM call");
+    }
+}
+
+#[test]
+fn the_qwen_grammar_is_main_s_parser() {
+    // GLM-shaped blocks and prose are not Qwen calls, as before GLM.
+    for block in [
+        "noargs",
+        "some malformed response",
+        "read_file<arg_key>p</arg_key><arg_value>1</arg_value>",
+    ] {
+        assert!(parse_tool_call(block, &schemas()).is_err(), "{block:?}");
+        assert!(
+            parse_tool_call_as(ToolGrammar::Qwen, block, &schemas()).is_err(),
+            "{block:?}"
+        );
+    }
+    let block = "<function=read_file>\n<parameter=path>\nx\n</parameter>\n</function>";
+    let a = parse_tool_call(block, &schemas()).unwrap();
+    let b = parse_tool_call_as(ToolGrammar::Qwen, block, &schemas()).unwrap();
+    assert_eq!(a, b);
+    assert_eq!(ToolGrammar::default(), ToolGrammar::Qwen);
 }
