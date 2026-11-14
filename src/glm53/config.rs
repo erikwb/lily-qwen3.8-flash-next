@@ -69,6 +69,10 @@ impl Config {
         let n_layer = u("block_count")?;
         let n_trunk = u("trunk_block_count")?;
         ensure!(
+            n_trunk <= n_layer,
+            "trunk_block_count {n_trunk} exceeds block_count {n_layer}"
+        );
+        ensure!(
             u("nextn_predict_layers")? == n_layer - n_trunk,
             "nextn_predict_layers does not match block counts"
         );

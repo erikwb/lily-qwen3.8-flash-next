@@ -163,3 +163,136 @@ fn open_reads_header_and_tensor_table() {
     assert!(g.tensor("c.weight").is_none());
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Bytes of a GGUF v3 file: header counts, then `body` (metadata and the
+/// tensor table), padded with zeros to `len`.
+fn gguf_bytes(n_tensors: u64, n_kv: u64, body: &[u8], len: usize) -> Vec<u8> {
+    let mut f = Vec::from(&b"GGUF"[..]);
+    f.extend(3u32.to_le_bytes());
+    f.extend(n_tensors.to_le_bytes());
+    f.extend(n_kv.to_le_bytes());
+    f.extend(body);
+    if f.len() < len {
+        f.resize(len, 0);
+    }
+    f
+}
+
+/// One tensor entry: name `t`, the dimensions, type F32, `offset`.
+fn tensor_entry(dims: &[u64], offset: u64) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend(1u64.to_le_bytes());
+    b.push(b't');
+    b.extend((dims.len() as u32).to_le_bytes());
+    for d in dims {
+        b.extend(d.to_le_bytes());
+    }
+    b.extend(0u32.to_le_bytes());
+    b.extend(offset.to_le_bytes());
+    b
+}
+
+/// Opens `bytes` as a file and returns the error (the open must fail, and
+/// must not panic or abort, in debug and release builds alike).
+fn open_err(name: &str, bytes: &[u8]) -> String {
+    let dir =
+        std::env::temp_dir().join(format!("lily-gguf-bad-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("{name}.gguf"));
+    std::fs::write(&path, bytes).unwrap();
+    let r = std::panic::catch_unwind(|| Gguf::open(&path));
+    std::fs::remove_file(&path).ok();
+    match r {
+        Ok(Ok(_)) => panic!("{name}: a malformed file was accepted"),
+        Ok(Err(e)) => format!("{e:#}"),
+        Err(_) => panic!("{name}: the reader panicked"),
+    }
+}
+
+#[test]
+fn malformed_tensor_tables_are_errors() {
+    // The review's cases (128-byte files, one F32 tensor, data at 64).
+    let cases: [(&str, Vec<u64>, u64, &str); 5] = [
+        ("offset-wrap", vec![1], u64::MAX - 63, "overflow"),
+        ("row-size-wrap", vec![1u64 << 62], 0, "overflow"),
+        ("rows-wrap", vec![1, 1u64 << 63, 2], 0, "overflow"),
+        ("unaligned", vec![1], 1, "multiple"),
+        ("zero-dim", vec![0], 0, "zero dimension"),
+    ];
+    for (name, dims, offset, want) in cases {
+        let e = open_err(name, &gguf_bytes(1, 0, &tensor_entry(&dims, offset), 128));
+        assert!(e.contains(want), "{name}: {e}");
+    }
+    // A tensor past the end, and a duplicate name.
+    let e = open_err("past-end", &gguf_bytes(1, 0, &tensor_entry(&[64], 0), 128));
+    assert!(e.contains("past the file"), "{e}");
+    let mut two = tensor_entry(&[1], 0);
+    two.extend(tensor_entry(&[1], 32));
+    let e = open_err("duplicate", &gguf_bytes(2, 0, &two, 256));
+    assert!(e.contains("appears twice"), "{e}");
+}
+
+#[test]
+fn malformed_metadata_is_an_error_not_an_abort() {
+    fn kv(key: &str, ty: u32, value: &[u8]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend((key.len() as u64).to_le_bytes());
+        b.extend(key.as_bytes());
+        b.extend(ty.to_le_bytes());
+        b.extend(value);
+        b
+    }
+    // Truncated: a header that stops inside its counts, and one inside a key.
+    let full = gguf_bytes(
+        0,
+        1,
+        &kv("general.name", 8, &[3, 0, 0, 0, 0, 0, 0, 0, b'a', b'b', b'c']),
+        0,
+    );
+    for cut in [10, 20, 30, full.len() - 1] {
+        let e = open_err(&format!("truncated-{cut}"), &full[..cut]);
+        assert!(
+            e.contains("ends early")
+                || e.contains("past the end")
+                || e.contains("does not fit"),
+            "{e}"
+        );
+    }
+    // Impossible counts.
+    let e = open_err("huge-tensor-count", &gguf_bytes(u64::MAX, 0, &[], 64));
+    assert!(e.contains("count"), "{e}");
+    let e = open_err("huge-kv-count", &gguf_bytes(0, u64::MAX / 2, &[], 64));
+    assert!(e.contains("count"), "{e}");
+    // A string longer than the file, an array longer than the file.
+    let e = open_err(
+        "huge-string",
+        &gguf_bytes(0, 1, &kv("k", 8, &u64::MAX.to_le_bytes()), 64),
+    );
+    assert!(e.contains("past the end"), "{e}");
+    let mut arr = 4u32.to_le_bytes().to_vec();
+    arr.extend(((1u64 << 40) as u64).to_le_bytes());
+    let e = open_err("huge-array", &gguf_bytes(0, 1, &kv("k", 9, &arr), 64));
+    assert!(e.contains("does not fit"), "{e}");
+    // Nested arrays, however small.
+    let mut nested = 9u32.to_le_bytes().to_vec();
+    nested.extend(1u64.to_le_bytes());
+    nested.extend(9u32.to_le_bytes());
+    nested.extend(1u64.to_le_bytes());
+    nested.extend(4u32.to_le_bytes());
+    nested.extend(1u64.to_le_bytes());
+    nested.extend(7u32.to_le_bytes());
+    let e = open_err("nested", &gguf_bytes(0, 1, &kv("k", 9, &nested), 128));
+    assert!(e.contains("nested"), "{e}");
+    // Unknown types, a bad alignment, a repeated key.
+    let e = open_err("bad-type", &gguf_bytes(0, 1, &kv("k", 99, &[0; 8]), 64));
+    assert!(e.contains("unknown"), "{e}");
+    let e = open_err(
+        "bad-alignment",
+        &gguf_bytes(0, 1, &kv("general.alignment", 4, &3u32.to_le_bytes()), 64),
+    );
+    assert!(e.contains("alignment"), "{e}");
+    let mut twice = kv("k", 4, &1u32.to_le_bytes());
+    twice.extend(kv("k", 4, &2u32.to_le_bytes()));
+    let e = open_err("repeated-key", &gguf_bytes(0, 2, &twice, 64));
+    assert!(e.contains("twice"), "{e}");
+}
