@@ -451,10 +451,18 @@ fn kda_prefill_long_runs_match_cpu() {
 
 #[test]
 fn dsa_store_and_attend_match_cpu() {
+    // 42 cached rows then 3 rows of queries (SIMT kernels); 25 then a run
+    // of 20 (matrix units).
+    for m in [3, 20] {
+        dsa_causal_case(m);
+    }
+}
+
+fn dsa_causal_case(m: usize) {
     let ctx = ctx();
     let mut rng = StdRng::seed_from_u64(61);
     let cfg = crate::glm53::Config::glm53_flash();
-    let (n, m) = (45, 3); // 42 cached rows, then 3 rows of queries
+    let n = 45;
     let kv_raw = f32s(&mut rng, n * 512, -2.0, 2.0);
     let w = f32s(&mut rng, 512, 0.5, 1.5);
     let cache = Tensor::zeros(&ctx, &[64 * 512], DType::F16).unwrap();
@@ -531,9 +539,16 @@ fn dsa_store_and_attend_match_cpu() {
 /// lists with unused slots, against the CPU.
 #[test]
 fn dsa_attend_selected_matches_cpu() {
+    // Decode rows (SIMT kernels) and a prompt run (matrix units).
+    for m in [2, 6] {
+        dsa_selected_case(m);
+    }
+}
+
+fn dsa_selected_case(m: usize) {
     let ctx = ctx();
     let mut rng = StdRng::seed_from_u64(70);
-    let (cached, m, s, count) = (700usize, 2usize, 2056usize, 344usize);
+    let (cached, s, count) = (700usize, 2056usize, 344usize);
     let lat_rows: Vec<f32> =
         f32s(&mut rng, cached * 512, -1.5, 1.5).into_iter().map(r::round_f16).collect();
     let bytes: Vec<u8> = lat_rows
@@ -621,7 +636,7 @@ fn dsa_timing() {
     let mut rng = StdRng::seed_from_u64(71);
     let m: usize =
         std::env::var("LILY_GLM53_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
-    let cached = 4096;
+    let cached = 4112 + m;
     let caches: Vec<Tensor> = (0..11)
         .map(|_| {
             let bytes: Vec<u8> = f32s(&mut rng, cached * 512, -1.5, 1.5)
@@ -642,17 +657,20 @@ fn dsa_timing() {
     let denom = zeros(&ctx, m * 64);
     let lat = zeros(&ctx, m * 64 * 512);
     let partial = zeros(&ctx, 4 * 8 * 64 * 512);
+    // Prompt runs: two layers (a 1 024-row call takes milliseconds), the
+    // dense case causal over the run itself.
+    let caches = if m > 4 { &caches[..2] } else { &caches[..] };
     for (label, sparse) in [("dense 264 rows", false), ("selected 2056", true)] {
-        let s = if sparse { s_max } else { 264 };
+        let s = if sparse { s_max } else { 264.max(m).next_multiple_of(8) };
         let rows = if sparse {
             Rows::Selected { sel: &tsel, count: s_max }
         } else {
-            Rows::Causal { pos0: 264 - m }
+            Rows::Causal { pos0: 264usize.saturating_sub(m) }
         };
         let mut best = f64::MAX;
         for _ in 0..5 {
             let pass = ctx.begin().unwrap();
-            for c in &caches {
+            for c in caches {
                 dsa_attend(
                     &ctx, &pass, &qk, c, rows, &scores, &denom, &lat, &partial, m, s,
                     0.0625,
@@ -663,7 +681,10 @@ fn dsa_timing() {
             pass.commit_wait().unwrap();
             best = best.min(t.elapsed().as_secs_f64());
         }
-        println!("dsa {label:16} m={m} {:8.1} us a layer", best / 11.0 * 1e6);
+        println!(
+            "dsa {label:16} m={m} {:8.1} us a layer",
+            best / caches.len() as f64 * 1e6
+        );
         // With LILY_KERNEL_PROFILE: each kernel alone, per layer.
         let mut by: Vec<(&str, f64)> = Vec::new();
         for p in crate::metal::profile::take() {
@@ -675,7 +696,10 @@ fn dsa_timing() {
             }
         }
         for (name, secs) in by {
-            println!("dsa   {name:28} {:8.1} us a layer", secs / 55.0 * 1e6);
+            println!(
+                "dsa   {name:28} {:8.1} us a layer",
+                secs / (5 * caches.len()) as f64 * 1e6
+            );
         }
     }
 }

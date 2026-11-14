@@ -1,0 +1,246 @@
+#version 460
+// GLM 5.3 Flash DSA attention for prompt runs on the matrix units
+// (src/kernels/glm53.rs `dsa_attend` with more than four query rows; the
+// decode kernels are in glm53.comp). Per query row the scores are
+// Q (64 heads x 512) . latent rows^T and the latent mix P (64 heads x
+// slots) . latent rows. The latent rows are f16 already; Q and P are f32,
+// split into an f16 high part and the f16 rounding of the rest, so each
+// product is two f16 x f16 multiplies with f32 accumulators (about f32
+// accuracy). Tiles stage through threadgroup memory a step of 32 at a
+// time, the next step's loads issued before the current step's products.
+#include "common.glsl"
+#include "matmul.glsl"
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+#define MatAh coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+#define MatBh coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
+#define MatCf coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+
+// Row stride of the staged tiles, in f16 (32 values + 8 of padding).
+#define ST 40u
+
+// The high and low f16 parts of four f32 values: the high part is the
+// value with its mantissa cut to f16's ten bits (exact in f16 in its
+// normal range), the low part the f16 rounding of the rest. (Taken as
+// f - f32(f16(f)), the compiler folded the low part to zero.)
+void dsa_split(vec4 f, out f16vec4 hi, out f16vec4 lo) {
+    const vec4 h = uintBitsToFloat(floatBitsToUint(f) & uvec4(0xffffe000u));
+    hi = f16vec4(h);
+    lo = f16vec4(f - h);
+}
+
+// ---------------------------------------------------------------------------
+// Scores: scores[i][h][s] = qk_low[i][h] . cache[row] * scale for s <
+// count_i (row = sel ? sel[i][s] : s; count_i = sel ? n_sel : pos0 + i + 1),
+// -inf past count_i or where row is 0xffffffff, up to S. A threadgroup of
+// four subgroups computes 64 heads x 64 slots of one query row; subgroup g
+// the 32 x 32 quarter (heads 32 (g / 2), slots 32 (g % 2)), K steps of 32.
+// Grid (S / 64, m), 128 threads. Buffers: 0 qk_low [m][64][512], 1 cache
+// f16 [rows][512], 2 sel u32 [m][S], 3 scores [m][64][S]. Params: 4 S,
+// 5 pos0, 6 has_sel, 7 n_sel, 8 scale.
+// ---------------------------------------------------------------------------
+#ifdef KERNEL_glm53_dsa_scores_mu
+shared float16_t qh[64 * ST];
+shared float16_t ql[64 * ST];
+shared float16_t ks[64 * ST];
+shared uint rows_sh[64];
+void main() {
+    const uint S = arg_u32(4);
+    const uint pos0 = arg_u32(5);
+    const bool has_sel = arg_u32(6) != 0u;
+    const uint n_sel = arg_u32(7);
+    const float scale = arg_f32(8);
+    const uint i = gl_WorkGroupID.y;
+    const uint s0 = gl_WorkGroupID.x * 64u;
+    const uint tid = gl_LocalInvocationIndex;
+    const uint sg = gl_SubgroupID;
+    const uint count = min(S, has_sel ? n_sel : pos0 + i + 1u);
+    if (tid < 64u) {
+        const uint s = s0 + tid;
+        uint row = 0xffffffffu;
+        if (s < count) row = has_sel ? U32(arg(2)).v[i * S + s] : s;
+        rows_sh[tid] = row;
+    }
+    barrier();
+    // Loaders: thread t stages head t / 2 and latent slot t / 2, values
+    // 16 (t % 2) .. + 15 of the step.
+    const uint lr = tid >> 1u, lh = (tid & 1u) * 16u;
+    const uint krow = rows_sh[lr];
+    const bool klive = krow != 0xffffffffu;
+    const uint64_t Q = arg(0) + 4u * ((uint64_t(i) * 64u + lr) * 512u + lh);
+    const uint64_t K = arg(1) + 1024u * uint64_t(klive ? krow : 0u) + 2u * lh;
+    vec4 qv[4];
+    uvec4 kv[2];
+    [[unroll]] for (uint u = 0u; u < 4u; u++) qv[u] = F32x4(Q + 16u * u).v[0];
+    [[unroll]] for (uint u = 0u; u < 2u; u++) kv[u] = U32x4(K + 16u * u).v[0];
+    const uint hb = (sg >> 1u) * 32u, sb = (sg & 1u) * 32u;
+    MatCf c00 = MatCf(0.0), c01 = MatCf(0.0), c10 = MatCf(0.0), c11 = MatCf(0.0);
+    for (uint kb = 0u; kb < 512u; kb += 32u) {
+        barrier();
+        [[unroll]] for (uint u = 0u; u < 4u; u++) {
+            f16vec4 hi, lo;
+            dsa_split(qv[u], hi, lo);
+            [[unroll]] for (uint c = 0u; c < 4u; c++) {
+                qh[lr * ST + lh + 4u * u + c] = hi[c];
+                ql[lr * ST + lh + 4u * u + c] = lo[c];
+            }
+        }
+        [[unroll]] for (uint u = 0u; u < 2u; u++) {
+            [[unroll]] for (uint c = 0u; c < 4u; c++) {
+                const uint w = klive ? kv[u][c] : 0u;
+                ks[lr * ST + lh + 8u * u + 2u * c] = uint16BitsToHalf(uint16_t(w));
+                ks[lr * ST + lh + 8u * u + 2u * c + 1u] = uint16BitsToHalf(uint16_t(w >> 16u));
+            }
+        }
+        barrier();
+        // The next step's loads (the last step reloads its own).
+        const uint nb = min(kb + 32u, 480u);
+        [[unroll]] for (uint u = 0u; u < 4u; u++) qv[u] = F32x4(Q + 4u * nb + 16u * u).v[0];
+        [[unroll]] for (uint u = 0u; u < 2u; u++) kv[u] = U32x4(K + 2u * nb + 16u * u).v[0];
+        [[unroll]] for (uint kk = 0u; kk < 32u; kk += 16u) {
+            MatAh ah0, ah1, al0, al1;
+            MatBh b0, b1;
+            coopMatLoad(ah0, qh, (hb + 0u) * ST + kk, ST, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(ah1, qh, (hb + 16u) * ST + kk, ST, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(al0, ql, (hb + 0u) * ST + kk, ST, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(al1, ql, (hb + 16u) * ST + kk, ST, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(b0, ks, (sb + 0u) * ST + kk, ST, gl_CooperativeMatrixLayoutColumnMajor);
+            coopMatLoad(b1, ks, (sb + 16u) * ST + kk, ST, gl_CooperativeMatrixLayoutColumnMajor);
+            c00 = coopMatMulAdd(ah0, b0, c00);
+            c01 = coopMatMulAdd(ah0, b1, c01);
+            c10 = coopMatMulAdd(ah1, b0, c10);
+            c11 = coopMatMulAdd(ah1, b1, c11);
+            c00 = coopMatMulAdd(al0, b0, c00);
+            c01 = coopMatMulAdd(al0, b1, c01);
+            c10 = coopMatMulAdd(al1, b0, c10);
+            c11 = coopMatMulAdd(al1, b1, c11);
+        }
+    }
+    [[unroll]] for (uint e = 0u; e < 8u; e++) {
+        const uint r = mat_row(e), cc = mat_col(e);
+        const uint ha = hb + r, hbb = hb + 16u + r;
+        const uint sa = sb + cc, sbb = sb + 16u + cc;
+        const bool la = rows_sh[sa] != 0xffffffffu, lb = rows_sh[sbb] != 0xffffffffu;
+        const uint64_t O = arg(3) + 4u * (uint64_t(i) * 64u * S);
+        if (s0 + sa < S) {
+            F32(O).v[ha * S + s0 + sa] = la ? c00[e] * scale : -1.0 / 0.0;
+            F32(O).v[hbb * S + s0 + sa] = la ? c10[e] * scale : -1.0 / 0.0;
+        }
+        if (s0 + sbb < S) {
+            F32(O).v[ha * S + s0 + sbb] = lb ? c01[e] * scale : -1.0 / 0.0;
+            F32(O).v[hbb * S + s0 + sbb] = lb ? c11[e] * scale : -1.0 / 0.0;
+        }
+    }
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// Latent mix: lat[i][h][j] = sum_s w[i][h][s] * cache[row(s)][j] /
+// denom[i][h] for 64 heads x 64 latent columns of one query row; subgroup g
+// the 32 x 32 quarter (heads 32 (g / 2), columns 32 (g % 2)), the slots in
+// steps of 32. Unused slots weigh 0 (the softmax left exp(-inf)) and load
+// zeros. Grid (8 column tiles, m), 128 threads. Buffers: 0 weights
+// [m][64][S], 1 denom [m][64], 2 cache, 3 sel, 4 lat out [m][64][512].
+// Params: 5 S, 6 pos0, 7 has_sel, 8 n_sel.
+// ---------------------------------------------------------------------------
+#ifdef KERNEL_glm53_dsa_lora_mu
+shared float16_t ph[64 * ST];
+shared float16_t pl[64 * ST];
+shared float16_t vs[32 * 72];
+#define VT 72u
+void main() {
+    const uint S = arg_u32(5);
+    const uint pos0 = arg_u32(6);
+    const bool has_sel = arg_u32(7) != 0u;
+    const uint n_sel = arg_u32(8);
+    const uint j0 = gl_WorkGroupID.x * 64u;
+    const uint i = gl_WorkGroupID.y;
+    const uint tid = gl_LocalInvocationIndex;
+    const uint sg = gl_SubgroupID;
+    const uint count = min(S, has_sel ? n_sel : pos0 + i + 1u);
+    const uint steps = (count + 31u) / 32u;
+    // Loaders: weights of head t / 2, slots 16 (t % 2) .. + 15 of the step;
+    // latent slot t / 4 of the step, columns 16 (t % 4) .. + 15.
+    const uint ph_ = tid >> 1u, pp = (tid & 1u) * 16u;
+    const uint vsl = tid >> 2u, vq = (tid & 3u) * 16u;
+    const uint64_t P = arg(0) + 4u * ((uint64_t(i) * 64u + ph_) * S);
+    vec4 pv[4];
+    uvec4 kv[2];
+    bool vlive;
+    {
+        [[unroll]] for (uint u = 0u; u < 4u; u++) pv[u] = F32x4(P + 4u * min(pp + 4u * u, S - 4u)).v[0];
+        const uint s = vsl;
+        uint row = 0xffffffffu;
+        if (s < count) row = has_sel ? U32(arg(3)).v[i * S + s] : s;
+        vlive = row != 0xffffffffu;
+        const uint64_t V = arg(2) + 1024u * uint64_t(vlive ? row : 0u) + 2u * (j0 + vq);
+        [[unroll]] for (uint u = 0u; u < 2u; u++) kv[u] = U32x4(V + 16u * u).v[0];
+    }
+    const uint hb = (sg >> 1u) * 32u, cb = (sg & 1u) * 32u;
+    MatCf c00 = MatCf(0.0), c01 = MatCf(0.0), c10 = MatCf(0.0), c11 = MatCf(0.0);
+    for (uint st = 0u; st < steps; st++) {
+        barrier();
+        [[unroll]] for (uint u = 0u; u < 4u; u++) {
+            f16vec4 hi, lo;
+            // Weights past the row's slots are garbage of a wider row (or
+            // past S): zero them.
+            const uint s = 32u * st + pp + 4u * u;
+            vec4 w = pv[u];
+            [[unroll]] for (uint c = 0u; c < 4u; c++) if (s + c >= count) w[c] = 0.0;
+            dsa_split(w, hi, lo);
+            [[unroll]] for (uint c = 0u; c < 4u; c++) {
+                ph[ph_ * ST + pp + 4u * u + c] = hi[c];
+                pl[ph_ * ST + pp + 4u * u + c] = lo[c];
+            }
+        }
+        [[unroll]] for (uint u = 0u; u < 2u; u++) {
+            [[unroll]] for (uint c = 0u; c < 4u; c++) {
+                const uint w = vlive ? kv[u][c] : 0u;
+                vs[vsl * VT + vq + 8u * u + 2u * c] = uint16BitsToHalf(uint16_t(w));
+                vs[vsl * VT + vq + 8u * u + 2u * c + 1u] = uint16BitsToHalf(uint16_t(w >> 16u));
+            }
+        }
+        barrier();
+        {
+            const uint base = 32u * min(st + 1u, steps - 1u);
+            [[unroll]] for (uint u = 0u; u < 4u; u++)
+                pv[u] = F32x4(P + 4u * min(base + pp + 4u * u, S - 4u)).v[0];
+            const uint s = base + vsl;
+            uint row = 0xffffffffu;
+            if (s < count) row = has_sel ? U32(arg(3)).v[i * S + s] : s;
+            vlive = row != 0xffffffffu;
+            const uint64_t V = arg(2) + 1024u * uint64_t(vlive ? row : 0u) + 2u * (j0 + vq);
+            [[unroll]] for (uint u = 0u; u < 2u; u++) kv[u] = U32x4(V + 16u * u).v[0];
+        }
+        [[unroll]] for (uint kk = 0u; kk < 32u; kk += 16u) {
+            MatAh ah0, ah1, al0, al1;
+            MatBh b0, b1;
+            coopMatLoad(ah0, ph, (hb + 0u) * ST + kk, ST, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(ah1, ph, (hb + 16u) * ST + kk, ST, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(al0, pl, (hb + 0u) * ST + kk, ST, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(al1, pl, (hb + 16u) * ST + kk, ST, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(b0, vs, kk * VT + cb, VT, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(b1, vs, kk * VT + cb + 16u, VT, gl_CooperativeMatrixLayoutRowMajor);
+            c00 = coopMatMulAdd(ah0, b0, c00);
+            c01 = coopMatMulAdd(ah0, b1, c01);
+            c10 = coopMatMulAdd(ah1, b0, c10);
+            c11 = coopMatMulAdd(ah1, b1, c11);
+            c00 = coopMatMulAdd(al0, b0, c00);
+            c01 = coopMatMulAdd(al0, b1, c01);
+            c10 = coopMatMulAdd(al1, b0, c10);
+            c11 = coopMatMulAdd(al1, b1, c11);
+        }
+    }
+    [[unroll]] for (uint e = 0u; e < 8u; e++) {
+        const uint r = mat_row(e), cc = mat_col(e);
+        const uint ha = hb + r, hbb = hb + 16u + r;
+        const uint ja = j0 + cb + cc, jb = j0 + cb + 16u + cc;
+        const float da = F32(arg(1)).v[i * 64u + ha], db = F32(arg(1)).v[i * 64u + hbb];
+        const uint64_t O = arg(4) + 4u * (uint64_t(i) * 64u * 512u);
+        F32(O).v[ha * 512u + ja] = c00[e] / da;
+        F32(O).v[ha * 512u + jb] = c01[e] / da;
+        F32(O).v[hbb * 512u + ja] = c10[e] / db;
+        F32(O).v[hbb * 512u + jb] = c11[e] / db;
+    }
+}
+#endif

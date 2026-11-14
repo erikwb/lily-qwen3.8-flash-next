@@ -1191,7 +1191,15 @@ pub fn dsa_attend(
         }
     };
     ensure!(s <= DSA_MAX_SLOTS, "attention over {s} slots");
-    let scores_k = ctx.pipeline("glm53_dsa_scores", SOURCE, MslVersion::V3_1)?;
+    // Prompt runs on the matrix units (glm53_dsa.comp); decode rows on the
+    // SIMT kernels.
+    let mu = m > GEMV_MAX_ROWS;
+    let (name, groups, tg) = if mu {
+        ("glm53_dsa_scores_mu", s.div_ceil(64), 128)
+    } else {
+        ("glm53_dsa_scores", s.div_ceil(32), 256)
+    };
+    let scores_k = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(
         &scores_k,
         &[qk_low.binding(), cache.binding(), sel.binding(), scores.binding()],
@@ -1202,7 +1210,7 @@ pub fn dsa_attend(
             &u32_bytes(n_sel),
             &f32_bytes(scale),
         ],
-        Grid::Threadgroups { groups: (s.div_ceil(32), m, 1), threadgroup: (256, 1, 1) },
+        Grid::Threadgroups { groups: (groups, m, 1), threadgroup: (tg, 1, 1) },
     )?;
     pass.memory_barrier()?;
     let softmax = ctx.pipeline("glm53_dsa_softmax", SOURCE, MslVersion::V3_1)?;
@@ -1213,6 +1221,21 @@ pub fn dsa_attend(
         Grid::Threadgroups { groups: (64, m, 1), threadgroup: (256, 1, 1) },
     )?;
     pass.memory_barrier()?;
+    if mu {
+        let lora = ctx.pipeline("glm53_dsa_lora_mu", SOURCE, MslVersion::V3_1)?;
+        return pass.dispatch_at(
+            &lora,
+            &[
+                scores.binding(),
+                denom.binding(),
+                cache.binding(),
+                sel.binding(),
+                lat.binding(),
+            ],
+            &[&u32_bytes(s), &u32_bytes(pos0), &u32_bytes(has_sel), &u32_bytes(n_sel)],
+            Grid::Threadgroups { groups: (8, m, 1), threadgroup: (128, 1, 1) },
+        );
+    }
     // Slots split into chunks of at least 8 steps of 32 (at most
     // DSA_LORA_CHUNKS) when the rows are few enough for the partials.
     let steps = s.div_ceil(32);
