@@ -80,6 +80,7 @@ impl Mapped {
     fn f32(&self, name: &str) -> Result<Tensor> {
         let (buf, at, t) = self.get(name)?;
         ensure!(t.ty == GgmlType::F32, "{name} is {:?}, expected F32", t.ty);
+        ensure!(at % 4 == 0, "{name} is not 4-byte aligned in its mapping");
         let n = t.row_len() * t.rows();
         let whole = Tensor::from_buffer(buf.clone(), &[buf.length() / 4], DType::F32)?;
         whole.view(at / 4, &[n])
@@ -197,6 +198,7 @@ impl Glm53Model {
     pub fn load(ctx: &MetalContext, path: &Path) -> Result<Self> {
         let gguf = Gguf::open(path)?;
         let cfg = Config::from_gguf(&gguf)?;
+        super::schema::validate(&gguf, &cfg)?;
         let mapped = Mapped::map(ctx, &gguf)?;
         let mut layers = Vec::with_capacity(cfg.n_layer);
         for il in 0..cfg.n_layer {

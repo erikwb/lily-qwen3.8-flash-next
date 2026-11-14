@@ -36,6 +36,12 @@ pub fn tokenizer_json(g: &Gguf) -> Result<String> {
     );
     ensure!(g.str("tokenizer.ggml.pre")? == "glm4", "GLM pre-tokenizer is not glm4");
     let tokens = strings(g, "tokenizer.ggml.tokens")?;
+    let vocab = g.u64(&format!("{}.vocab_size", super::config::ARCH))? as usize;
+    ensure!(
+        tokens.len() == vocab,
+        "the tokenizer has {} tokens, the model's vocabulary {vocab}",
+        tokens.len()
+    );
     let merges = strings(g, "tokenizer.ggml.merges")?;
     let types: Vec<u64> = match g.get("tokenizer.ggml.token_type") {
         Some(GValue::Array(v)) => v.iter().map(|t| t.as_u64().unwrap_or(1)).collect(),
@@ -106,8 +112,13 @@ pub fn chat_template(g: &Gguf) -> Result<String> {
 /// Turn-ending ids: `<|endoftext|>`, `<|user|>` and `<|observation|>` (ds4's
 /// eos, eot and eom).
 pub fn stop_ids(g: &Gguf) -> Result<Vec<u32>> {
+    let vocab = g.u64(&format!("{}.vocab_size", super::config::ARCH))?;
     ["eos", "eot", "eom"]
         .iter()
-        .map(|k| Ok(g.u64(&format!("tokenizer.ggml.{k}_token_id"))? as u32))
+        .map(|k| {
+            let id = g.u64(&format!("tokenizer.ggml.{k}_token_id"))?;
+            ensure!(id < vocab, "{k} token {id} is outside the vocabulary of {vocab}");
+            Ok(id as u32)
+        })
         .collect()
 }

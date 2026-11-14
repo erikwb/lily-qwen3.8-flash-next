@@ -462,7 +462,10 @@ pub fn moe_gate_up(
     limit: f32,
 ) -> Result<()> {
     check_f32(&[x, weights, mid])?;
-    ensure!(gate.ty == up.ty && gate.cols == up.cols, "gate and up experts differ");
+    ensure!(
+        gate.ty == up.ty && gate.cols == up.cols && gate.rows == up.rows,
+        "gate and up experts differ"
+    );
     ensure!(gate.rows.is_multiple_of(ff), "expert rows {} of {ff}", gate.rows);
     ensure!(sel.dtype() == DType::U32 && sel.numel() >= m * used, "selection");
     ensure!(mid.numel() >= m * used * ff, "mid of {}", mid.numel());

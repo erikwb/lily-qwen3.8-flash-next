@@ -225,6 +225,15 @@ impl Config {
             "Sinkhorn iterations {}",
             self.sinkhorn_iters
         );
+        for (name, id) in
+            [("bos", self.bos), ("eos", self.eos), ("eot", self.eot), ("eom", self.eom)]
+        {
+            ensure!(
+                (id as usize) < self.vocab,
+                "{name} token {id} is outside the vocabulary of {}",
+                self.vocab
+            );
+        }
         ensure!(self.rms_eps > 0.0 && self.hc_eps > 0.0, "epsilons must be positive");
         Ok(())
     }
