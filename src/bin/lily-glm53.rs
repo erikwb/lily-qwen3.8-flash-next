@@ -118,8 +118,17 @@ fn parse_tokens(s: &str) -> Result<Vec<u32>> {
     s.split(',').map(|t| t.trim().parse::<u32>().context("token id")).collect()
 }
 
-fn main() -> Result<()> {
-    match Cli::parse().cmd {
+/// Exits 75 when another lily instance holds the lock (`lily::instance`):
+/// every subcommand loads the model.
+fn main() -> std::process::ExitCode {
+    lily::instance::exit_code(run())
+}
+
+fn run() -> Result<()> {
+    let cli = Cli::parse();
+    // Before any GPU context or mapping: one model on this machine at once.
+    lily::instance::acquire()?;
+    match cli.cmd {
         Cmd::Compare { model, tokens, layers, single } => {
             compare(&model, &parse_tokens(&tokens)?, layers, single)
         }

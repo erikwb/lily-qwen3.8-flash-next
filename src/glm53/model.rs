@@ -196,6 +196,18 @@ pub struct Glm53Model {
 impl Glm53Model {
     /// Opens and maps `path` (the GGUF file).
     pub fn load(ctx: &MetalContext, path: &Path) -> Result<Self> {
+        Self::load_locked(ctx, path, crate::instance::acquire)
+    }
+
+    /// [`Self::load`] with the instance lock taken by `lock`, first: before
+    /// the file is opened or anything is mapped (one model on this machine
+    /// at a time, `crate::instance`). Tests lock a file of their own.
+    pub(crate) fn load_locked(
+        ctx: &MetalContext,
+        path: &Path,
+        lock: impl FnOnce() -> Result<()>,
+    ) -> Result<Self> {
+        lock()?;
         let gguf = Gguf::open(path)?;
         let cfg = Config::from_gguf(&gguf)?;
         super::schema::validate(&gguf, &cfg)?;

@@ -1,5 +1,38 @@
 use super::*;
 
+/// A held instance lock refuses the GLM load before the file is opened or
+/// anything mapped: the refusal, not "no such file", for a path that does
+/// not exist. (`Glm53Model::load` and the engine's `LanguageModel::load`,
+/// which calls it, take the lock through `load_locked`.)
+#[test]
+fn a_held_instance_lock_refuses_the_load_before_mapping() {
+    use crate::instance::{AlreadyRunning, InstanceLock};
+    let dir =
+        std::env::temp_dir().join(format!("lily-glm53-lock-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let lock = dir.join("instance.lock");
+    let ctx = MetalContext::new().expect("context");
+    let missing = dir.join("no-such-model.gguf");
+    let held = InstanceLock::acquire_at(&lock).unwrap();
+    let e = Glm53Model::load_locked(&ctx, &missing, || {
+        InstanceLock::acquire_at(&lock).map(drop)
+    })
+    .err()
+    .expect("refused");
+    assert!(e.chain().any(|c| c.is::<AlreadyRunning>()), "{e:#}");
+    assert_eq!(crate::instance::exit_status(&e), crate::instance::EXIT_ALREADY_RUNNING);
+    drop(held);
+    // With the lock free, the same load gets as far as opening the file.
+    let e = Glm53Model::load_locked(&ctx, &missing, || {
+        InstanceLock::acquire_at(&lock).map(drop)
+    })
+    .err()
+    .expect("no file");
+    assert!(!e.chain().any(|c| c.is::<AlreadyRunning>()), "{e:#}");
+    assert!(format!("{e:#}").contains("no-such-model"), "{e:#}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Every staging path the engine uses fits the scratch it writes, at every
 /// row count it is called with: a verify pass (1 or 2 rows, up to
 /// MAX_ROWS), a decode step, a prefill run up to PREFILL_ROWS, the MTP
@@ -44,17 +77,33 @@ fn speculative_cycle_after_a_long_prefill() {
     let path = std::env::var("LILY_GLM53_GGUF").expect("LILY_GLM53_GGUF");
     let ctx = MetalContext::new().expect("context");
     let options = LoadOptions { mtp_drafts: 1, ..Default::default() };
-    let model = <Glm53Model as LanguageModel>::load(&ctx, std::path::Path::new(&path), &options)
-        .expect("load");
+    let model = <Glm53Model as LanguageModel>::load(
+        &ctx,
+        std::path::Path::new(&path),
+        &options,
+    )
+    .expect("load");
     let mut st = LanguageModel::new_state(&model, &ctx, 64).expect("state");
-    let mut sc = LanguageModel::new_scratch_with_capacity(&model, &ctx, 0).expect("scratch");
-    let prompt: Vec<u32> = (0..PREFILL_ROWS as u32 + 37).map(|i| 1000 + i % 5000).collect();
-    let params = SamplingParams { temperature: 0.7, top_p: 0.9, ..SamplingParams::greedy() };
-    LanguageModel::prefill(&model, &ctx, &mut st, &mut sc, &prompt, Some(Draw { params: &params, step: 0 }))
-        .expect("prefill");
+    let mut sc =
+        LanguageModel::new_scratch_with_capacity(&model, &ctx, 0).expect("scratch");
+    let prompt: Vec<u32> =
+        (0..PREFILL_ROWS as u32 + 37).map(|i| 1000 + i % 5000).collect();
+    let params =
+        SamplingParams { temperature: 0.7, top_p: 0.9, ..SamplingParams::greedy() };
+    LanguageModel::prefill(
+        &model,
+        &ctx,
+        &mut st,
+        &mut sc,
+        &prompt,
+        Some(Draw { params: &params, step: 0 }),
+    )
+    .expect("prefill");
     assert_eq!(st.pos(), prompt.len());
     let mut last = sc.next_token.to_u32().unwrap()[0];
-    let mut proposals = model.draft_initial(&ctx, &mut st, &mut sc, last, 1, &params, 1).expect("draft");
+    let mut proposals = model
+        .draft_initial(&ctx, &mut st, &mut sc, last, 1, &params, 1)
+        .expect("draft");
     for step in 0..2 {
         let pos = st.pos();
         let (draws, pending) = model
