@@ -6,7 +6,9 @@ use std::path::Path;
 
 use anyhow::{Result, ensure};
 
-use super::model::{Glm53Model, Glm53State, LayerState, Logits, MAX_ROWS, Scratch};
+use super::model::{
+    Glm53Model, Glm53State, LayerState, Logits, MAX_ROWS, PREFILL_ROWS, Scratch,
+};
 use crate::engine::{
     DecodeStateApi, Draw, LanguageModel, LoadOptions, ScratchApi, SnapshotApi,
 };
@@ -97,7 +99,8 @@ impl DecodeStateApi for Glm53State {
             }
         }
         self.pool_cap = capacity / 4 + 1;
-        self.pool_scores = Tensor::zeros(ctx, &[MAX_ROWS * self.pool_cap], DType::F32)?;
+        self.pool_scores =
+            Tensor::zeros(ctx, &[PREFILL_ROWS * self.pool_cap], DType::F32)?;
         self.capacity = capacity;
         Ok(())
     }
@@ -400,10 +403,10 @@ impl LanguageModel for Glm53Model {
     ) -> Result<()> {
         ensure!(!tokens.is_empty(), "empty prefill");
         state.ensure_capacity(ctx, state.pos + tokens.len())?;
-        let chunks: Vec<&[u32]> = tokens.chunks(MAX_ROWS).collect();
+        let chunks: Vec<&[u32]> = tokens.chunks(PREFILL_ROWS).collect();
         for (i, chunk) in chunks.iter().enumerate() {
             let last = i + 1 == chunks.len();
-            let mut words = [0u32; MAX_ROWS];
+            let mut words = [0u32; PREFILL_ROWS];
             words[..chunk.len()].copy_from_slice(chunk);
             scratch.tokens.write_bytes(bytemuck::cast_slice(&words))?;
             let pass = self.begin(ctx)?;

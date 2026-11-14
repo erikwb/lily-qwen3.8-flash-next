@@ -966,3 +966,129 @@ fn kda_snapshot_is_the_state_after_its_row() {
     }
     assert_close(&state.to_f32().unwrap(), &st.s, 1e-4, 1e-3);
 }
+
+#[test]
+fn gemm_matches_cpu() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(69);
+    for (ty, cols, rows, m) in [
+        (GgmlType::Q8_0, 4096usize, 200usize, 70usize),
+        (GgmlType::Q4K, 4096, 130, 5),
+        (GgmlType::Bf16, 1536, 64, 129),
+        (GgmlType::F32, 4096, 288, 33),
+        (GgmlType::Q8_0, 128, 8192, 64),
+    ] {
+        let raw = random_blocks(&mut rng, ty, rows * cols);
+        let w = QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap();
+        let cpu = mat(ty, &raw, rows, cols);
+        let x = f32s(&mut rng, m * cols, -1.0, 1.0);
+        let tx = tensor(&ctx, &x);
+        let y = zeros(&ctx, m * rows);
+        run(&ctx, |p| gemm(&ctx, p, &w, &tx, &y, m).unwrap());
+        let g = y.to_f32().unwrap();
+        // bf16 operands: compare against the exact product with a tolerance
+        // scaled by the row's magnitude.
+        for i in 0..m {
+            let e = cpu.mv(&x[i * cols..(i + 1) * cols]);
+            let scale: f32 =
+                (e.iter().map(|v| v * v).sum::<f32>() / rows as f32).sqrt();
+            for (n, (a, b)) in g[i * rows..(i + 1) * rows].iter().zip(&e).enumerate() {
+                assert!(
+                    (a - b).abs() <= 2e-2 * scale + 1e-6,
+                    "{ty:?} row {i} col {n}: {a} vs {b}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn gemm_batched_matches_grouped_gemv() {
+    // attn_k_b's shape for 4 heads, 70 rows: per head a 512 x 256 block.
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(70);
+    let (heads, per, cols, m) = (4, 512, 256, 70);
+    let raw = random_blocks(&mut rng, GgmlType::Q8_0, heads * per * cols);
+    let w = QWeight::from_bytes(&ctx, &raw, GgmlType::Q8_0, cols, heads * per).unwrap();
+    let cpu = mat(GgmlType::Q8_0, &raw, heads * per, cols);
+    let x = f32s(&mut rng, m * heads * cols, -1.0, 1.0);
+    let tx = tensor(&ctx, &x);
+    let y = zeros(&ctx, m * heads * per);
+    let l = GemmLayout {
+        ldx: heads * cols,
+        ldy: heads * per,
+        batches: heads,
+        x_batch: cols,
+        w_batch: per,
+        y_batch: per,
+    };
+    run(&ctx, |p| gemm_with(&ctx, p, &w, &tx, &y, m, per, l).unwrap());
+    let g = y.to_f32().unwrap();
+    for i in 0..m {
+        let e = cpu.mv_grouped(&x[i * heads * cols..(i + 1) * heads * cols], per);
+        let scale: f32 = (e.iter().map(|v| v * v).sum::<f32>() / e.len() as f32).sqrt();
+        for (a, b) in g[i * heads * per..(i + 1) * heads * per].iter().zip(&e) {
+            assert!((a - b).abs() <= 2e-2 * scale, "{a} vs {b}");
+        }
+    }
+}
+
+#[test]
+fn moe_grouped_matches_per_pair_kernels() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(71);
+    let (experts, hidden, ff, used, m) = (12, 512, 256, 8, 70);
+    let g_raw = random_blocks(&mut rng, GgmlType::Iq2Xxs, experts * ff * hidden);
+    let u_raw = random_blocks(&mut rng, GgmlType::Iq2Xxs, experts * ff * hidden);
+    let d_raw = random_blocks(&mut rng, GgmlType::Q2K, experts * hidden * ff);
+    let gw = QWeight::from_bytes(&ctx, &g_raw, GgmlType::Iq2Xxs, hidden, experts * ff)
+        .unwrap();
+    let uw = QWeight::from_bytes(&ctx, &u_raw, GgmlType::Iq2Xxs, hidden, experts * ff)
+        .unwrap();
+    let dw =
+        QWeight::from_bytes(&ctx, &d_raw, GgmlType::Q2K, ff, experts * hidden).unwrap();
+    let x = f32s(&mut rng, m * hidden, -2.0, 2.0);
+    // Distinct experts per row, skewed so some experts get more than 64 pairs.
+    let sel: Vec<u32> = (0..m)
+        .flat_map(|i| (0..used).map(move |s| ((i * (s + 1) + s * s) % experts) as u32))
+        .collect();
+    let wts = f32s(&mut rng, m * used, 0.1, 0.6);
+    let shared = f32s(&mut rng, m * hidden, -1.0, 1.0);
+    let tx = tensor(&ctx, &x);
+    let tsel =
+        Tensor::from_bytes(&ctx, bytemuck::cast_slice(&sel), &[sel.len()], DType::U32)
+            .unwrap();
+    let tw = tensor(&ctx, &wts);
+    let grouped = tensor(&ctx, &shared);
+    let reference = tensor(&ctx, &shared);
+    let mid = zeros(&ctx, m * used * ff);
+    let gs = MoeGroupScratch::new(&ctx, m * used, experts, ff, hidden).unwrap();
+    run(&ctx, |p| {
+        moe_grouped(
+            &ctx, p, &gw, &uw, &dw, ff, hidden, &tx, &tsel, &tw, &grouped, &gs, m,
+            used, experts, 0.05,
+        )
+        .unwrap();
+        moe_gate_up(&ctx, p, &gw, &uw, ff, &tx, &tsel, &tw, &mid, m, used, 0.05)
+            .unwrap();
+        moe_down(
+            &ctx,
+            p,
+            &dw,
+            hidden,
+            &mid,
+            &tsel,
+            Some(&reference),
+            &reference,
+            m,
+            used,
+        )
+        .unwrap();
+    });
+    let a = grouped.to_f32().unwrap();
+    let b = reference.to_f32().unwrap();
+    let scale = (b.iter().map(|v| v * v).sum::<f32>() / b.len() as f32).sqrt();
+    for (k, (x, y)) in a.iter().zip(&b).enumerate() {
+        assert!((x - y).abs() <= 3e-2 * scale, "element {k}: {x} vs {y}");
+    }
+}

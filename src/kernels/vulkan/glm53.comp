@@ -890,6 +890,10 @@ void main() {
     const uint pool_start = pool * POOL;
     const uint input_end = pos0 + n_tokens;
     const bool complete = pool_start + POOL <= input_end;
+    // The pool of the last fed token keeps its rows in the tail buffers
+    // even when it completes: a speculative row that completes it may be
+    // rolled back and fed again. (Only it: the tail is one pool's rows.)
+    const bool keeps_tail = pool == (input_end - 1u) / POOL;
     float gate_v[4];
     [[unroll]] for (uint r = 0u; r < POOL; r++) {
         const uint pos = pool_start + r;
@@ -898,10 +902,10 @@ void main() {
             const uint src = pos - pos0;
             k_value = F32(arg(0)).v[src * HD + tid];
             g_value = F32(arg(1)).v[src * HD + tid];
-            // Kept even when the pool completes: a speculative row that
-            // completes it may be rolled back and fed again.
-            F32(arg(6)).v[r * HD + tid] = k_value;
-            F32(arg(7)).v[r * HD + tid] = g_value;
+            if (keeps_tail) {
+                F32(arg(6)).v[r * HD + tid] = k_value;
+                F32(arg(7)).v[r * HD + tid] = g_value;
+            }
         } else if (pos < pos0) {
             k_value = F32(arg(6)).v[r * HD + tid];
             g_value = F32(arg(7)).v[r * HD + tid];

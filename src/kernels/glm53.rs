@@ -213,6 +213,236 @@ fn gemv_dispatch(
     )
 }
 
+/// Rows (of activations) at which [`gemm`] takes over from the GEMV.
+pub const GEMM_MIN_ROWS: usize = GEMV_MAX_ROWS + 1;
+
+/// The GEMM's operand layout beyond `y[i][n] = w[n] . x[i]`, `x` and `y`
+/// rows `ldx` and `ldy` elements apart; batch `b` (grid z) reads `x` from
+/// `b * x_batch` elements on, weight rows from `b * w_batch` on, and writes
+/// `y` from `b * y_batch` on.
+#[derive(Clone, Copy)]
+pub struct GemmLayout {
+    pub ldx: usize,
+    pub ldy: usize,
+    pub batches: usize,
+    pub x_batch: usize,
+    pub w_batch: usize,
+    pub y_batch: usize,
+}
+
+fn gemm_name(ty: GgmlType) -> Result<&'static str> {
+    Ok(match ty {
+        GgmlType::Q8_0 => "glm53_gemm_q8_0",
+        GgmlType::Q4K => "glm53_gemm_q4_k",
+        GgmlType::Bf16 => "glm53_gemm_bf16",
+        GgmlType::F32 => "glm53_gemm_f32",
+        other => anyhow::bail!("no GLM GEMM over {other:?}"),
+    })
+}
+
+/// `y[i][n] = w[n] . x[i]` for `m` rows on the matrix units (operands
+/// rounded to bfloat16, f32 accumulation): the prefill's projections.
+/// `n` is the weight rows a batch uses (all of `w`'s without batches).
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_with(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    w: &QWeight,
+    x: &Tensor,
+    y: &Tensor,
+    m: usize,
+    n: usize,
+    l: GemmLayout,
+) -> Result<()> {
+    check_f32(&[x, y])?;
+    ensure!(w.cols.is_multiple_of(32), "GEMM row of {} values", w.cols);
+    ensure!(
+        l.ldx % 4 == 0 && l.x_batch % 4 == 0,
+        "GEMM activations must be 16-byte aligned"
+    );
+    ensure!((l.batches - 1) * l.w_batch + n <= w.rows, "GEMM weight rows");
+    ensure!(
+        x.numel() >= (l.batches - 1) * l.x_batch + (m - 1) * l.ldx + w.cols,
+        "GEMM input of {}",
+        x.numel()
+    );
+    ensure!(
+        y.numel() >= (l.batches - 1) * l.y_batch + (m - 1) * l.ldy + n,
+        "GEMM output"
+    );
+    let pipeline = ctx.pipeline(gemm_name(w.ty)?, SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[x.binding(), w.t.binding(), y.binding()],
+        &[
+            &u32_bytes(m),
+            &u32_bytes(n),
+            &u32_bytes(w.cols),
+            &u32_bytes(w.row_bytes),
+            &u32_bytes(l.ldx),
+            &u32_bytes(l.ldy),
+            &u32_bytes(l.x_batch),
+            &u32_bytes(l.w_batch),
+            &u32_bytes(l.y_batch),
+        ],
+        Grid::Threadgroups {
+            groups: (n.div_ceil(64), m.div_ceil(64), l.batches),
+            threadgroup: (128, 1, 1),
+        },
+    )
+}
+
+/// [`gemm_with`] over plain packed rows.
+pub fn gemm(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    w: &QWeight,
+    x: &Tensor,
+    y: &Tensor,
+    m: usize,
+) -> Result<()> {
+    let l = GemmLayout {
+        ldx: w.cols,
+        ldy: w.rows,
+        batches: 1,
+        x_batch: 0,
+        w_batch: 0,
+        y_batch: 0,
+    };
+    gemm_with(ctx, pass, w, x, y, m, w.rows, l)
+}
+
+/// Scratch for [`moe_grouped`], sized for `pairs` routed pairs.
+pub struct MoeGroupScratch {
+    pub pairs: Tensor,
+    pub tiles: Tensor,
+    pub tile_count: Tensor,
+    pub g: Tensor,
+    pub u: Tensor,
+    pub mid: Tensor,
+    pub down: Tensor,
+}
+
+impl MoeGroupScratch {
+    pub fn new(
+        ctx: &MetalContext,
+        pairs: usize,
+        experts: usize,
+        ff: usize,
+        hidden: usize,
+    ) -> Result<Self> {
+        let max_tiles = pairs.div_ceil(64) + experts;
+        Ok(Self {
+            pairs: Tensor::zeros(ctx, &[pairs], DType::U32)?,
+            tiles: Tensor::zeros(ctx, &[3 * max_tiles], DType::U32)?,
+            tile_count: Tensor::zeros(ctx, &[1], DType::U32)?,
+            g: Tensor::zeros(ctx, &[pairs * ff], DType::F32)?,
+            u: Tensor::zeros(ctx, &[pairs * ff], DType::F32)?,
+            mid: Tensor::zeros(ctx, &[pairs * ff], DType::F32)?,
+            down: Tensor::zeros(ctx, &[pairs * hidden], DType::F32)?,
+        })
+    }
+}
+
+/// Routed experts over a run of `m` rows grouped by expert (prefill): each
+/// expert's rows are one GEMM on the matrix units instead of one GEMV per
+/// pair. `out[i] = sum_s w[i][s] * down(swiglu(gate x[i], up x[i])) +
+/// out[i]` (`out` holds the shared expert's output on entry).
+#[allow(clippy::too_many_arguments)]
+pub fn moe_grouped(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    gate: &QWeight,
+    up: &QWeight,
+    down: &QWeight,
+    ff: usize,
+    hidden: usize,
+    x: &Tensor,
+    sel: &Tensor,
+    weights: &Tensor,
+    out: &Tensor,
+    sc: &MoeGroupScratch,
+    m: usize,
+    used: usize,
+    experts: usize,
+    limit: f32,
+) -> Result<()> {
+    let pairs = m * used;
+    ensure!(
+        sc.pairs.numel() >= pairs,
+        "grouped MoE scratch for {} pairs",
+        sc.pairs.numel()
+    );
+    let group = ctx.pipeline("glm53_moe_group", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &group,
+        &[
+            sel.binding(),
+            sc.pairs.binding(),
+            sc.tiles.binding(),
+            sc.tile_count.binding(),
+        ],
+        &[&u32_bytes(pairs), &u32_bytes(experts)],
+        Grid::Threadgroups { groups: (1, 1, 1), threadgroup: (1024, 1, 1) },
+    )?;
+    pass.memory_barrier()?;
+    let max_tiles = pairs.div_ceil(64) + experts;
+    let gemm_moe =
+        |w: &QWeight, x: &Tensor, y: &Tensor, n: usize, x_shift: usize| -> Result<()> {
+            let name = match w.ty {
+                GgmlType::Iq2Xxs => "glm53_gemm_moe_iq2_xxs",
+                GgmlType::Q2K => "glm53_gemm_moe_q2_k",
+                other => anyhow::bail!("no grouped expert GEMM over {other:?}"),
+            };
+            let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
+            pass.dispatch_at(
+                &pipeline,
+                &[
+                    x.binding(),
+                    w.t.binding(),
+                    y.binding(),
+                    sc.pairs.binding(),
+                    sc.tiles.binding(),
+                    sc.tile_count.binding(),
+                ],
+                &[
+                    &u32_bytes(n),
+                    &u32_bytes(w.cols),
+                    &u32_bytes(w.row_bytes),
+                    &u32_bytes(w.cols),
+                    &u32_bytes(n),
+                    &u32_bytes(x_shift),
+                ],
+                Grid::Threadgroups {
+                    groups: (n.div_ceil(64), max_tiles, 1),
+                    threadgroup: (128, 1, 1),
+                },
+            )
+        };
+    ensure!(used.is_power_of_two(), "experts used {used}");
+    let shift = used.trailing_zeros() as usize;
+    gemm_moe(gate, x, &sc.g, ff, shift)?;
+    gemm_moe(up, x, &sc.u, ff, shift)?;
+    pass.memory_barrier()?;
+    let swiglu = ctx.pipeline("glm53_moe_swiglu", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &swiglu,
+        &[sc.g.binding(), sc.u.binding(), weights.binding(), sc.mid.binding()],
+        &[&u32_bytes(ff), &f32_bytes(limit)],
+        Grid::Threads { grid: (ff, pairs, 1), threadgroup: (256, 1, 1) },
+    )?;
+    pass.memory_barrier()?;
+    gemm_moe(down, &sc.mid, &sc.down, hidden, 0)?;
+    pass.memory_barrier()?;
+    let combine = ctx.pipeline("glm53_moe_combine", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &combine,
+        &[sc.down.binding(), out.binding(), out.binding()],
+        &[&u32_bytes(hidden), &u32_bytes(used)],
+        Grid::Threads { grid: (hidden, m, 1), threadgroup: (256, 1, 1) },
+    )
+}
+
 /// Routed experts' gate and up with the clamped SwiGLU, weighted:
 /// `mid[i * used + s] = w[i][s] * swiglu(gate_e x[i], up_e x[i])` for the
 /// `used` experts `sel[i]` of each of the `m` rows.

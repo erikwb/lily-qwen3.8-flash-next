@@ -484,9 +484,14 @@ fn bench(
     let mut sc = model.new_scratch(&ctx)?;
     for run in 0..runs {
         let mut st = model.new_state(&ctx, prompt_len + n + 8)?;
+        let _ = lily::metal::profile::take();
         let t = Instant::now();
         model.prefill(&ctx, &mut st, &mut sc, &ids)?;
         let pf = t.elapsed().as_secs_f64();
+        if ctx.profiling() {
+            eprintln!("prefill of {prompt_len} tokens, per prefill:");
+            profile_report(1);
+        }
         let mut next = argmax(&sc.logits.to_f32()?[..vocab]) as u32;
         let t = Instant::now();
         let mut steps = Vec::with_capacity(n);

@@ -23,6 +23,9 @@ use crate::tensor::{DType, Tensor};
 /// Rows one forward step takes (the GEMV's limit).
 pub const MAX_ROWS: usize = k::GEMV_MAX_ROWS;
 
+/// Rows a prefill step takes (projections on the matrix units).
+pub const PREFILL_ROWS: usize = 1024;
+
 /// Mapped regions are at most this large (single tensors larger than it get
 /// a region of their own).
 const REGION_BYTES: u64 = 1 << 30;
@@ -401,7 +404,7 @@ impl Glm53State {
             })
             .collect::<Result<_>>()?;
         let pool_cap = capacity / 4 + 1;
-        let pool_scores = Tensor::zeros(ctx, &[MAX_ROWS * pool_cap], DType::F32)?;
+        let pool_scores = Tensor::zeros(ctx, &[PREFILL_ROWS * pool_cap], DType::F32)?;
         Ok(Self {
             pos: 0,
             capacity,
@@ -487,6 +490,7 @@ pub struct Scratch {
     rsel: Tensor,
     rw: Tensor,
     moe_mid: Tensor,
+    moe_group: k::MoeGroupScratch,
     // Head
     /// The stream mean of the last step's rows (the MTP head's input).
     pub hidden: Tensor,
@@ -513,13 +517,15 @@ pub struct Scratch {
 
 impl Scratch {
     fn new(ctx: &MetalContext, cfg: &Config) -> Result<Self> {
-        let m = MAX_ROWS;
+        let m = PREFILL_ROWS;
         let f = |n: usize| Tensor::zeros(ctx, &[n], DType::F32);
         let u = |n: usize| Tensor::zeros(ctx, &[n], DType::U32);
         let p = cfg.kda_projection();
         let hq = cfg.n_head * cfg.key_dim;
         let s = cfg.indexer_selected_limit().next_multiple_of(8);
-        let logits = f(m * cfg.vocab)?;
+        // Logits of every row only for steps of up to MAX_ROWS (verify,
+        // scoring): 256 rows would be 158 MB.
+        let logits = f(MAX_ROWS * cfg.vocab)?;
         Ok(Self {
             logits_last: logits.view(0, &[cfg.vocab])?,
             tokens: u(m)?,
@@ -558,7 +564,14 @@ impl Scratch {
             rlogits: f(m * cfg.n_expert)?,
             rsel: u(m * cfg.n_expert_used)?,
             rw: f(m * cfg.n_expert_used)?,
-            moe_mid: f(m * cfg.n_expert_used * cfg.ff_expert)?,
+            moe_mid: f(MAX_ROWS * cfg.n_expert_used * cfg.ff_expert)?,
+            moe_group: k::MoeGroupScratch::new(
+                ctx,
+                m * cfg.n_expert_used,
+                cfg.n_expert,
+                cfg.ff_expert,
+                cfg.hidden,
+            )?,
             hidden: f(m * cfg.hidden)?,
             hidden_norm: f(m * cfg.hidden)?,
             logits,
@@ -650,8 +663,8 @@ impl Glm53Model {
         tokens: &[u32],
     ) -> Result<()> {
         let n = tokens.len();
-        for (i, chunk) in tokens.chunks(MAX_ROWS).enumerate() {
-            let last = (i + 1) * MAX_ROWS >= n;
+        for (i, chunk) in tokens.chunks(PREFILL_ROWS).enumerate() {
+            let last = (i + 1) * PREFILL_ROWS >= n;
             self.forward(ctx, st, sc, chunk, last)?;
         }
         Ok(())
@@ -668,7 +681,7 @@ impl Glm53Model {
     ) -> Result<()> {
         let cfg = &self.cfg;
         let m = tokens.len();
-        ensure!((1..=MAX_ROWS).contains(&m), "forward of {m} rows");
+        ensure!((1..=PREFILL_ROWS).contains(&m), "forward of {m} rows");
         let pos0 = st.pos;
         ensure!(
             pos0 + m <= st.capacity,
@@ -677,7 +690,7 @@ impl Glm53Model {
             pos0 + m
         );
         sc.tokens.write_bytes(bytemuck::cast_slice(&{
-            let mut t = [0u32; MAX_ROWS];
+            let mut t = [0u32; PREFILL_ROWS];
             t[..m].copy_from_slice(tokens);
             t
         }))?;
@@ -756,7 +769,8 @@ impl Glm53Model {
     ) -> Result<()> {
         let cfg = &self.cfg;
         let pos0 = st.pos;
-        ensure!((1..=MAX_ROWS).contains(&m), "step of {m} rows");
+        ensure!((1..=PREFILL_ROWS).contains(&m), "step of {m} rows");
+        ensure!(logits != Logits::All || m <= MAX_ROWS, "logits of {m} rows");
         ensure!(
             pos0 + m <= st.capacity,
             "state capacity {} for position {}",
@@ -937,6 +951,25 @@ impl Glm53Model {
         pass.memory_barrier()
     }
 
+    /// Projections of one input: the GEMV (several weights in one dispatch)
+    /// up to [`MAX_ROWS`] rows, the matrix-unit GEMM beyond.
+    fn proj(
+        &self,
+        ctx: &MetalContext,
+        pass: &ComputePass<'_>,
+        sets: &[(&QWeight, &Tensor)],
+        x: &Tensor,
+        m: usize,
+    ) -> Result<()> {
+        if m <= MAX_ROWS {
+            return k::gemv_sets(ctx, pass, sets, x, m);
+        }
+        for &(w, y) in sets {
+            k::gemm(ctx, pass, w, x, y, m)?;
+        }
+        Ok(())
+    }
+
     /// The pass a step is encoded into: concurrent, its dependency levels
     /// separated by barriers; `LILY_GLM53_SERIAL=1` makes every dispatch its
     /// own level (A/B and debugging).
@@ -1014,8 +1047,8 @@ impl Glm53Model {
         let cfg = &self.cfg;
         match (a, &st.layers[il]) {
             (AttnW::Kda(w), LayerState::Kda { conv, s, conv_alt, s_alt }) => {
-                k::gemv_sets(ctx, pass, &[(&w.q, &sc.kq), (&w.k, &sc.kk)], &sc.xn, m)?;
-                k::gemv_sets(
+                self.proj(ctx, pass, &[(&w.q, &sc.kq), (&w.k, &sc.kk)], &sc.xn, m)?;
+                self.proj(
                     ctx,
                     pass,
                     &[
@@ -1029,8 +1062,8 @@ impl Glm53Model {
                 )?;
                 pass.memory_barrier()?;
                 // f_b and g_b read different inputs: one dispatch each.
-                k::gemv(ctx, pass, &w.f_b, &sc.klow, &sc.kgate, m)?;
-                k::gemv(ctx, pass, &w.g_b, &sc.klow2, &sc.kog, m)?;
+                self.proj(ctx, pass, &[(&w.f_b, &sc.kgate)], &sc.klow, m)?;
+                self.proj(ctx, pass, &[(&w.g_b, &sc.kog)], &sc.klow2, m)?;
                 pass.memory_barrier()?;
                 let p = KdaParams {
                     q_conv: &w.q_conv,
@@ -1058,7 +1091,7 @@ impl Glm53Model {
                 });
                 k::kda(ctx, pass, &p, &x, conv, s, &sc.kout, m, snap)?;
                 pass.memory_barrier()?;
-                k::gemv(ctx, pass, &w.out, &sc.kout, &sc.attn_out, m)?;
+                self.proj(ctx, pass, &[(&w.out, &sc.attn_out)], &sc.kout, m)?;
                 pass.memory_barrier()
             }
             (AttnW::Dsa(w), LayerState::Dsa { latent, pooled, tail_k, tail_g }) => {
@@ -1067,7 +1100,7 @@ impl Glm53Model {
                 let limit = cfg.indexer_selected_limit();
                 let sparse = w.indexer.is_some() && pos0 + m > limit;
                 // Level 1: everything that reads xn.
-                k::gemv_sets(
+                self.proj(
                     ctx,
                     pass,
                     &[(&w.q_a, &sc.qr), (&w.kv_a, &sc.kv_raw)],
@@ -1079,7 +1112,7 @@ impl Glm53Model {
                     if sparse {
                         sets.push((&ix.proj, &sc.iw));
                     }
-                    k::gemv_sets(ctx, pass, &sets, &sc.xn, m)?;
+                    self.proj(ctx, pass, &sets, &sc.xn, m)?;
                 }
                 pass.memory_barrier()?;
                 // Level 2: the norms, the latent store, the pooled keys.
@@ -1115,25 +1148,38 @@ impl Glm53Model {
                 }
                 pass.memory_barrier()?;
                 // Level 3: the queries.
-                k::gemv(ctx, pass, &w.q_b, &sc.qr, &sc.q, m)?;
+                self.proj(ctx, pass, &[(&w.q_b, &sc.q)], &sc.qr, m)?;
                 if let (true, Some(ix)) = (sparse, &w.indexer) {
-                    k::gemv(ctx, pass, &ix.q_b, &sc.qr, &sc.iq, m)?;
+                    self.proj(ctx, pass, &[(&ix.q_b, &sc.iq)], &sc.qr, m)?;
                 }
                 pass.memory_barrier()?;
                 // Level 4: absorbed queries, pool scores.
-                k::gemv_with(
-                    ctx,
-                    pass,
-                    &w.k_b,
-                    &sc.q,
-                    &sc.qk_low,
-                    m,
-                    GemvLayout {
-                        x_group: kv,
-                        x_row_stride: hq,
-                        y_row_stride: cfg.n_head * kv,
-                    },
-                )?;
+                if m <= MAX_ROWS {
+                    k::gemv_with(
+                        ctx,
+                        pass,
+                        &w.k_b,
+                        &sc.q,
+                        &sc.qk_low,
+                        m,
+                        GemvLayout {
+                            x_group: kv,
+                            x_row_stride: hq,
+                            y_row_stride: cfg.n_head * kv,
+                        },
+                    )?;
+                } else {
+                    // Per head: qk_low[i][h] (512) = k_b[h] (512 x 256) . q[i][h].
+                    let l = k::GemmLayout {
+                        ldx: hq,
+                        ldy: cfg.n_head * kv,
+                        batches: cfg.n_head,
+                        x_batch: cfg.key_dim,
+                        w_batch: kv,
+                        y_batch: kv,
+                    };
+                    k::gemm_with(ctx, pass, &w.k_b, &sc.q, &sc.qk_low, m, kv, l)?;
+                }
                 let rows = if sparse {
                     let scale =
                         1.0 / ((cfg.indexer_dim * cfg.indexer_heads) as f32).sqrt();
@@ -1193,21 +1239,43 @@ impl Glm53Model {
                     1.0 / (cfg.key_dim as f32).sqrt(),
                 )?;
                 pass.memory_barrier()?;
-                k::gemv_with(
-                    ctx,
-                    pass,
-                    &w.v_b,
-                    &sc.lat,
-                    &sc.heads,
-                    m,
-                    GemvLayout {
-                        x_group: cfg.value_dim,
-                        x_row_stride: cfg.n_head * kv,
-                        y_row_stride: cfg.n_head * cfg.value_dim,
-                    },
-                )?;
+                if m <= MAX_ROWS {
+                    k::gemv_with(
+                        ctx,
+                        pass,
+                        &w.v_b,
+                        &sc.lat,
+                        &sc.heads,
+                        m,
+                        GemvLayout {
+                            x_group: cfg.value_dim,
+                            x_row_stride: cfg.n_head * kv,
+                            y_row_stride: cfg.n_head * cfg.value_dim,
+                        },
+                    )?;
+                } else {
+                    // Per head: heads[i][h] (256) = v_b[h] (256 x 512) . lat[i][h].
+                    let l = k::GemmLayout {
+                        ldx: cfg.n_head * kv,
+                        ldy: cfg.n_head * cfg.value_dim,
+                        batches: cfg.n_head,
+                        x_batch: kv,
+                        w_batch: cfg.value_dim,
+                        y_batch: cfg.value_dim,
+                    };
+                    k::gemm_with(
+                        ctx,
+                        pass,
+                        &w.v_b,
+                        &sc.lat,
+                        &sc.heads,
+                        m,
+                        cfg.value_dim,
+                        l,
+                    )?;
+                }
                 pass.memory_barrier()?;
-                k::gemv(ctx, pass, &w.out, &sc.heads, &sc.attn_out, m)?;
+                self.proj(ctx, pass, &[(&w.out, &sc.attn_out)], &sc.heads, m)?;
                 pass.memory_barrier()
             }
             _ => anyhow::bail!("layer {il}: weights and state disagree"),
@@ -1227,23 +1295,17 @@ impl Glm53Model {
         let lim = cfg.swiglu_limit;
         match f {
             FfnW::Dense { gate, up, down } => {
-                k::gemv_sets(ctx, pass, &[(gate, &sc.fg), (up, &sc.fu)], &sc.xn, m)?;
+                self.proj(ctx, pass, &[(gate, &sc.fg), (up, &sc.fu)], &sc.xn, m)?;
                 pass.memory_barrier()?;
                 k::swiglu(ctx, pass, &sc.fg, &sc.fu, &sc.fmid, m * cfg.ff_dense, lim)?;
                 pass.memory_barrier()?;
-                k::gemv(ctx, pass, down, &sc.fmid, &sc.ffn_out, m)?;
+                self.proj(ctx, pass, &[(down, &sc.ffn_out)], &sc.fmid, m)?;
                 pass.memory_barrier()
             }
             FfnW::Moe { router, bias, gate, up, down, sh_gate, sh_up, sh_down } => {
                 let used = cfg.n_expert_used;
-                k::gemv(ctx, pass, router, &sc.xn, &sc.rlogits, m)?;
-                k::gemv_sets(
-                    ctx,
-                    pass,
-                    &[(sh_gate, &sc.fg), (sh_up, &sc.fu)],
-                    &sc.xn,
-                    m,
-                )?;
+                self.proj(ctx, pass, &[(router, &sc.rlogits)], &sc.xn, m)?;
+                self.proj(ctx, pass, &[(sh_gate, &sc.fg), (sh_up, &sc.fu)], &sc.xn, m)?;
                 pass.memory_barrier()?;
                 k::router_topk(
                     ctx,
@@ -1259,6 +1321,31 @@ impl Glm53Model {
                 )?;
                 k::swiglu(ctx, pass, &sc.fg, &sc.fu, &sc.fmid, m * cfg.ff_expert, lim)?;
                 pass.memory_barrier()?;
+                if m > MAX_ROWS {
+                    // A prompt run: shared expert first, then the routed
+                    // experts grouped by expert on the matrix units.
+                    self.proj(ctx, pass, &[(sh_down, &sc.ffn_out)], &sc.fmid, m)?;
+                    pass.memory_barrier()?;
+                    k::moe_grouped(
+                        ctx,
+                        pass,
+                        gate,
+                        up,
+                        down,
+                        cfg.ff_expert,
+                        cfg.hidden,
+                        &sc.xn,
+                        &sc.rsel,
+                        &sc.rw,
+                        &sc.ffn_out,
+                        &sc.moe_group,
+                        m,
+                        used,
+                        cfg.n_expert,
+                        lim,
+                    )?;
+                    return pass.memory_barrier();
+                }
                 k::moe_gate_up(
                     ctx,
                     pass,
@@ -1273,7 +1360,7 @@ impl Glm53Model {
                     used,
                     lim,
                 )?;
-                k::gemv(ctx, pass, sh_down, &sc.fmid, &sc.ffn_out, m)?;
+                self.proj(ctx, pass, &[(sh_down, &sc.ffn_out)], &sc.fmid, m)?;
                 pass.memory_barrier()?;
                 // Routed sum plus the shared expert's output.
                 k::moe_down(

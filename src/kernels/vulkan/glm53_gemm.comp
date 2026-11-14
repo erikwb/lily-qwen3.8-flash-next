@@ -1,0 +1,237 @@
+#version 460
+// GLM 5.3 Flash prefill GEMM: Y[m][n] = X[m] . W[n] for runs of prompt rows
+// (src/kernels/glm53.rs `gemm`), X f32, W GGUF blocks. A threadgroup of four
+// subgroups computes a 64-row x 64-column tile; each K step decodes one
+// 32-value task of 64 weight rows (glm53_quant.glsl, exact) and 64 rows of
+// X into bfloats in threadgroup memory, and each subgroup multiplies its
+// 32 x 32 quarter (2 x 2 blocks of 16 x 16) on the matrix units with f32
+// accumulators. Rows past M and N are clamped on load and not stored.
+// Batches (grid z) step X, W and Y by their own strides: the per-head
+// attn_k_b and attn_v_b projections.
+// Buffers: 0 X, 1 W, 2 Y. Params: 3 M, 4 N, 5 K, 6 row_bytes, 7 ldx,
+// 8 ldy, 9 x_batch (elements), 10 w_batch (rows), 11 y_batch (elements).
+#include "common.glsl"
+#include "glm53_quant.glsl"
+#include "matmul.glsl"
+
+#if defined(KERNEL_glm53_gemm_q8_0) || defined(KERNEL_glm53_gemm_q4_k) || \
+    defined(KERNEL_glm53_gemm_bf16) || defined(KERNEL_glm53_gemm_f32) || \
+    defined(KERNEL_glm53_gemm_moe_iq2_xxs) || defined(KERNEL_glm53_gemm_moe_q2_k)
+#if defined(KERNEL_glm53_gemm_q8_0)
+#define GEMM_TYPE GLM53_Q8_0
+#elif defined(KERNEL_glm53_gemm_q4_k)
+#define GEMM_TYPE GLM53_Q4_K
+#elif defined(KERNEL_glm53_gemm_bf16)
+#define GEMM_TYPE GLM53_BF16
+#elif defined(KERNEL_glm53_gemm_f32)
+#define GEMM_TYPE GLM53_F32
+#elif defined(KERNEL_glm53_gemm_moe_iq2_xxs)
+#define GEMM_TYPE GLM53_IQ2_XXS
+#define GEMM_MOE 1
+#else
+#define GEMM_TYPE GLM53_Q2_K
+#define GEMM_MOE 1
+#endif
+
+// Tiles of 64 rows x 32 values as bfloats, rows 40 apart (80 bytes).
+#define TS 40u
+shared bfloat16_t xs[64 * TS];
+shared bfloat16_t ws[64 * TS];
+
+uint glm53_bf16_bits(float f) {
+    const uint u = floatBitsToUint(f);
+    return (u + 0x7fffu + ((u >> 16u) & 1u)) >> 16u;
+}
+
+#ifdef GEMM_MOE
+// Routed experts over a run of rows, grouped by expert: tile y is
+// tiles[y] = (expert, first, count) of the expert-sorted pair list `pairs`
+// (glm53_moe_group); its rows are pairs[first ..], X row pairs[k] >>
+// x_shift (the token for gate/up, the pair for down), Y row pairs[k].
+// Buffers: 0 X, 1 W (the expert stack), 2 Y, 3 pairs u32, 4 tiles u32
+// [3 per tile], 5 tile count u32. Params: 6 N (rows per expert), 7 K,
+// 8 row_bytes, 9 ldx, 10 ldy, 11 x_shift.
+#endif
+void main() {
+#ifdef GEMM_MOE
+    if (gl_WorkGroupID.y >= U32(arg(5)).v[0]) return;
+    const uint N = arg_u32(6);
+    const uint K = arg_u32(7);
+    const uint row_bytes = arg_u32(8);
+    const uint ldx = arg_u32(9);
+    const uint ldy = arg_u32(10);
+    const uint x_shift = arg_u32(11);
+    const uint expert = U32(arg(4)).v[3u * gl_WorkGroupID.y];
+    const uint first = U32(arg(4)).v[3u * gl_WorkGroupID.y + 1u];
+    const uint M = U32(arg(4)).v[3u * gl_WorkGroupID.y + 2u];
+    const uint64_t X = arg(0);
+    const uint64_t W = arg(1) + uint64_t(expert) * N * row_bytes;
+    const uint64_t Y = arg(2);
+    const uint m0 = 0u;
+#else
+    const uint M = arg_u32(3);
+    const uint N = arg_u32(4);
+    const uint K = arg_u32(5);
+    const uint row_bytes = arg_u32(6);
+    const uint ldx = arg_u32(7);
+    const uint ldy = arg_u32(8);
+    const uint batch = gl_WorkGroupID.z;
+    const uint64_t X = arg(0) + 4u * uint64_t(batch) * arg_u32(9);
+    const uint64_t W = arg(1) + uint64_t(batch) * arg_u32(10) * row_bytes;
+    const uint64_t Y = arg(2) + 4u * uint64_t(batch) * arg_u32(11);
+    const uint m0 = gl_WorkGroupID.y * 64u;
+#endif
+    const uint n0 = gl_WorkGroupID.x * 64u;
+    const uint tid = gl_LocalInvocationIndex;
+    const uint sg = gl_SubgroupID;
+    const uint rb = (sg >> 1u) * 32u;
+    const uint cb = (sg & 1u) * 32u;
+    // This thread's staging row: weight rows for threads 0-63, X rows for
+    // 64-127.
+    const bool stages_w = tid < 64u;
+    const uint srow = tid & 63u;
+    const uint64_t wrow = W + uint64_t(min(n0 + srow, N - 1u)) * row_bytes;
+#ifdef GEMM_MOE
+    const uint xr = U32(arg(3)).v[first + min(srow, M - 1u)] >> x_shift;
+    const uint64_t xrow = X + 4u * uint64_t(xr) * ldx;
+#else
+    const uint64_t xrow = X + 4u * uint64_t(min(m0 + srow, M - 1u)) * ldx;
+#endif
+    MatC c00 = MatC(0.0), c01 = MatC(0.0), c10 = MatC(0.0), c11 = MatC(0.0);
+    const uint tasks = K / GLM53_TASK;
+    for (uint t = 0u; t < tasks; t++) {
+        float v[32];
+        if (stages_w) {
+            glm53_decode(GEMM_TYPE, wrow, t, v);
+        } else {
+            [[unroll]] for (uint q = 0u; q < 8u; q++) {
+                const vec4 f = F32x4(xrow + 128u * t + 16u * q).v[0];
+                v[4u * q] = f.x;
+                v[4u * q + 1u] = f.y;
+                v[4u * q + 2u] = f.z;
+                v[4u * q + 3u] = f.w;
+            }
+        }
+        barrier();
+        [[unroll]] for (uint e = 0u; e < 32u; e++) {
+            const bfloat16_t b = uintBitsToBFloat16EXT(uint16_t(glm53_bf16_bits(v[e])));
+            if (stages_w) ws[srow * TS + e] = b;
+            else xs[srow * TS + e] = b;
+        }
+        barrier();
+        [[unroll]] for (uint kk = 0u; kk < 32u; kk += 16u) {
+            MatA a0, a1;
+            MatB b0, b1;
+            MAT_LOAD_A(a0, xs, (rb + 0u) * TS + kk, TS);
+            MAT_LOAD_A(a1, xs, (rb + 16u) * TS + kk, TS);
+            MAT_LOAD_B(b0, ws, (cb + 0u) * TS + kk, TS);
+            MAT_LOAD_B(b1, ws, (cb + 16u) * TS + kk, TS);
+            c00 = coopMatMulAdd(a0, b0, c00);
+            c01 = coopMatMulAdd(a0, b1, c01);
+            c10 = coopMatMulAdd(a1, b0, c10);
+            c11 = coopMatMulAdd(a1, b1, c11);
+        }
+    }
+    [[unroll]] for (uint e = 0u; e < 8u; e++) {
+        const uint r = mat_row(e);
+        const uint c = mat_col(e);
+        const uint m_a = m0 + rb + r, m_b = m0 + rb + 16u + r;
+        const uint n_a = n0 + cb + c, n_b = n0 + cb + 16u + c;
+#ifdef GEMM_MOE
+        const uint y_a = m_a < M ? U32(arg(3)).v[first + m_a] : 0u;
+        const uint y_b = m_b < M ? U32(arg(3)).v[first + m_b] : 0u;
+#else
+        const uint y_a = m_a, y_b = m_b;
+#endif
+        if (m_a < M && n_a < N) F32(Y + 4u * uint64_t(y_a) * ldy).v[n_a] = c00[e];
+        if (m_a < M && n_b < N) F32(Y + 4u * uint64_t(y_a) * ldy).v[n_b] = c01[e];
+        if (m_b < M && n_a < N) F32(Y + 4u * uint64_t(y_b) * ldy).v[n_a] = c10[e];
+        if (m_b < M && n_b < N) F32(Y + 4u * uint64_t(y_b) * ldy).v[n_b] = c11[e];
+    }
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// Groups a run's routed pairs (row i, slot s: pair i * used + s) by expert:
+// pairs sorted by expert (order inside an expert arbitrary: each pair's
+// result goes to its own row), and a tile list of (expert, first, count)
+// with at most 64 pairs a tile. One threadgroup of 1024.
+// Buffers: 0 sel u32 [pairs], 1 pairs out, 2 tiles out [3 per tile], 3 tile
+// count out. Params: 4 number of pairs, 5 experts (<= 512).
+// ---------------------------------------------------------------------------
+#ifdef KERNEL_glm53_moe_group
+shared uint counts[512];
+shared uint offsets[512];
+void main() {
+    const uint n = arg_u32(4);
+    const uint E = arg_u32(5);
+    const uint tid = gl_LocalInvocationIndex;
+    for (uint e = tid; e < E; e += 1024u) counts[e] = 0u;
+    barrier();
+    for (uint p = tid; p < n; p += 1024u) atomicAdd(counts[U32(arg(0)).v[p]], 1u);
+    barrier();
+    if (tid == 0u) {
+        uint at = 0u, tiles = 0u;
+        for (uint e = 0u; e < E; e++) {
+            const uint c = counts[e];
+            offsets[e] = at;
+            for (uint s = 0u; s < c; s += 64u) {
+                U32(arg(2)).v[3u * tiles] = e;
+                U32(arg(2)).v[3u * tiles + 1u] = at + s;
+                U32(arg(2)).v[3u * tiles + 2u] = min(64u, c - s);
+                tiles++;
+            }
+            at += c;
+        }
+        U32(arg(3)).v[0] = tiles;
+    }
+    barrier();
+    for (uint p = tid; p < n; p += 1024u) {
+        const uint e = U32(arg(0)).v[p];
+        const uint k = atomicAdd(offsets[e], 1u);
+        U32(arg(1)).v[k] = p;
+    }
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// mid[p][j] = w[p] * silu(min(g, L)) * clamp(u, -L, L) for every routed pair.
+// Grid::Threads (F, pairs). Buffers: 0 g [pairs][F], 1 u, 2 weights
+// [pairs], 3 mid. Params: 4 F, 5 limit.
+// ---------------------------------------------------------------------------
+#ifdef KERNEL_glm53_moe_swiglu
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    const uint F = arg_u32(4);
+    const float limit = arg_f32(5);
+    const uint j = gl_GlobalInvocationID.x;
+    const uint p = gl_GlobalInvocationID.y;
+    const uint64_t at = uint64_t(p) * F + j;
+    float g = F32(arg(0) + 4u * at).v[0], u = F32(arg(1) + 4u * at).v[0];
+    if (limit > 1e-6) {
+        g = min(g, limit);
+        u = clamp(u, -limit, limit);
+    }
+    F32(arg(3) + 4u * at).v[0] = g / (1.0 + exp(-g)) * u * F32(arg(2)).v[p];
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// out[i][r] = sum over the row's slots of down[i * used + s][r], plus
+// shared[i][r] (moe + shared, as ds4). out may be shared.
+// Grid::Threads (H, rows). Buffers: 0 down [pairs][H], 1 shared, 2 out.
+// Params: 3 H, 4 used.
+// ---------------------------------------------------------------------------
+#ifdef KERNEL_glm53_moe_combine
+void main() {
+    if (!LILY_THREAD_IN_GRID) return;
+    const uint H = arg_u32(3);
+    const uint used = arg_u32(4);
+    const uint r = gl_GlobalInvocationID.x;
+    const uint i = gl_GlobalInvocationID.y;
+    float acc = 0.0;
+    for (uint s = 0u; s < used; s++) acc += F32(arg(0) + 4u * (uint64_t(i * used + s) * H)).v[r];
+    const uint64_t at = uint64_t(i) * H + r;
+    F32(arg(2) + 4u * at).v[0] = acc + F32(arg(1) + 4u * at).v[0];
+}
+#endif
