@@ -88,8 +88,18 @@ fn speculative_cycle_after_a_long_prefill() {
         LanguageModel::new_scratch_with_capacity(&model, &ctx, 0).expect("scratch");
     let prompt: Vec<u32> =
         (0..PREFILL_ROWS as u32 + 37).map(|i| 1000 + i % 5000).collect();
-    let params =
-        SamplingParams { temperature: 0.7, top_p: 0.9, ..SamplingParams::greedy() };
+    // Sampling, not greedy (greedy() sets top_k 1), with penalties.
+    let params = SamplingParams {
+        temperature: 0.7,
+        top_k: 40,
+        top_p: 0.9,
+        presence_penalty: 0.3,
+        frequency_penalty: 0.2,
+        repetition_penalty: 1.05,
+        seed: 1234,
+        ..SamplingParams::greedy()
+    };
+    assert!(!params.is_greedy());
     LanguageModel::prefill(
         &model,
         &ctx,
@@ -126,12 +136,149 @@ fn real_model(ctx: &MetalContext) -> Glm53Model {
     use crate::engine::{LanguageModel, LoadOptions};
     let path = std::env::var("LILY_GLM53_GGUF").expect("LILY_GLM53_GGUF");
     let options = LoadOptions { mtp_drafts: 1, ..Default::default() };
-    <Glm53Model as LanguageModel>::load(ctx, std::path::Path::new(&path), &options).expect("load")
+    <Glm53Model as LanguageModel>::load(ctx, std::path::Path::new(&path), &options)
+        .expect("load")
 }
 
 /// A prompt of `n` ordinary text tokens.
 fn prompt(n: usize) -> Vec<u32> {
     (0..n as u32).map(|i| 1000 + (i * 7919) % 50_000).collect()
+}
+
+/// Relative L2 distance of two logit vectors.
+fn rel(a: &[f32], b: &[f32]) -> f64 {
+    let (mut d, mut n) = (0f64, 0f64);
+    for (&x, &y) in a.iter().zip(b) {
+        d += (f64::from(x) - f64::from(y)).powi(2);
+        n += f64::from(y).powi(2);
+    }
+    (d / n).sqrt()
+}
+
+fn argmax(v: &[f32]) -> u32 {
+    v.iter().enumerate().fold(0, |b, (i, &x)| if x > v[b] { i } else { b }) as u32
+}
+
+/// Ordinary decoding: the logits after each of `tokens`, fed one at a time
+/// after `prompt`.
+fn ordinary(
+    m: &Glm53Model,
+    ctx: &MetalContext,
+    prompt: &[u32],
+    tokens: &[u32],
+) -> Vec<Vec<f32>> {
+    let mut st = m.new_state(ctx, prompt.len() + tokens.len() + 8).unwrap();
+    let mut sc = m.new_scratch(ctx).unwrap();
+    m.prefill(ctx, &mut st, &mut sc, prompt).unwrap();
+    tokens
+        .iter()
+        .map(|&t| {
+            m.forward(ctx, &mut st, &mut sc, &[t], true).unwrap();
+            sc.logits_last.to_f32().unwrap()
+        })
+        .collect()
+}
+
+/// Continues `st` ordinarily with `tokens` and checks each step's logits
+/// against `want`: the same top token and a relative L2 distance within
+/// 5e-3 (the verify pass runs KDA's multi-row kernels where ordinary
+/// decoding runs the one-row kernel, so the sums differ in the last bits).
+fn continue_and_compare(
+    m: &Glm53Model,
+    ctx: &MetalContext,
+    st: &mut Glm53State,
+    sc: &mut Scratch,
+    tokens: &[u32],
+    want: &[Vec<f32>],
+    case: &str,
+) {
+    for (k, (&t, w)) in tokens.iter().zip(want).enumerate() {
+        m.forward(ctx, st, sc, &[t], true).unwrap();
+        let got = sc.logits_last.to_f32().unwrap();
+        let r = rel(&got, w);
+        eprintln!("{case}: step {k} relative L2 {r:.2e}");
+        assert!(r < 5e-3, "{case}: step {k} logits differ (relative L2 {r:.2e})");
+        assert_eq!(argmax(&got), argmax(w), "{case}: step {k} top token");
+    }
+}
+
+/// Speculative steps leave the state ordinary decoding would have, for an
+/// accepted draft, a rejected one, a confirmed draft cut at the first row
+/// (the generation ends there), and a rejected row that completes an
+/// indexer pool past the dense window; and a snapshot taken before a step
+/// restores, and forks, to that state.
+#[test]
+#[ignore = "requires LILY_GLM53_GGUF"]
+fn speculative_steps_match_ordinary_decoding() {
+    use crate::engine::{DecodeStateApi, LanguageModel};
+    use crate::kernels::sample::SamplingParams;
+    let ctx = MetalContext::new().expect("context");
+    let m = real_model(&ctx);
+    let greedy = SamplingParams::greedy();
+    // 2102 = 2 mod 4 and past 2051: the verify pass's row 1 (position 2103)
+    // completes a pool and the attention is sparse.
+    for (n, cases) in
+        [(37usize, &["accept", "reject", "first-row"][..]), (2102, &["reject"][..])]
+    {
+        let p = prompt(n);
+        // The greedy continuation; t0 is what the prompt's logits pick.
+        let mut st = m.new_state(&ctx, n + 16).unwrap();
+        let mut sc = m.new_scratch(&ctx).unwrap();
+        m.prefill(&ctx, &mut st, &mut sc, &p).unwrap();
+        let mut toks = vec![argmax(&sc.logits_last.to_f32().unwrap())];
+        for _ in 0..6 {
+            let last = *toks.last().unwrap();
+            m.forward(&ctx, &mut st, &mut sc, &[last], true).unwrap();
+            toks.push(argmax(&sc.logits_last.to_f32().unwrap()));
+        }
+        drop((st, sc));
+        let want = ordinary(&m, &ctx, &p, &toks);
+        for &case in cases {
+            let mut st = LanguageModel::new_state(&m, &ctx, n + 16).unwrap();
+            let mut sc = m.new_scratch(&ctx).unwrap();
+            m.prefill(&ctx, &mut st, &mut sc, &p).unwrap();
+            m.draft_initial(&ctx, &mut st, &mut sc, toks[0], 1, &greedy, 1).unwrap();
+            // The draft: the true next token, or a wrong one.
+            let draft =
+                if case == "reject" { (toks[1] + 1) % 1000 + 5 } else { toks[1] };
+            assert_eq!(draft == toks[1], case != "reject");
+            let (draws, pending) = m
+                .verify(&ctx, &mut st, &mut sc, toks[0], &[draft], &greedy, 1, 1)
+                .unwrap();
+            assert_eq!(draws[0], toks[1], "{case} n={n}: row 0 draw");
+            let kept = usize::from(case == "accept");
+            m.finish_speculation(&ctx, &mut st, &mut sc, kept, true, pending).unwrap();
+            assert_eq!(st.pos(), n + 1 + kept);
+            let label = format!("{case} n={n}");
+            continue_and_compare(
+                &m,
+                &ctx,
+                &mut st,
+                &mut sc,
+                &toks[1 + kept..],
+                &want[1 + kept..],
+                &label,
+            );
+        }
+        if n == 37 {
+            let mut st = LanguageModel::new_state(&m, &ctx, n + 16).unwrap();
+            let mut sc = m.new_scratch(&ctx).unwrap();
+            m.prefill(&ctx, &mut st, &mut sc, &p).unwrap();
+            let snap = st.snapshot(&ctx).unwrap();
+            m.draft_initial(&ctx, &mut st, &mut sc, toks[0], 1, &greedy, 1).unwrap();
+            let (_, pending) = m
+                .verify(&ctx, &mut st, &mut sc, toks[0], &[toks[1]], &greedy, 1, 1)
+                .unwrap();
+            m.finish_speculation(&ctx, &mut st, &mut sc, 1, true, pending).unwrap();
+            let mut fork = LanguageModel::new_state(&m, &ctx, n + 16).unwrap();
+            fork.copy_prefix_from(&ctx, &st, n).unwrap();
+            fork.restore(&ctx, &snap).unwrap();
+            st.restore(&ctx, &snap).unwrap();
+            assert_eq!((st.pos(), fork.pos()), (n, n));
+            continue_and_compare(&m, &ctx, &mut st, &mut sc, &toks, &want, "restored");
+            continue_and_compare(&m, &ctx, &mut fork, &mut sc, &toks, &want, "forked");
+        }
+    }
 }
 
 /// prefill_until stops at a run boundary before committing it and reports
