@@ -452,17 +452,54 @@ fn kda_prefill_long_runs_match_cpu() {
 #[test]
 fn dsa_store_and_attend_match_cpu() {
     // 42 cached rows then 3 rows of queries (SIMT kernels); 25 then a run
-    // of 20 (matrix units).
-    for m in [3, 20] {
-        dsa_causal_case(m);
+    // of 20 (matrix units); runs from row 0 in partial tiles of the
+    // padded widths 8 and 16.
+    for (n, m, s) in [(45, 3, 64), (45, 20, 64), (5, 5, 8), (13, 13, 16)] {
+        dsa_causal_case(n, m, s, false);
     }
 }
 
-fn dsa_causal_case(m: usize) {
+/// Queries at and past f16's range on both routes (a tile with one goes
+/// through f32 on the matrix route): finite, and as the CPU computes.
+#[test]
+fn dsa_attend_large_queries_stay_finite() {
+    for m in [3, 20] {
+        dsa_causal_case(45, m, 64, true);
+    }
+}
+
+/// The matrix route's widths are padded to 8.
+#[test]
+fn dsa_attend_refuses_unpadded_prompt_widths() {
+    let ctx = ctx();
+    let (m, s) = (5, 5);
+    let cache = Tensor::zeros(&ctx, &[8 * 512], DType::F16).unwrap();
+    let qk = zeros(&ctx, m * 64 * 512);
+    let (scores, denom) = (zeros(&ctx, m * 64 * 8), zeros(&ctx, m * 64));
+    let (lat, partial) = (zeros(&ctx, m * 64 * 512), zeros(&ctx, 4 * 8 * 64 * 512));
+    let pass = ctx.begin().unwrap();
+    let r = dsa_attend(
+        &ctx,
+        &pass,
+        &qk,
+        &cache,
+        Rows::Causal { pos0: 0 },
+        &scores,
+        &denom,
+        &lat,
+        &partial,
+        m,
+        s,
+        1.0,
+    );
+    assert!(r.is_err());
+    pass.commit_wait().unwrap();
+}
+
+fn dsa_causal_case(n: usize, m: usize, s: usize, big: bool) {
     let ctx = ctx();
     let mut rng = StdRng::seed_from_u64(61);
     let cfg = crate::glm53::Config::glm53_flash();
-    let n = 45;
     let kv_raw = f32s(&mut rng, n * 512, -2.0, 2.0);
     let w = f32s(&mut rng, 512, 0.5, 1.5);
     let cache = Tensor::zeros(&ctx, &[64 * 512], DType::F16).unwrap();
@@ -480,12 +517,26 @@ fn dsa_causal_case(m: usize) {
         .collect();
     let diffs = gl.iter().zip(&latent).filter(|(a, b)| a != b).count();
     assert!(diffs * 1000 < latent.len(), "{diffs} f16 latent values differ");
-    let qk = f32s(&mut rng, m * 64 * 512, -0.2, 0.2);
+    let mut qk = f32s(&mut rng, m * 64 * 512, -0.2, 0.2);
+    if big {
+        // f16's largest value, the first values past it, far past it, and
+        // large values of both signs whose products cancel in part.
+        let at = |i: usize, h: usize, j: usize| (i * 64 + h) * 512 + j;
+        qk[at(0, 0, 0)] = 65536.0;
+        qk[at(0, 1, 5)] = -65536.0;
+        qk[at(1, 2, 7)] = 65520.0;
+        qk[at(m - 1, 3, 0)] = 1.0e6;
+        qk[at(m - 1, 3, 1)] = -1.0e6;
+        for j in 0..512 {
+            qk[at(1, 4, j)] = if j % 2 == 0 { 65504.0 } else { -65504.0 };
+            qk[at(2, 5, j)] = 3.0e4;
+        }
+    }
     let tqk = tensor(&ctx, &qk);
-    let s = 64;
     let scores = zeros(&ctx, m * 64 * s);
     let denom = zeros(&ctx, m * 64);
     let lat = zeros(&ctx, m * 64 * 512);
+    let partial = zeros(&ctx, 4 * 8 * 64 * 512);
     let pos0 = n - m;
     run(&ctx, |p| {
         dsa_attend(
@@ -497,7 +548,7 @@ fn dsa_causal_case(m: usize) {
             &scores,
             &denom,
             &lat,
-            &zeros(&ctx, 4 * 8 * 64 * 512),
+            &partial,
             m,
             s,
             1.0 / 16.0,
@@ -505,6 +556,10 @@ fn dsa_causal_case(m: usize) {
         .unwrap()
     });
     let glat = lat.to_f32().unwrap();
+    assert!(
+        glat[..m * 64 * 512].iter().all(|v| v.is_finite()),
+        "non-finite latent mix"
+    );
     for i in 0..m {
         let rows: Vec<usize> = (0..=pos0 + i).collect();
         for h in 0..64 {
@@ -539,16 +594,17 @@ fn dsa_causal_case(m: usize) {
 /// lists with unused slots, against the CPU.
 #[test]
 fn dsa_attend_selected_matches_cpu() {
-    // Decode rows (SIMT kernels) and a prompt run (matrix units).
-    for m in [2, 6] {
-        dsa_selected_case(m);
+    // Decode rows (SIMT kernels, the slots in chunks) and a prompt run
+    // (matrix units); a short selection and a full one (its last chunk full).
+    for (m, count) in [(2, 344), (6, 344), (2, 2056), (6, 2056)] {
+        dsa_selected_case(m, count);
     }
 }
 
-fn dsa_selected_case(m: usize) {
+fn dsa_selected_case(m: usize, count: usize) {
     let ctx = ctx();
     let mut rng = StdRng::seed_from_u64(70);
-    let (cached, s, count) = (700usize, 2056usize, 344usize);
+    let (cached, s) = (700usize, 2056usize);
     let lat_rows: Vec<f32> =
         f32s(&mut rng, cached * 512, -1.5, 1.5).into_iter().map(r::round_f16).collect();
     let bytes: Vec<u8> = lat_rows
@@ -578,6 +634,8 @@ fn dsa_selected_case(m: usize) {
     let scores = zeros(&ctx, m * 64 * s);
     let denom = zeros(&ctx, m * 64);
     let lat = zeros(&ctx, m * 64 * 512);
+    // Bound here: the pass reads it until run's commit_wait returns.
+    let partial = zeros(&ctx, 4 * 8 * 64 * 512);
     run(&ctx, |p| {
         dsa_attend(
             &ctx,
@@ -588,7 +646,7 @@ fn dsa_selected_case(m: usize) {
             &scores,
             &denom,
             &lat,
-            &zeros(&ctx, 4 * 8 * 64 * 512),
+            &partial,
             m,
             s,
             1.0 / 16.0,

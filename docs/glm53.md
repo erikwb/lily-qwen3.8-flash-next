@@ -69,6 +69,14 @@ gives plain decoding's tokens only up to such ties.
   run). It changes only how often drafts are accepted, never the output.
 - Prefill GEMMs round both operands to bfloat16 (f32 accumulators); decode
   works on f32 activations. Quality is close to ds4's (below).
+- Prompt runs compute DSA attention on the matrix units: the f32 queries
+  and attention weights are split into an f16 high part (the value with its
+  mantissa cut to ten bits) and the f16 rounding of the rest, multiplied
+  with the f16 latent rows into f32 accumulators: about 22 significant bits
+  for values in f16's normal range, an absolute 2^-24 below it. A score
+  tile whose queries leave f16's range (or are not finite) is computed in
+  f32. `LILY_GLM53_DSA_F32=1` keeps prompt runs on the f32 kernels. Decode
+  and verify rows compute attention in f32.
 - The hyper-connection control projection scales its sums by the RMS after
   the dot products (ds4 normalizes first): the products differ in rounding
   only.

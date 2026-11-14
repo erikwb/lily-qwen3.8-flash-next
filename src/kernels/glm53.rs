@@ -1193,7 +1193,14 @@ pub fn dsa_attend(
     ensure!(s <= DSA_MAX_SLOTS, "attention over {s} slots");
     // Prompt runs on the matrix units (glm53_dsa.comp); decode rows on the
     // SIMT kernels.
-    let mu = m > GEMV_MAX_ROWS;
+    // LILY_GLM53_DSA_F32=1 keeps prompt runs on the SIMT kernels (A/B of
+    // the matrix route's precision).
+    static F32_ONLY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let f32_only =
+        *F32_ONLY.get_or_init(|| std::env::var_os("LILY_GLM53_DSA_F32").is_some());
+    let mu = m > GEMV_MAX_ROWS && !f32_only;
+    // The matrix route's weight loads are four wide: rows padded to 8.
+    ensure!(!mu || s.is_multiple_of(8), "prompt attention over {s} slots (pad to 8)");
     let (name, groups, tg) = if mu {
         ("glm53_dsa_scores_mu", s.div_ceil(64), 128)
     } else {
