@@ -1097,3 +1097,55 @@ fn moe_grouped_matches_per_pair_kernels() {
         assert!((x - y).abs() <= 3e-2 * scale, "element {k}: {x} vs {y}");
     }
 }
+
+/// The prefill's grouped routed experts at the model's shapes (gate/up
+/// IQ2_XXS 2048 x 4096, down Q2_K 4096 x 2048) over 64 experts, for runs
+/// whose pairs per expert match a 256-token and a 4K-token prompt of the
+/// model (288 experts, 8 used): best of three passes of one call.
+#[test]
+#[ignore = "timing only"]
+fn moe_grouped_timing() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(72);
+    let (experts, hidden, ff, used) = (64, 4096, 2048, 8);
+    let mk = |rng: &mut StdRng, ty, cols, rows| {
+        let raw = random_blocks(rng, ty, rows * cols);
+        QWeight::from_bytes(&ctx, &raw, ty, cols, rows).unwrap()
+    };
+    let gw = mk(&mut rng, GgmlType::Iq2Xxs, hidden, experts * ff);
+    let uw = mk(&mut rng, GgmlType::Iq2Xxs, hidden, experts * ff);
+    let dw = mk(&mut rng, GgmlType::Q2K, ff, experts * hidden);
+    // Rows such that pairs per expert = 256 * 8 / 288 and 4096 * 8 / 288.
+    for (label, m) in [("256-token density", 57), ("4K-token density", 910)] {
+        let sel: Vec<u32> = (0..m)
+            .flat_map(|i| {
+                let start = (i * 37) % experts;
+                (0..used).map(move |s| ((start + s * 7) % experts) as u32)
+            })
+            .collect();
+        let x = tensor(&ctx, &f32s(&mut rng, m * hidden, -1.0, 1.0));
+        let tsel = Tensor::from_bytes(
+            &ctx,
+            bytemuck::cast_slice(&sel),
+            &[sel.len()],
+            DType::U32,
+        )
+        .unwrap();
+        let tw = tensor(&ctx, &f32s(&mut rng, m * used, 0.1, 0.6));
+        let out = zeros(&ctx, m * hidden);
+        let gs = MoeGroupScratch::new(&ctx, m * used, experts, ff, hidden).unwrap();
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let pass = ctx.begin().unwrap();
+            moe_grouped(
+                &ctx, &pass, &gw, &uw, &dw, ff, hidden, &x, &tsel, &tw, &out, &gs, m,
+                used, experts, 10.0,
+            )
+            .unwrap();
+            let t = std::time::Instant::now();
+            pass.commit_wait().unwrap();
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        println!("moe grouped {label:20} m {m:4}: {:8.1} us", best * 1e6);
+    }
+}

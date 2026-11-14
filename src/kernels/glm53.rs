@@ -339,8 +339,11 @@ pub struct MoeGroupScratch {
     pub pairs: Tensor,
     pub tiles: Tensor,
     pub tile_count: Tensor,
+    /// The run's input rows as bfloat (the gate/up GEMMs' operand).
+    pub xb: Tensor,
     pub g: Tensor,
     pub u: Tensor,
+    /// BF16: the down GEMM's operand.
     pub mid: Tensor,
     pub down: Tensor,
 }
@@ -358,9 +361,10 @@ impl MoeGroupScratch {
             pairs: Tensor::zeros(ctx, &[pairs], DType::U32)?,
             tiles: Tensor::zeros(ctx, &[3 * max_tiles], DType::U32)?,
             tile_count: Tensor::zeros(ctx, &[1], DType::U32)?,
+            xb: Tensor::zeros(ctx, &[pairs * hidden], DType::BF16)?,
             g: Tensor::zeros(ctx, &[pairs * ff], DType::F32)?,
             u: Tensor::zeros(ctx, &[pairs * ff], DType::F32)?,
-            mid: Tensor::zeros(ctx, &[pairs * ff], DType::F32)?,
+            mid: Tensor::zeros(ctx, &[pairs * ff], DType::BF16)?,
             down: Tensor::zeros(ctx, &[pairs * hidden], DType::F32)?,
         })
     }
@@ -407,6 +411,17 @@ pub fn moe_grouped(
         &[&u32_bytes(pairs), &u32_bytes(experts)],
         Grid::Threadgroups { groups: (1, 1, 1), threadgroup: (1024, 1, 1) },
     )?;
+    let to_bf16 = ctx.pipeline("glm53_to_bf16", SOURCE, MslVersion::V3_1)?;
+    ensure!(
+        x.numel() >= m * hidden && sc.xb.numel() >= m * hidden,
+        "grouped MoE input"
+    );
+    pass.dispatch_at(
+        &to_bf16,
+        &[x.binding(), sc.xb.binding()],
+        &[],
+        Grid::Threads { grid: (m * hidden / 2, 1, 1), threadgroup: (256, 1, 1) },
+    )?;
     pass.memory_barrier()?;
     let max_tiles = pairs.div_ceil(64) + experts;
     let gemm_moe =
@@ -416,6 +431,11 @@ pub fn moe_grouped(
                 GgmlType::Q2K => "glm53_gemm_moe_q2_k",
                 other => anyhow::bail!("no grouped expert GEMM over {other:?}"),
             };
+            ensure!(
+                w.cols.is_multiple_of(256) && n.is_multiple_of(64),
+                "grouped expert GEMM of {n} x {}",
+                w.cols
+            );
             let pipeline = ctx.pipeline(name, SOURCE, MslVersion::V3_1)?;
             pass.dispatch_at(
                 &pipeline,
@@ -431,8 +451,6 @@ pub fn moe_grouped(
                     &u32_bytes(n),
                     &u32_bytes(w.cols),
                     &u32_bytes(w.row_bytes),
-                    &u32_bytes(w.cols),
-                    &u32_bytes(n),
                     &u32_bytes(x_shift),
                 ],
                 Grid::Threadgroups {
@@ -443,8 +461,8 @@ pub fn moe_grouped(
         };
     ensure!(used.is_power_of_two(), "experts used {used}");
     let shift = used.trailing_zeros() as usize;
-    gemm_moe(gate, x, &sc.g, ff, shift)?;
-    gemm_moe(up, x, &sc.u, ff, shift)?;
+    gemm_moe(gate, &sc.xb, &sc.g, ff, shift)?;
+    gemm_moe(up, &sc.xb, &sc.u, ff, shift)?;
     pass.memory_barrier()?;
     let swiglu = ctx.pipeline("glm53_moe_swiglu", SOURCE, MslVersion::V3_1)?;
     pass.dispatch_at(

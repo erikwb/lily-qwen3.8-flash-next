@@ -215,3 +215,114 @@ float glm53_dot_iq2_xxs(uint64_t row, uint t, in vec4 xv[8]) {
     }
     return 0.125 * d * float(2u * (aux1 >> 28u) + 1u) * s;
 }
+
+// ---------------------------------------------------------------------------
+// Half tasks: values 16 hf .. 16 hf + 16 of task t, as glm53_decode gives
+// them (the prefill GEMM's threads each stage half a task).
+// ---------------------------------------------------------------------------
+void glm53_decode_half_q8_0(uint64_t row, uint t, uint hf, out float w[16]) {
+    const uint64_t b = row + uint64_t(t) * 34u;
+    const float d = glm53_h2f(uint(U16(b).v[0]));
+    [[unroll]] for (uint i = 0u; i < 8u; i++) {
+        const uint pair = uint(U16(b + 2u).v[8u * hf + i]);
+        w[2u * i] = d * float(int(pair << 24) >> 24);
+        w[2u * i + 1u] = d * float(int(pair << 16) >> 24);
+    }
+}
+
+void glm53_decode_half_q4_k(uint64_t row, uint t, uint hf, out float w[16]) {
+    const uint64_t b = row + uint64_t(t >> 3u) * 144u;
+    const uint j = t & 7u;
+    const uint dd = U32(b).v[0];
+    const float d = glm53_h2f(dd & 0xffffu);
+    const float dmin = glm53_h2f(dd >> 16u);
+    const uvec3 sw = uvec3(U32(b + 4u).v[0], U32(b + 8u).v[0], U32(b + 12u).v[0]);
+    #define Q4K_BYTE(i) ((sw[(i) >> 2u] >> (8u * ((i) & 3u))) & 0xffu)
+    uint sc, m;
+    if (j < 4u) {
+        sc = Q4K_BYTE(j) & 63u;
+        m = Q4K_BYTE(j + 4u) & 63u;
+    } else {
+        sc = (Q4K_BYTE(j + 4u) & 0xfu) | ((Q4K_BYTE(j - 4u) >> 6u) << 4u);
+        m = (Q4K_BYTE(j + 4u) >> 4u) | ((Q4K_BYTE(j) >> 6u) << 4u);
+    }
+    #undef Q4K_BYTE
+    const float scale = d * float(sc);
+    const float minv = dmin * float(m);
+    const uint shift = (j & 1u) * 4u;
+    const uvec4 v = U32x4(b + 16u + (j >> 1u) * 32u + 16u * hf).v[0];
+    [[unroll]] for (uint c = 0u; c < 4u; c++) {
+        const uint word = v[c] >> shift;
+        [[unroll]] for (uint k = 0u; k < 4u; k++) {
+            w[4u * c + k] = scale * float((word >> (8u * k)) & 0xfu) - minv;
+        }
+    }
+}
+
+void glm53_decode_half_q2_k(uint64_t row, uint t, uint hf, out float w[16]) {
+    const uint64_t b = row + uint64_t(t >> 3u) * 84u;
+    const uint j = t & 7u;
+    const uint dd = U32(b + 80u).v[0];
+    const float d = glm53_h2f(dd & 0xffffu);
+    const float dmin = glm53_h2f(dd >> 16u);
+    const uint sc = uint(U8(b).v[2u * j + hf]);
+    const uint shift = (j & 3u) * 2u;
+    const float scale = d * float(sc & 0xfu);
+    const float minv = dmin * float(sc >> 4u);
+    const uvec4 q = U32x4(b + 16u + (j >> 2u) * 32u + 16u * hf).v[0];
+    [[unroll]] for (uint c = 0u; c < 4u; c++) {
+        const uint word = q[c] >> shift;
+        [[unroll]] for (uint k = 0u; k < 4u; k++) {
+            w[4u * c + k] = scale * float((word >> (8u * k)) & 3u) - minv;
+        }
+    }
+}
+
+void glm53_decode_half_iq2_xxs(uint64_t row, uint t, uint hf, out float w[16]) {
+    const uint64_t b = row + uint64_t(t >> 3u) * 66u;
+    const uint ib = t & 7u;
+    const float d = glm53_h2f(uint(U16(b).v[0]));
+    const uint64_t q = b + 2u + 8u * ib;
+    const uint aux0 = uint(U16(q).v[0]) | (uint(U16(q).v[1]) << 16u);
+    const uint aux1 = uint(U16(q).v[2]) | (uint(U16(q).v[3]) << 16u);
+    const float scale = 0.125 * d * float(2u * (aux1 >> 28u) + 1u);
+    [[unroll]] for (uint ll = 0u; ll < 2u; ll++) {
+        const uint l = 2u * hf + ll;
+        const uvec4 g = glm53_iq2xxs_grid_h[(aux0 >> (8u * l)) & 0xffu]
+                      ^ glm53_iq2xxs_signs_h[(aux1 >> (7u * l)) & 127u];
+        // Word p holds values p and p + 4 of the group of eight.
+        [[unroll]] for (uint p = 0u; p < 4u; p++) {
+            const vec2 v = unpackHalf2x16(g[p]);
+            w[8u * ll + p] = scale * v.x;
+            w[8u * ll + p + 4u] = scale * v.y;
+        }
+    }
+}
+
+void glm53_decode_half_bf16(uint64_t row, uint t, uint hf, out float w[16]) {
+    const uint64_t b = row + uint64_t(t) * 64u + 32u * hf;
+    [[unroll]] for (uint q = 0u; q < 2u; q++) {
+        const uvec4 v = U32x4(b + 16u * q).v[0];
+        [[unroll]] for (uint c = 0u; c < 4u; c++) {
+            w[8u * q + 2u * c] = uintBitsToFloat(v[c] << 16u);
+            w[8u * q + 2u * c + 1u] = uintBitsToFloat(v[c] & 0xffff0000u);
+        }
+    }
+}
+
+void glm53_decode_half_f32(uint64_t row, uint t, uint hf, out float w[16]) {
+    const uint64_t b = row + uint64_t(t) * 128u + 64u * hf;
+    [[unroll]] for (uint q = 0u; q < 4u; q++) {
+        const vec4 v = F32x4(b + 16u * q).v[0];
+        [[unroll]] for (uint c = 0u; c < 4u; c++) w[4u * q + c] = v[c];
+    }
+}
+
+void glm53_decode_half(uint ty, uint64_t row, uint t, uint hf, out float w[16]) {
+    if (ty == GLM53_Q8_0) glm53_decode_half_q8_0(row, t, hf, w);
+    else if (ty == GLM53_Q4_K) glm53_decode_half_q4_k(row, t, hf, w);
+    else if (ty == GLM53_Q2_K) glm53_decode_half_q2_k(row, t, hf, w);
+    else if (ty == GLM53_IQ2_XXS) glm53_decode_half_iq2_xxs(row, t, hf, w);
+    else if (ty == GLM53_BF16) glm53_decode_half_bf16(row, t, hf, w);
+    else glm53_decode_half_f32(row, t, hf, w);
+}
