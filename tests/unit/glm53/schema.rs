@@ -141,6 +141,27 @@ fn shortened_or_retyped_tensors_are_refused() {
             "different types",
         ),
     ];
+    // Each fused group with one member of another (allowed) type.
+    let mut fused = 0;
+    for names in fused_groups(&c) {
+        let mut t = base.clone();
+        let e = t
+            .iter_mut()
+            .find(|e| e.0 == names[1])
+            .unwrap_or_else(|| panic!("{names:?}"));
+        e.2 = if e.2 == GgmlType::Iq2Xxs {
+            GgmlType::Q2K
+        } else if e.2 == GgmlType::Q4K {
+            GgmlType::Q8_0
+        } else {
+            GgmlType::Q4K
+        };
+        let e = check("fused", &t).expect_err(&names[1]);
+        assert!(format!("{e:#}").contains("different types"), "{names:?}: {e:#}");
+        fused += 1;
+    }
+    // At least one attention and one FFN group a layer.
+    assert!(fused > 2 * c.n_layer, "{fused} fused groups");
     for (name, t, want) in cases {
         let e = check(name, &t).expect_err(name);
         assert!(format!("{e:#}").contains(want), "{name}: {e:#}");

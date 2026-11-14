@@ -165,9 +165,44 @@ pub fn expected(c: &Config) -> Vec<Spec> {
     v
 }
 
+/// The tensors each layer reads in one fused dispatch: the decode GEMV of a
+/// group, and the routed-expert gate/up kernel, take one block type for all
+/// of its weights.
+pub fn fused_groups(c: &Config) -> Vec<Vec<String>> {
+    let mut v = Vec::new();
+    for il in 0..c.n_layer {
+        let group = |names: &[&str]| -> Vec<String> {
+            names.iter().map(|s| format!("blk.{il}.{s}.weight")).collect()
+        };
+        match c.kinds[il] {
+            LayerKind::Kda => {
+                v.push(group(&["kda_q", "kda_k"]));
+                v.push(group(&["kda_v", "kda_f_a", "kda_beta", "kda_g_a"]));
+            }
+            LayerKind::Dsa => {
+                v.push(group(&["attn_q_a", "attn_kv_a_mqa"]));
+                if il < c.n_trunk {
+                    v.push(group(&[
+                        "indexer.attn_k",
+                        "indexer.pool_gate",
+                        "indexer.proj",
+                    ]));
+                }
+            }
+        }
+        if c.is_moe(il) {
+            v.push(group(&["ffn_gate_exps", "ffn_up_exps"]));
+            v.push(group(&["ffn_gate_shexp", "ffn_up_shexp"]));
+        } else {
+            v.push(group(&["ffn_gate", "ffn_up"]));
+        }
+    }
+    v
+}
+
 /// Checks every tensor the model reads: present, of the expected rank and
 /// dimensions, of a type its kernels decode, at an aligned offset; and that
-/// a layer's gate and up experts share a type.
+/// the tensors of each fused group share a type.
 pub fn validate(g: &Gguf, c: &Config) -> Result<()> {
     for s in expected(c) {
         let t = g.require(&s.name)?;
@@ -192,10 +227,15 @@ pub fn validate(g: &Gguf, c: &Config) -> Result<()> {
             t.offset
         );
     }
-    for il in (0..c.n_layer).filter(|&il| c.is_moe(il)) {
-        let gate = g.require(&format!("blk.{il}.ffn_gate_exps.weight"))?;
-        let up = g.require(&format!("blk.{il}.ffn_up_exps.weight"))?;
-        ensure!(gate.ty == up.ty, "layer {il}: gate and up experts of different types");
+    for names in fused_groups(c) {
+        let ty = g.require(&names[0])?.ty;
+        for n in &names[1..] {
+            ensure!(
+                g.require(n)?.ty == ty,
+                "tensors {} are read together but of different types",
+                names.join(", ")
+            );
+        }
     }
     Ok(())
 }
