@@ -393,6 +393,34 @@ pub fn moe_grouped(
     experts: usize,
     limit: f32,
 ) -> Result<()> {
+    moe_grouped_with(
+        ctx, pass, gate, up, down, ff, hidden, x, sel, weights, out, sc, m, used,
+        experts, limit, true,
+    )
+}
+
+/// [`moe_grouped`]; `fuse_gate_up` false takes IQ2_XXS experts through the
+/// separate gate and up GEMMs and SwiGLU too (the tests' reference).
+#[allow(clippy::too_many_arguments)]
+fn moe_grouped_with(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    gate: &QWeight,
+    up: &QWeight,
+    down: &QWeight,
+    ff: usize,
+    hidden: usize,
+    x: &Tensor,
+    sel: &Tensor,
+    weights: &Tensor,
+    out: &Tensor,
+    sc: &MoeGroupScratch,
+    m: usize,
+    used: usize,
+    experts: usize,
+    limit: f32,
+    fuse_gate_up: bool,
+) -> Result<()> {
     let pairs = m * used;
     ensure!(
         sc.pairs.numel() >= pairs,
@@ -461,16 +489,52 @@ pub fn moe_grouped(
         };
     ensure!(used.is_power_of_two(), "experts used {used}");
     let shift = used.trailing_zeros() as usize;
-    gemm_moe(gate, &sc.xb, &sc.g, ff, shift)?;
-    gemm_moe(up, &sc.xb, &sc.u, ff, shift)?;
-    pass.memory_barrier()?;
-    let swiglu = ctx.pipeline("glm53_moe_swiglu", SOURCE, MslVersion::V3_1)?;
-    pass.dispatch_at(
-        &swiglu,
-        &[sc.g.binding(), sc.u.binding(), weights.binding(), sc.mid.binding()],
-        &[&u32_bytes(ff), &f32_bytes(limit)],
-        Grid::Threads { grid: (ff, pairs, 1), threadgroup: (256, 1, 1) },
-    )?;
+    if gate.ty == GgmlType::Iq2Xxs && fuse_gate_up {
+        // Gate, up and the SwiGLU in one GEMM: a tile is 32 columns of
+        // each, written as the down GEMM's bfloat operand.
+        ensure!(
+            gate.cols.is_multiple_of(256) && ff.is_multiple_of(32),
+            "grouped expert GEMM of {ff} x {}",
+            gate.cols
+        );
+        let pipeline =
+            ctx.pipeline("glm53_gemm_moe_gate_up_iq2_xxs", SOURCE, MslVersion::V3_1)?;
+        pass.dispatch_at(
+            &pipeline,
+            &[
+                sc.xb.binding(),
+                gate.t.binding(),
+                sc.mid.binding(),
+                sc.pairs.binding(),
+                sc.tiles.binding(),
+                sc.tile_count.binding(),
+                up.t.binding(),
+                weights.binding(),
+            ],
+            &[
+                &u32_bytes(ff),
+                &u32_bytes(gate.cols),
+                &u32_bytes(gate.row_bytes),
+                &u32_bytes(shift),
+                &f32_bytes(limit),
+            ],
+            Grid::Threadgroups {
+                groups: (ff / 32, max_tiles, 1),
+                threadgroup: (128, 1, 1),
+            },
+        )?;
+    } else {
+        gemm_moe(gate, &sc.xb, &sc.g, ff, shift)?;
+        gemm_moe(up, &sc.xb, &sc.u, ff, shift)?;
+        pass.memory_barrier()?;
+        let swiglu = ctx.pipeline("glm53_moe_swiglu", SOURCE, MslVersion::V3_1)?;
+        pass.dispatch_at(
+            &swiglu,
+            &[sc.g.binding(), sc.u.binding(), weights.binding(), sc.mid.binding()],
+            &[&u32_bytes(ff), &f32_bytes(limit)],
+            Grid::Threads { grid: (ff, pairs, 1), threadgroup: (256, 1, 1) },
+        )?;
+    }
     pass.memory_barrier()?;
     gemm_moe(down, &sc.mid, &sc.down, hidden, 0)?;
     pass.memory_barrier()?;

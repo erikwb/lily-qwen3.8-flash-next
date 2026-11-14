@@ -25,7 +25,8 @@ uint glm53_bf16_bits(float f) {
 
 #if defined(KERNEL_glm53_gemm_q8_0) || defined(KERNEL_glm53_gemm_q4_k) || \
     defined(KERNEL_glm53_gemm_bf16) || defined(KERNEL_glm53_gemm_f32) || \
-    defined(KERNEL_glm53_gemm_moe_iq2_xxs) || defined(KERNEL_glm53_gemm_moe_q2_k)
+    defined(KERNEL_glm53_gemm_moe_iq2_xxs) || defined(KERNEL_glm53_gemm_moe_q2_k) || \
+    defined(KERNEL_glm53_gemm_moe_gate_up_iq2_xxs)
 #define GM_STEP 64u
 // Vector (k - k0) / 2 * 16 + n / 4 of a step's tile holds weights k and
 // k + 1 of the tile's rows n .. n + 3 (quant_grouped.glsl's qg_tile).
@@ -217,12 +218,24 @@ void main() {
 // Buffers: 0 X (bfloat), 1 W (the expert stack), 2 Y f32, 3 pairs u32,
 // 4 tiles u32 [3 per tile], 5 tile count u32. Params: 6 N (rows per
 // expert), 7 K (a multiple of 256), 8 row_bytes, 9 x_shift.
+// glm53_gemm_moe_gate_up_iq2_xxs computes gate (W) and up (buffer 6) of
+// 32 columns a tile, grid (N / 32, tiles), and writes the weighted clamped
+// SwiGLU of each pair (weights f32 at buffer 7) to Y as bfloat, the down
+// GEMM's operand; its params are 8 N, 9 K, 10 row_bytes, 11 x_shift,
+// 12 limit.
 // ---------------------------------------------------------------------------
-#if defined(KERNEL_glm53_gemm_moe_iq2_xxs) || defined(KERNEL_glm53_gemm_moe_q2_k)
+#if defined(KERNEL_glm53_gemm_moe_iq2_xxs) || defined(KERNEL_glm53_gemm_moe_q2_k) || \
+    defined(KERNEL_glm53_gemm_moe_gate_up_iq2_xxs)
+#ifdef KERNEL_glm53_gemm_moe_gate_up_iq2_xxs
+#define GM_GATE_UP 1
+#define GM_P 8u
+#else
+#define GM_P 6u
+#endif
 
 // Weights k .. k + 8 (k a multiple of 8) of `row`.
 void gm_decode8(uint64_t row, uint k, out float w[8]) {
-#if defined(KERNEL_glm53_gemm_moe_iq2_xxs)
+#if defined(KERNEL_glm53_gemm_moe_iq2_xxs) || defined(GM_GATE_UP)
     const uint t = k >> 5u, l = (k >> 3u) & 3u;
     const uint bw = (t >> 3u) * 33u;
     const uint qw = bw + 1u + 4u * (t & 7u);
@@ -258,22 +271,30 @@ void gm_decode8(uint64_t row, uint k, out float w[8]) {
 
 void main() {
     if (gl_WorkGroupID.y >= U32(arg(5)).v[0]) return;
-    const uint N = arg_u32(6);
-    const uint K = arg_u32(7);
-    const uint row_bytes = arg_u32(8);
-    const uint x_shift = arg_u32(9);
+    const uint N = arg_u32(GM_P);
+    const uint K = arg_u32(GM_P + 1u);
+    const uint row_bytes = arg_u32(GM_P + 2u);
+    const uint x_shift = arg_u32(GM_P + 3u);
     const uint expert = U32(arg(4)).v[3u * gl_WorkGroupID.y];
     const uint first = U32(arg(4)).v[3u * gl_WorkGroupID.y + 1u];
     const uint rows = U32(arg(4)).v[3u * gl_WorkGroupID.y + 2u];
-    const uint n0 = gl_WorkGroupID.x * 64u;
     const uint tid = gl_LocalInvocationIndex;
     const uint sg = gl_SubgroupID;
-    const uint64_t W = arg(1) + (uint64_t(expert) * N + n0) * row_bytes;
     // This thread's dequantization: weight rows 4 quad .. + 4 of the tile,
     // values 8 k8 .. + 8 of each step.
     const uint quad = tid & 15u, k8 = tid >> 4u;
     uint64_t wr[4];
+#ifdef GM_GATE_UP
+    // The tile's 64 weight rows are rows n0 .. n0 + 32 of gate (column
+    // blocks 0 and 1) and the same rows of up (blocks 2 and 3).
+    const uint n0 = gl_WorkGroupID.x * 32u;
+    const uint64_t W = (quad < 8u ? arg(1) : arg(6)) + (uint64_t(expert) * N + n0) * row_bytes;
+    [[unroll]] for (uint r = 0u; r < 4u; r++) wr[r] = W + uint64_t(min(4u * (quad & 7u) + r, N - 1u - n0)) * row_bytes;
+#else
+    const uint n0 = gl_WorkGroupID.x * 64u;
+    const uint64_t W = arg(1) + (uint64_t(expert) * N + n0) * row_bytes;
     [[unroll]] for (uint r = 0u; r < 4u; r++) wr[r] = W + uint64_t(min(4u * quad + r, N - 1u - n0)) * row_bytes;
+#endif
     // The subgroup's rows, and its lanes' two rows of X (a row past the
     // tile's reads the tile's last and is not stored).
     const uint row0 = 16u * sg;
@@ -317,6 +338,37 @@ void main() {
     }
     if (!working) return;
     const uint col = n0 + mat_lane_col();
+#ifdef GM_GATE_UP
+    // mid[p][j] = w[p] * silu(min(g, L)) * clamp(u, -L, L) as bfloat (the
+    // SwiGLU of glm53_moe_swiglu, from the same sums).
+    const float limit = arg_f32(12);
+    [[unroll]] for (uint h = 0u; h < 2u; h++) {
+        const uint r = row0 + lane_row + h;
+        if (r < rows) {
+            const uint p = U32(arg(3)).v[first + r];
+            const float we = F32(arg(7)).v[p];
+            [[unroll]] for (uint half_ = 0u; half_ < 2u; half_++) {
+                uint b[4];
+                [[unroll]] for (uint c = 0u; c < 4u; c++) {
+                    float g = half_ == 0u ? acc0[4u * h + c] : acc1[4u * h + c];
+                    float u = half_ == 0u ? acc2[4u * h + c] : acc3[4u * h + c];
+                    if (limit > 1e-6) {
+                        g = min(g, limit);
+                        u = clamp(u, -limit, limit);
+                    }
+                    // glm53_moe_swiglu's value in its order:
+                    // w ((g u) / (1 + 2^(-g log2 e))).
+                    precise float gu = g * u;
+                    precise float e = exp2(-(g * uintBitsToFloat(0x3fb8aa3bu)));
+                    precise float sv = we * (gu * (1.0 / (1.0 + e)));
+                    b[c] = glm53_bf16_bits(sv);
+                }
+                const uint64_t at = arg(2) + 2u * (uint64_t(p) * N + col + 16u * half_);
+                U32x2(at).v[0] = uvec2(b[0] | (b[1] << 16u), b[2] | (b[3] << 16u));
+            }
+        }
+    }
+#else
     [[unroll]] for (uint h = 0u; h < 2u; h++) {
         const uint r = row0 + lane_row + h;
         if (r < rows) {
@@ -327,6 +379,7 @@ void main() {
             F32x4(y).v[(col + 48u) / 4u] = vec4(acc3[4u * h], acc3[4u * h + 1u], acc3[4u * h + 2u], acc3[4u * h + 3u]);
         }
     }
+#endif
 }
 #endif
 
@@ -404,7 +457,11 @@ void main() {
         g = min(g, limit);
         u = clamp(u, -limit, limit);
     }
-    BF16(arg(3) + 2u * at).v[0] = uintBitsToBFloat16EXT(uint16_t(glm53_bf16_bits(g / (1.0 + exp(-g)) * u * F32(arg(2)).v[p])));
+    // In this order (glm53_gemm_moe_gate_up_iq2_xxs computes the same).
+    precise float gu = g * u;
+    precise float e = exp2(-(g * uintBitsToFloat(0x3fb8aa3bu)));
+    precise float sv = F32(arg(2)).v[p] * (gu * (1.0 / (1.0 + e)));
+    BF16(arg(3) + 2u * at).v[0] = uintBitsToBFloat16EXT(uint16_t(glm53_bf16_bits(sv)));
 }
 #endif
 
