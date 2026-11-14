@@ -1676,10 +1676,28 @@ pub fn checkpoint_model_type(model_dir: &Path) -> Result<String> {
 }
 
 fn read_config(model_dir: &Path) -> Result<Value> {
+    if crate::gguf::is_gguf(model_dir) {
+        return gguf_config(model_dir);
+    }
     let path = model_dir.join("config.json");
     let bytes =
         std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
     serde_json::from_slice(&bytes).context("parsing config.json")
+}
+
+/// What `config.json` would say of a GGUF checkpoint (GLM 5.3 Flash), from
+/// its metadata: the model type is the architecture, the stop ids its eos,
+/// eot and eom tokens.
+fn gguf_config(path: &Path) -> Result<Value> {
+    let g = crate::gguf::Gguf::open(path)?;
+    let arch = g.architecture()?.to_string();
+    let mut config = serde_json::json!({ "model_type": arch });
+    if arch == crate::glm53::config::ARCH {
+        config["eos_token_id"] = serde_json::json!(crate::glm53::tokenizer::stop_ids(&g)?);
+        config["max_position_embeddings"] =
+            serde_json::json!(g.u64(&format!("{arch}.context_length"))?);
+    }
+    Ok(config)
 }
 
 /// `eos_token_id` from `config.json` (top level or `text_config`), int or list.
@@ -1883,9 +1901,12 @@ pub fn run(model_dir: &Path, options: ServeOptions) -> Result<()> {
     let signals = signal::Signals::block()?;
     match checkpoint_model_type(model_dir)?.as_str() {
         "qwen4_exp" => run_with::<Qwen4ExpModel>(model_dir, options, signals),
+        crate::glm53::config::ARCH => {
+            run_with::<crate::glm53::Glm53Model>(model_dir, options, signals)
+        }
         other => anyhow::bail!(
             "unsupported model_type {other:?}; lily serves qwen4_exp \
-             (Qwen3.8-Flash-Next)"
+             (Qwen3.8-Flash-Next) and a glm5-next GGUF (GLM 5.3 Flash)"
         ),
     }
 }

@@ -4,6 +4,7 @@
 //! loads ds4's published GGUF as it is.
 
 pub mod config;
+pub mod engine;
 pub mod model;
 pub mod reference;
 pub mod tokenizer;

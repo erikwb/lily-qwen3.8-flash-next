@@ -77,9 +77,15 @@ pub struct ParsedToolCall {
     pub arguments: String,
 }
 
-/// Parses the text between `<tool_call>` and `</tool_call>`.
+/// Parses the text between `<tool_call>` and `</tool_call>`: Qwen's
+/// `<function=...>` form, or GLM's `name<arg_key>k</arg_key><arg_value>v
+/// </arg_value>...` (GLM's template writes string values as they are and
+/// other values as JSON, which the schema typing below reads back).
 pub fn parse_tool_call(block: &str, tools: &[ToolSchema]) -> Result<ParsedToolCall> {
     let block = block.trim();
+    if !block.starts_with("<function=") {
+        return parse_glm_tool_call(block, tools);
+    }
     let rest = block
         .strip_prefix("<function=")
         .context("tool call does not start with <function=")?;
@@ -112,6 +118,44 @@ pub fn parse_tool_call(block: &str, tools: &[ToolSchema]) -> Result<ParsedToolCa
     }
     if cursor.trim().contains("<parameter") {
         bail!("malformed parameter block");
+    }
+    Ok(ParsedToolCall {
+        name: name.to_string(),
+        arguments: serde_json::to_string(&Value::Object(arguments))?,
+    })
+}
+
+/// GLM's call: the function name, then key/value pairs.
+fn parse_glm_tool_call(block: &str, tools: &[ToolSchema]) -> Result<ParsedToolCall> {
+    let (name, mut cursor) = match block.find("<arg_key>") {
+        Some(at) => (block[..at].trim(), &block[at..]),
+        None => (block.trim(), ""),
+    };
+    if name.is_empty() || name.contains('<') {
+        bail!("tool call has no function name");
+    }
+    let schema = tools.iter().find(|t| t.name == name);
+    let mut arguments = Map::new();
+    while let Some(rest) = cursor.trim_start().strip_prefix("<arg_key>") {
+        let (key, rest) = rest.split_once("</arg_key>").context("unterminated <arg_key>")?;
+        let rest = rest
+            .trim_start()
+            .strip_prefix("<arg_value>")
+            .context("<arg_key> without an <arg_value>")?;
+        let (value, rest) =
+            rest.split_once("</arg_value>").context("unterminated <arg_value>")?;
+        let key = key.trim();
+        let typed = match schema {
+            Some(s) if s.param_is_string(key) => Value::String(value.to_string()),
+            Some(_) => serde_json::from_str(value)
+                .unwrap_or_else(|_| Value::String(value.to_string())),
+            None => Value::String(value.to_string()),
+        };
+        arguments.insert(key.to_string(), typed);
+        cursor = rest;
+    }
+    if !cursor.trim().is_empty() {
+        bail!("malformed GLM tool call arguments");
     }
     Ok(ParsedToolCall {
         name: name.to_string(),

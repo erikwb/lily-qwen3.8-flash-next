@@ -168,3 +168,29 @@ fn tool_schemas_render_in_the_order_the_client_sent() {
         r#"{"type":"function","function":{"name":"grep","parameters":{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"}}}}}"#
     );
 }
+
+#[test]
+fn parses_glm_tool_calls() {
+    let block = "read_file<arg_key>path</arg_key><arg_value>src/main.rs</arg_value>\
+                 <arg_key>offset</arg_key><arg_value>42</arg_value>\
+                 <arg_key>tags</arg_key><arg_value>[\"a\", \"b\"]</arg_value>\
+                 <arg_key>maybe</arg_key><arg_value>123</arg_value>";
+    let call = parse_tool_call(block, &schemas()).expect("parse");
+    assert_eq!(call.name, "read_file");
+    let args: serde_json::Value = serde_json::from_str(&call.arguments).unwrap();
+    assert_eq!(args["path"], "src/main.rs");
+    assert_eq!(args["offset"], 42);
+    assert_eq!(args["tags"], serde_json::json!(["a", "b"]));
+    assert_eq!(args["maybe"], "123");
+    let call = parse_tool_call("noargs", &schemas()).expect("no arguments");
+    assert_eq!((call.name.as_str(), call.arguments.as_str()), ("noargs", "{}"));
+    // A multi-line string value is kept as written.
+    let call = parse_tool_call(
+        "read_file<arg_key>path</arg_key><arg_value>a\nb\n</arg_value>",
+        &schemas(),
+    )
+    .unwrap();
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&call.arguments).unwrap()["path"], "a\nb\n");
+    assert!(parse_tool_call("read_file<arg_key>path</arg_key>", &schemas()).is_err());
+    assert!(parse_tool_call("<arg_key>x</arg_key><arg_value>1</arg_value>", &schemas()).is_err());
+}

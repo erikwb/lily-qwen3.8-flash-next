@@ -16,6 +16,7 @@ use crate::gguf::{GgmlType, Gguf, TensorInfo};
 use crate::kernels::glm53::{
     self as k, GemvLayout, KdaInputs, KdaParams, PoolParams, QWeight, Rows,
 };
+use crate::kernels::sample::SamplerScratch;
 use crate::metal::{Buffer, ComputePass, MetalContext};
 use crate::tensor::{DType, Tensor};
 
@@ -299,6 +300,10 @@ pub struct Glm53State {
     pub pos: usize,
     pub capacity: usize,
     pub layers: Vec<LayerState>,
+    /// Indexer pool scores, `[MAX_ROWS][pool_cap]` (scratch sized by the
+    /// session's capacity).
+    pub(crate) pool_scores: Tensor,
+    pub(crate) pool_cap: usize,
 }
 
 impl Glm53State {
@@ -337,7 +342,9 @@ impl Glm53State {
                 })
             })
             .collect::<Result<_>>()?;
-        Ok(Self { pos: 0, capacity, layers })
+        let pool_cap = capacity / 4 + 1;
+        let pool_scores = Tensor::zeros(ctx, &[MAX_ROWS * pool_cap], DType::F32)?;
+        Ok(Self { pos: 0, capacity, layers, pool_scores, pool_cap })
     }
 
     /// Zeroes everything (GPU idle).
@@ -390,8 +397,6 @@ pub struct Scratch {
     ig: Tensor,
     iq: Tensor,
     iw: Tensor,
-    pool_scores: Tensor,
-    pool_scores_cap: usize,
     sel: Tensor,
     sel_count: Tensor,
     // FFN
@@ -406,6 +411,11 @@ pub struct Scratch {
     // Head
     hidden: Tensor,
     pub logits: Tensor,
+    /// The last (or only) row's logits: `logits[0..vocab]`.
+    pub logits_last: Tensor,
+    sampler: SamplerScratch,
+    /// U32[2]: the ping-pong slots the in-graph sampler draws into.
+    pub next_token: Tensor,
 }
 
 impl Scratch {
@@ -416,7 +426,9 @@ impl Scratch {
         let p = cfg.kda_projection();
         let hq = cfg.n_head * cfg.key_dim;
         let s = cfg.indexer_selected_limit().next_multiple_of(8);
+        let logits = f(m * cfg.vocab)?;
         Ok(Self {
+            logits_last: logits.view(0, &[cfg.vocab])?,
             tokens: u(m)?,
             h: f(m * cfg.hc_dim())?,
             flat: f(m * cfg.hc_dim())?,
@@ -445,8 +457,6 @@ impl Scratch {
             ig: f(m * cfg.indexer_dim)?,
             iq: f(m * cfg.indexer_heads * cfg.indexer_dim)?,
             iw: f(m * cfg.indexer_heads)?,
-            pool_scores: f(m * 1024)?,
-            pool_scores_cap: 1024,
             sel: u(m * s)?,
             sel_count: u(m)?,
             fg: f(m * cfg.ff_dense)?,
@@ -458,18 +468,15 @@ impl Scratch {
             moe_mid: f(m * cfg.n_expert_used * cfg.ff_expert)?,
             moe_out: f(m * cfg.hidden)?,
             hidden: f(m * cfg.hidden)?,
-            logits: f(m * cfg.vocab)?,
+            logits,
+            sampler: SamplerScratch::new(ctx, cfg.vocab)?,
+            next_token: u(2)?,
         })
     }
 
-    /// Grows the pool score rows to cover `pools` pools.
-    fn ensure_pools(&mut self, ctx: &MetalContext, pools: usize) -> Result<()> {
-        if pools > self.pool_scores_cap {
-            let cap = pools.next_power_of_two();
-            self.pool_scores = Tensor::zeros(ctx, &[MAX_ROWS * cap], DType::F32)?;
-            self.pool_scores_cap = cap;
-        }
-        Ok(())
+    /// The sampler's buffers.
+    pub fn sampler(&self) -> &SamplerScratch {
+        &self.sampler
     }
 }
 
@@ -568,25 +575,28 @@ impl Glm53Model {
             st.capacity,
             pos0 + m
         );
-        sc.ensure_pools(ctx, (pos0 + m) / 4 + 1)?;
         sc.tokens.write_bytes(bytemuck::cast_slice(&{
             let mut t = [0u32; MAX_ROWS];
             t[..m].copy_from_slice(tokens);
             t
         }))?;
+        let Some(trace) = trace else {
+            let pass = ctx.begin()?;
+            self.encode(ctx, &pass, st, sc, &sc.tokens, m, want_logits)?;
+            pass.commit_wait()?;
+            st.pos += m;
+            return Ok(());
+        };
         let mut pass = ctx.begin()?;
         k::embed(ctx, &pass, &self.embed, &sc.tokens, &sc.h, m)?;
         for il in 0..cfg.n_trunk {
             let l = &self.layers[il];
             let [hc_a, hc_f] = l.hc.as_ref().expect("trunk layer has HC");
             self.hc_pre(ctx, &pass, sc, hc_a, &l.attn_norm, m)?;
-            if trace.is_some() {
-                pass.commit_wait()?;
-                pass = ctx.begin()?;
-            }
-            let attn_in =
-                trace.as_ref().map(|_| read(&sc.xn, m * cfg.hidden)).transpose()?;
-            self.attention(ctx, &pass, sc, &st.layers[il], &l.attn, il, pos0, m)?;
+            pass.commit_wait()?;
+            pass = ctx.begin()?;
+            let attn_in = read(&sc.xn, m * cfg.hidden)?;
+            self.attention(ctx, &pass, st, sc, &l.attn, il, pos0, m)?;
             k::hc_post(
                 ctx,
                 &pass,
@@ -598,12 +608,9 @@ impl Glm53Model {
                 cfg.hidden,
             )?;
             self.hc_pre(ctx, &pass, sc, hc_f, &l.ffn_norm, m)?;
-            if trace.is_some() {
-                pass.commit_wait()?;
-                pass = ctx.begin()?;
-            }
-            let ffn_in =
-                trace.as_ref().map(|_| read(&sc.xn, m * cfg.hidden)).transpose()?;
+            pass.commit_wait()?;
+            pass = ctx.begin()?;
+            let ffn_in = read(&sc.xn, m * cfg.hidden)?;
             self.ffn(ctx, &pass, sc, &l.ffn, m)?;
             k::hc_post(
                 ctx,
@@ -615,38 +622,94 @@ impl Glm53Model {
                 m,
                 cfg.hidden,
             )?;
-            if let Some(t) = trace.as_deref_mut() {
-                pass.commit_wait()?;
-                pass = ctx.begin()?;
-                t.push(LayerTrace {
-                    attn_in: attn_in.unwrap(),
-                    attn_out: read(&sc.attn_out, m * cfg.hidden)?,
-                    ffn_in: ffn_in.unwrap(),
-                    ffn_out: read(&sc.ffn_out, m * cfg.hidden)?,
-                    h: read(&sc.h, m * cfg.hc_dim())?,
-                });
-            }
+            pass.commit_wait()?;
+            pass = ctx.begin()?;
+            trace.push(LayerTrace {
+                attn_in,
+                attn_out: read(&sc.attn_out, m * cfg.hidden)?,
+                ffn_in,
+                ffn_out: read(&sc.ffn_out, m * cfg.hidden)?,
+                h: read(&sc.h, m * cfg.hc_dim())?,
+            });
         }
-        if want_logits != Logits::None {
-            let (first, rows) =
-                if want_logits == Logits::All { (0, m) } else { (m - 1, 1) };
-            let h = sc.h.view(first * cfg.hc_dim(), &[rows * cfg.hc_dim()])?;
-            k::hc_mean(ctx, &pass, &h, &sc.hidden, rows, cfg.hidden)?;
-            k::rmsnorm(
-                ctx,
-                &pass,
-                &sc.hidden,
-                Some(&self.output_norm),
-                &sc.hidden,
-                rows,
-                cfg.hidden,
-                cfg.rms_eps,
-            )?;
-            k::gemv(ctx, &pass, &self.output, &sc.hidden, &sc.logits, rows)?;
-        }
+        self.encode_head(ctx, &pass, sc, m, want_logits)?;
         pass.commit_wait()?;
         st.pos += m;
         Ok(())
+    }
+
+    /// Encodes one step of `m` rows at the state's position into `pass`,
+    /// reading the token ids from `tokens` (U32, `m` words) on the GPU,
+    /// without advancing the state.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode(
+        &self,
+        ctx: &MetalContext,
+        pass: &ComputePass<'_>,
+        st: &Glm53State,
+        sc: &Scratch,
+        tokens: &Tensor,
+        m: usize,
+        logits: Logits,
+    ) -> Result<()> {
+        let cfg = &self.cfg;
+        let pos0 = st.pos;
+        ensure!((1..=MAX_ROWS).contains(&m), "step of {m} rows");
+        ensure!(
+            pos0 + m <= st.capacity,
+            "state capacity {} for position {}",
+            st.capacity,
+            pos0 + m
+        );
+        k::embed(ctx, pass, &self.embed, tokens, &sc.h, m)?;
+        for il in 0..cfg.n_trunk {
+            let l = &self.layers[il];
+            let [hc_a, hc_f] = l.hc.as_ref().expect("trunk layer has HC");
+            self.hc_pre(ctx, pass, sc, hc_a, &l.attn_norm, m)?;
+            self.attention(ctx, pass, st, sc, &l.attn, il, pos0, m)?;
+            k::hc_post(
+                ctx,
+                pass,
+                &sc.h,
+                &sc.attn_out,
+                &sc.split,
+                &sc.h,
+                m,
+                cfg.hidden,
+            )?;
+            self.hc_pre(ctx, pass, sc, hc_f, &l.ffn_norm, m)?;
+            self.ffn(ctx, pass, sc, &l.ffn, m)?;
+            k::hc_post(ctx, pass, &sc.h, &sc.ffn_out, &sc.split, &sc.h, m, cfg.hidden)?;
+        }
+        self.encode_head(ctx, pass, sc, m, logits)
+    }
+
+    fn encode_head(
+        &self,
+        ctx: &MetalContext,
+        pass: &ComputePass<'_>,
+        sc: &Scratch,
+        m: usize,
+        logits: Logits,
+    ) -> Result<()> {
+        let cfg = &self.cfg;
+        if logits == Logits::None {
+            return Ok(());
+        }
+        let (first, rows) = if logits == Logits::All { (0, m) } else { (m - 1, 1) };
+        let h = sc.h.view(first * cfg.hc_dim(), &[rows * cfg.hc_dim()])?;
+        k::hc_mean(ctx, pass, &h, &sc.hidden, rows, cfg.hidden)?;
+        k::rmsnorm(
+            ctx,
+            pass,
+            &sc.hidden,
+            Some(&self.output_norm),
+            &sc.hidden,
+            rows,
+            cfg.hidden,
+            cfg.rms_eps,
+        )?;
+        k::gemv(ctx, pass, &self.output, &sc.hidden, &sc.logits, rows)
     }
 
     fn hc_pre(
@@ -684,15 +747,15 @@ impl Glm53Model {
         &self,
         ctx: &MetalContext,
         pass: &ComputePass<'_>,
+        st: &Glm53State,
         sc: &Scratch,
-        ls: &LayerState,
         a: &AttnW,
         il: usize,
         pos0: usize,
         m: usize,
     ) -> Result<()> {
         let cfg = &self.cfg;
-        match (a, ls) {
+        match (a, &st.layers[il]) {
             (AttnW::Kda(w), LayerState::Kda { conv, s }) => {
                 k::gemv(ctx, pass, &w.q, &sc.xn, &sc.kq, m)?;
                 k::gemv(ctx, pass, &w.k, &sc.xn, &sc.kk, m)?;
@@ -790,9 +853,9 @@ impl Glm53Model {
                                 &sc.iq,
                                 &sc.iw,
                                 pooled,
-                                &sc.pool_scores,
+                                &st.pool_scores,
                                 m,
-                                sc.pool_scores_cap,
+                                st.pool_cap,
                                 pos0,
                                 scale,
                             )?;
@@ -800,11 +863,11 @@ impl Glm53Model {
                             k::indexer_topk(
                                 ctx,
                                 pass,
-                                &sc.pool_scores,
+                                &st.pool_scores,
                                 &sc.sel,
                                 &sc.sel_count,
                                 m,
-                                sc.pool_scores_cap,
+                                st.pool_cap,
                                 s,
                                 pos0,
                                 cfg.indexer_top_k / cfg.indexer_pool,
