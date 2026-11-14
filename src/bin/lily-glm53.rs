@@ -469,16 +469,23 @@ fn bench(
         let pf = t.elapsed().as_secs_f64();
         let mut next = argmax(&sc.logits.to_f32()?[..vocab]) as u32;
         let t = Instant::now();
+        let mut steps = Vec::with_capacity(n);
+        let mut digest = 0xcbf29ce484222325u64;
         for _ in 0..n {
+            let s = Instant::now();
             model.forward(&ctx, &mut st, &mut sc, &[next], true)?;
+            steps.push(s.elapsed().as_secs_f64() * 1e3);
             next = argmax(&sc.logits.to_f32()?[..vocab]) as u32;
+            digest = (digest ^ u64::from(next)).wrapping_mul(0x100000001b3);
         }
         let dt = t.elapsed().as_secs_f64();
+        steps.sort_by(f64::total_cmp);
         println!(
-            "run {run}: prompt {prompt_len}: prefill {pf:.2} s = {:.1} tok/s; decode {n} tokens {dt:.2} s = {:.2} tok/s ({:.2} ms/token)",
+            "run {run}: prompt {prompt_len}: prefill {pf:.2} s = {:.1} tok/s; decode {n} tokens {dt:.2} s = {:.2} tok/s; step median {:.2} ms p10 {:.2} ms; digest {digest:016x}",
             prompt_len as f64 / pf,
             n as f64 / dt,
-            dt * 1e3 / n as f64
+            steps[n / 2],
+            steps[n / 10],
         );
     }
     Ok(())
