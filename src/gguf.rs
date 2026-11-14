@@ -168,6 +168,11 @@ impl TensorInfo {
     }
 }
 
+/// Whether `path` names a GGUF file (lily takes one as `--model`).
+pub fn is_gguf(path: &Path) -> bool {
+    path.is_file() && path.extension().is_some_and(|e| e == "gguf")
+}
+
 /// A parsed GGUF header. The tensor data stays in the file.
 pub struct Gguf {
     pub path: PathBuf,

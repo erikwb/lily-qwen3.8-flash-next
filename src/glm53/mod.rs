@@ -6,6 +6,7 @@
 pub mod config;
 pub mod model;
 pub mod reference;
+pub mod tokenizer;
 
 pub use config::{Config, LayerKind};
-pub use model::{Glm53Model, Glm53State, LayerTrace, Scratch};
+pub use model::{Glm53Model, Glm53State, LayerTrace, Logits, Scratch};

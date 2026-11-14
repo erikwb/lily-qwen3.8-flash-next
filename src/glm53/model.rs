@@ -458,7 +458,7 @@ impl Scratch {
             moe_mid: f(m * cfg.n_expert_used * cfg.ff_expert)?,
             moe_out: f(m * cfg.hidden)?,
             hidden: f(m * cfg.hidden)?,
-            logits: f(cfg.vocab)?,
+            logits: f(m * cfg.vocab)?,
         })
     }
 
@@ -471,6 +471,16 @@ impl Scratch {
         }
         Ok(())
     }
+}
+
+/// Which rows' logits a forward step computes into `Scratch::logits`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Logits {
+    None,
+    /// The last row's, at `logits[0..vocab]`.
+    Last,
+    /// Every row's, row `i` at `logits[i * vocab..]` (scoring).
+    All,
 }
 
 /// What a traced forward reads back after each layer (row-major over the
@@ -495,7 +505,19 @@ impl Glm53Model {
         tokens: &[u32],
         logits: bool,
     ) -> Result<()> {
-        self.forward_inner(ctx, st, sc, tokens, logits, None)
+        let l = if logits { Logits::Last } else { Logits::None };
+        self.forward_inner(ctx, st, sc, tokens, l, None)
+    }
+
+    /// [`Self::forward`] with the logits of every row.
+    pub fn forward_all_logits(
+        &self,
+        ctx: &MetalContext,
+        st: &mut Glm53State,
+        sc: &mut Scratch,
+        tokens: &[u32],
+    ) -> Result<()> {
+        self.forward_inner(ctx, st, sc, tokens, Logits::All, None)
     }
 
     /// [`Self::forward`] committing after every trunk layer and reading its
@@ -508,7 +530,7 @@ impl Glm53Model {
         tokens: &[u32],
         trace: &mut Vec<LayerTrace>,
     ) -> Result<()> {
-        self.forward_inner(ctx, st, sc, tokens, true, Some(trace))
+        self.forward_inner(ctx, st, sc, tokens, Logits::Last, Some(trace))
     }
 
     /// Feeds a whole prompt in runs of [`MAX_ROWS`] rows.
@@ -533,7 +555,7 @@ impl Glm53Model {
         st: &mut Glm53State,
         sc: &mut Scratch,
         tokens: &[u32],
-        want_logits: bool,
+        want_logits: Logits,
         mut trace: Option<&mut Vec<LayerTrace>>,
     ) -> Result<()> {
         let cfg = &self.cfg;
@@ -605,21 +627,22 @@ impl Glm53Model {
                 });
             }
         }
-        if want_logits {
-            let last = m - 1;
-            let h_last = sc.h.view(last * cfg.hc_dim(), &[cfg.hc_dim()])?;
-            k::hc_mean(ctx, &pass, &h_last, &sc.hidden, 1, cfg.hidden)?;
+        if want_logits != Logits::None {
+            let (first, rows) =
+                if want_logits == Logits::All { (0, m) } else { (m - 1, 1) };
+            let h = sc.h.view(first * cfg.hc_dim(), &[rows * cfg.hc_dim()])?;
+            k::hc_mean(ctx, &pass, &h, &sc.hidden, rows, cfg.hidden)?;
             k::rmsnorm(
                 ctx,
                 &pass,
                 &sc.hidden,
                 Some(&self.output_norm),
                 &sc.hidden,
-                1,
+                rows,
                 cfg.hidden,
                 cfg.rms_eps,
             )?;
-            k::gemv(ctx, &pass, &self.output, &sc.hidden, &sc.logits, 1)?;
+            k::gemv(ctx, &pass, &self.output, &sc.hidden, &sc.logits, rows)?;
         }
         pass.commit_wait()?;
         st.pos += m;
