@@ -369,8 +369,7 @@ impl Glm53State {
 pub struct Scratch {
     pub tokens: Tensor,
     pub h: Tensor,
-    flat: Tensor,
-    mix: Tensor,
+    hc_partial: Tensor,
     split: Tensor,
     pub xn: Tensor,
     pub attn_out: Tensor,
@@ -431,8 +430,7 @@ impl Scratch {
             logits_last: logits.view(0, &[cfg.vocab])?,
             tokens: u(m)?,
             h: f(m * cfg.hc_dim())?,
-            flat: f(m * cfg.hc_dim())?,
-            mix: f(m * cfg.hc_mix())?,
+            hc_partial: f(m * k::hc_mix_groups(cfg.hidden) * 25)?,
             split: f(m * cfg.hc_mix())?,
             xn: f(m * cfg.hidden)?,
             attn_out: f(m * cfg.hidden)?,
@@ -592,7 +590,7 @@ impl Glm53Model {
         for il in 0..cfg.n_trunk {
             let l = &self.layers[il];
             let [hc_a, hc_f] = l.hc.as_ref().expect("trunk layer has HC");
-            self.hc_pre(ctx, &pass, sc, hc_a, &l.attn_norm, m)?;
+            self.hc_pre(ctx, &pass, sc, hc_a, &l.attn_norm, m, None)?;
             pass.commit_wait()?;
             pass = ctx.begin()?;
             let attn_in = read(&sc.xn, m * cfg.hidden)?;
@@ -607,7 +605,7 @@ impl Glm53Model {
                 m,
                 cfg.hidden,
             )?;
-            self.hc_pre(ctx, &pass, sc, hc_f, &l.ffn_norm, m)?;
+            self.hc_pre(ctx, &pass, sc, hc_f, &l.ffn_norm, m, None)?;
             pass.commit_wait()?;
             pass = ctx.begin()?;
             let ffn_in = read(&sc.xn, m * cfg.hidden)?;
@@ -666,24 +664,15 @@ impl Glm53Model {
         for il in 0..cfg.n_trunk {
             let l = &self.layers[il];
             let [hc_a, hc_f] = l.hc.as_ref().expect("trunk layer has HC");
-            self.hc_pre(ctx, pass, sc, hc_a, &l.attn_norm, m)?;
+            // Each HC pre applies the HC post of the sublayer before it.
+            let prev = (il > 0).then_some(&sc.ffn_out);
+            self.hc_pre(ctx, pass, sc, hc_a, &l.attn_norm, m, prev)?;
             self.attention(ctx, pass, st, sc, &l.attn, il, pos0, m)?;
-            k::hc_post(
-                ctx,
-                pass,
-                &sc.h,
-                &sc.attn_out,
-                &sc.split,
-                &sc.h,
-                m,
-                cfg.hidden,
-            )?;
-            pass.memory_barrier()?;
-            self.hc_pre(ctx, pass, sc, hc_f, &l.ffn_norm, m)?;
+            self.hc_pre(ctx, pass, sc, hc_f, &l.ffn_norm, m, Some(&sc.attn_out))?;
             self.ffn(ctx, pass, sc, &l.ffn, m)?;
-            k::hc_post(ctx, pass, &sc.h, &sc.ffn_out, &sc.split, &sc.h, m, cfg.hidden)?;
-            pass.memory_barrier()?;
         }
+        k::hc_post(ctx, pass, &sc.h, &sc.ffn_out, &sc.split, &sc.h, m, cfg.hidden)?;
+        pass.memory_barrier()?;
         self.encode_head(ctx, pass, sc, m, logits)
     }
 
@@ -730,6 +719,10 @@ impl Glm53Model {
         }
     }
 
+    /// HC pre of a sublayer into `sc.split` and `sc.xn`, first applying the
+    /// previous sublayer's HC post when `post` gives its output (the post
+    /// weights are still in `sc.split`).
+    #[allow(clippy::too_many_arguments)]
     fn hc_pre(
         &self,
         ctx: &MetalContext,
@@ -738,16 +731,25 @@ impl Glm53Model {
         hc: &HcW,
         norm: &Tensor,
         m: usize,
+        post: Option<&Tensor>,
     ) -> Result<()> {
         let cfg = &self.cfg;
-        k::rmsnorm(ctx, pass, &sc.h, None, &sc.flat, m, cfg.hc_dim(), cfg.rms_eps)?;
-        pass.memory_barrier()?;
-        k::gemv(ctx, pass, &hc.fn_w, &sc.flat, &sc.mix, m)?;
-        pass.memory_barrier()?;
-        k::hc_pre(
+        let post = post.map(|block| (block, &sc.split));
+        k::hc_post_mix(
             ctx,
             pass,
-            &sc.mix,
+            &sc.h,
+            post,
+            &hc.fn_w,
+            &sc.hc_partial,
+            m,
+            cfg.hidden,
+        )?;
+        pass.memory_barrier()?;
+        k::hc_pre2(
+            ctx,
+            pass,
+            &sc.hc_partial,
             &hc.scale,
             &hc.base,
             &sc.h,

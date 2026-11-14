@@ -661,3 +661,74 @@ fn indexer_scores_and_topk_match_cpu() {
         );
     }
 }
+
+#[test]
+fn hc_post_mix_and_pre2_match_cpu() {
+    let ctx = ctx();
+    let mut rng = StdRng::seed_from_u64(64);
+    let cfg = crate::glm53::Config::glm53_flash();
+    let (m, hidden) = (2, cfg.hidden);
+    let h = f32s(&mut rng, m * 4 * hidden, -3.0, 3.0);
+    let block = f32s(&mut rng, m * hidden, -1.0, 1.0);
+    // A previous split: post weights and a comb near a doubly stochastic one.
+    let mut prev = Vec::new();
+    for _ in 0..m {
+        prev.extend(f32s(&mut rng, 4, 0.0, 1.0));
+        prev.extend(f32s(&mut rng, 4, 0.0, 2.0));
+        prev.extend(f32s(&mut rng, 16, 0.0, 0.5));
+    }
+    let fn_raw = random_blocks(&mut rng, GgmlType::Bf16, 24 * 4 * hidden);
+    let fn_w =
+        QWeight::from_bytes(&ctx, &fn_raw, GgmlType::Bf16, 4 * hidden, 24).unwrap();
+    let fn_cpu = mat(GgmlType::Bf16, &fn_raw, 24, 4 * hidden);
+    let scale = [0.8f32, 1.2, 1.7];
+    let base = f32s(&mut rng, 24, -0.5, 0.5);
+    let norm = f32s(&mut rng, hidden, 0.5, 1.5);
+    let th = tensor(&ctx, &h);
+    let (tblock, tprev) = (tensor(&ctx, &block), tensor(&ctx, &prev));
+    let partial = zeros(&ctx, m * hc_mix_groups(hidden) * 25);
+    let (tsc, tba, tno) =
+        (tensor(&ctx, &scale), tensor(&ctx, &base), tensor(&ctx, &norm));
+    let split = zeros(&ctx, m * 24);
+    let xn = zeros(&ctx, m * hidden);
+    run(&ctx, |p| {
+        hc_post_mix(&ctx, p, &th, Some((&tblock, &tprev)), &fn_w, &partial, m, hidden)
+            .unwrap();
+        hc_pre2(
+            &ctx,
+            p,
+            &partial,
+            &tsc,
+            &tba,
+            &th,
+            &tno,
+            &split,
+            &xn,
+            m,
+            hidden,
+            20,
+            1e-6,
+            cfg.rms_eps,
+        )
+        .unwrap();
+    });
+    let gh = th.to_f32().unwrap();
+    let gxn = xn.to_f32().unwrap();
+    let gsplit = split.to_f32().unwrap();
+    for i in 0..m {
+        let hi = &h[i * 4 * hidden..(i + 1) * 4 * hidden];
+        let pi = &prev[i * 24..(i + 1) * 24];
+        let eh = r::hc_post(
+            hi,
+            &block[i * hidden..(i + 1) * hidden],
+            &pi[4..8],
+            &pi[8..24],
+            4,
+        );
+        assert_close(&gh[i * 4 * hidden..(i + 1) * 4 * hidden], &eh, 1e-5, 1e-5);
+        let (exn, epost, ecomb) = r::hc_pre(&cfg, &eh, &fn_cpu, &scale, &base, &norm);
+        assert_close(&gsplit[i * 24 + 4..i * 24 + 8], &epost, 1e-5, 1e-4);
+        assert_close(&gsplit[i * 24 + 8..i * 24 + 24], &ecomb, 1e-5, 1e-4);
+        assert_close(&gxn[i * hidden..(i + 1) * hidden], &exn, 1e-4, 1e-3);
+    }
+}

@@ -382,6 +382,96 @@ pub fn hc_post(
     )
 }
 
+/// Threadgroups (and partial sums per row) of [`hc_post_mix`].
+pub fn hc_mix_groups(hidden: usize) -> usize {
+    hidden / 128
+}
+
+/// HC post of the previous sublayer (when `post` gives its output and the
+/// split holding its post/comb weights; in place on `streams`) fused with
+/// the partial sums of the next control projection `fn_w . streams` and of
+/// `sum(streams^2)`, `[m][groups][25]` into `partial`.
+#[allow(clippy::too_many_arguments)]
+pub fn hc_post_mix(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    streams: &Tensor,
+    post: Option<(&Tensor, &Tensor)>,
+    fn_w: &QWeight,
+    partial: &Tensor,
+    m: usize,
+    hidden: usize,
+) -> Result<()> {
+    check_f32(&[streams, partial])?;
+    ensure!(
+        fn_w.ty == GgmlType::Bf16 && fn_w.rows == 24 && fn_w.cols == 4 * hidden,
+        "HC fn shape"
+    );
+    ensure!(hidden.is_multiple_of(128), "hidden {hidden}");
+    ensure!(partial.numel() >= m * hc_mix_groups(hidden) * 25, "partials");
+    let (block, split) = post.unwrap_or((streams, streams));
+    let pipeline = ctx.pipeline("glm53_hc_post_mix", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[
+            streams.binding(),
+            block.binding(),
+            split.binding(),
+            fn_w.t.binding(),
+            partial.binding(),
+        ],
+        &[&u32_bytes(hidden), &u32_bytes(usize::from(post.is_some()))],
+        Grid::Threadgroups {
+            groups: (hc_mix_groups(hidden), m, 1),
+            threadgroup: (64, 1, 1),
+        },
+    )
+}
+
+/// HC pre from [`hc_post_mix`]'s partial sums: the split into `split`
+/// (pre, post, comb) and `xn = rmsnorm(sum_h pre[h] * streams[h], norm)`.
+#[allow(clippy::too_many_arguments)]
+pub fn hc_pre2(
+    ctx: &MetalContext,
+    pass: &ComputePass<'_>,
+    partial: &Tensor,
+    scale: &Tensor,
+    base: &Tensor,
+    streams: &Tensor,
+    norm: &Tensor,
+    split: &Tensor,
+    xn: &Tensor,
+    m: usize,
+    hidden: usize,
+    iters: usize,
+    hc_eps: f32,
+    rms_eps: f32,
+) -> Result<()> {
+    check_f32(&[partial, scale, base, streams, norm, split, xn])?;
+    ensure!(hidden == 4096, "hc_pre2 is written for hidden 4096, not {hidden}");
+    let pipeline = ctx.pipeline("glm53_hc_pre2", SOURCE, MslVersion::V3_1)?;
+    pass.dispatch_at(
+        &pipeline,
+        &[
+            partial.binding(),
+            scale.binding(),
+            base.binding(),
+            streams.binding(),
+            norm.binding(),
+            split.binding(),
+            xn.binding(),
+        ],
+        &[
+            &u32_bytes(hidden),
+            &u32_bytes(iters),
+            &f32_bytes(hc_eps),
+            &f32_bytes(rms_eps),
+            &u32_bytes(hc_mix_groups(hidden)),
+        ],
+        Grid::Threadgroups { groups: (m, 1, 1), threadgroup: (256, 1, 1) },
+    )
+}
+
 /// The mean of the four streams.
 pub fn hc_mean(
     ctx: &MetalContext,

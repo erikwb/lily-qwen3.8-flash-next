@@ -1068,3 +1068,159 @@ void main() {
     if (tid == 0u) U32(arg(2)).v[i] = 4u * kept + tail;
 }
 #endif
+
+// ---------------------------------------------------------------------------
+// HC post fused with the next control projection's partial sums. Thread
+// owns two hidden positions d of all four streams: when has_post it first
+// applies the post mix of the previous sublayer (H[dst][d] = block[d] *
+// post[dst] + sum_src comb[dst + 4 src] * H[src][d], in place: no other
+// thread reads its d), then adds its eight values' share of the 24 rows of
+// fn . H and of sum(H^2). Each threadgroup (64 threads, 128 positions)
+// writes 25 partial sums; glm53_hc_pre2 reduces them. fn rows are
+// [24][4 * hidden] bf16 over the streams' flat order.
+// Grid (hidden / 128, m), 64 threads. Buffers: 0 H [m][4][hidden], 1 block
+// [m][hidden], 2 split [m][24], 3 fn bf16, 4 partial [m][groups][25].
+// Params: 5 hidden, 6 has_post.
+// ---------------------------------------------------------------------------
+#ifdef KERNEL_glm53_hc_post_mix
+shared float red[2 * 25];
+void main() {
+    const uint hidden = arg_u32(5);
+    const bool has_post = arg_u32(6) != 0u;
+    const uint i = gl_WorkGroupID.y;
+    const uint g = gl_WorkGroupID.x;
+    const uint groups = gl_NumWorkGroups.x;
+    const uint tid = gl_LocalInvocationIndex;
+    const uint d = g * 128u + 2u * tid;
+    const uint64_t Hs = arg(0) + 16u * uint64_t(i) * hidden;
+    vec2 h[4];
+    [[unroll]] for (uint s = 0u; s < 4u; s++) h[s] = vec2(F32(Hs).v[s * hidden + d], F32(Hs).v[s * hidden + d + 1u]);
+    if (has_post) {
+        const uint64_t S = arg(2) + 96u * uint64_t(i);
+        const vec2 b = vec2(F32(arg(1)).v[i * hidden + d], F32(arg(1)).v[i * hidden + d + 1u]);
+        vec2 o[4];
+        [[unroll]] for (uint dst = 0u; dst < 4u; dst++) {
+            vec2 acc = b * F32(S).v[4u + dst];
+            acc += F32(S).v[8u + dst] * h[0];
+            acc += F32(S).v[8u + dst + 4u] * h[1];
+            acc += F32(S).v[8u + dst + 8u] * h[2];
+            acc += F32(S).v[8u + dst + 12u] * h[3];
+            o[dst] = acc;
+        }
+        [[unroll]] for (uint s = 0u; s < 4u; s++) {
+            h[s] = o[s];
+            F32(Hs).v[s * hidden + d] = o[s].x;
+            F32(Hs).v[s * hidden + d + 1u] = o[s].y;
+        }
+    }
+    float ss = 0.0;
+    [[unroll]] for (uint s = 0u; s < 4u; s++) ss += dot(h[s], h[s]);
+    const uint lane = gl_SubgroupInvocationID;
+    const uint sg = gl_SubgroupID;
+    ss = subgroupAdd(ss);
+    if (lane == 0u) red[sg * 25u + 24u] = ss;
+    const uint64_t W = arg(3);
+    const uint row_words = 2u * hidden; // 4 * hidden bf16 = 2 * hidden words
+    for (uint r = 0u; r < 24u; r++) {
+        const uint64_t R = W + 4u * uint64_t(r) * row_words;
+        float acc = 0.0;
+        [[unroll]] for (uint s = 0u; s < 4u; s++) {
+            const uint w = U32(R).v[(s * hidden + d) / 2u];
+            acc += uintBitsToFloat(w << 16u) * h[s].x + uintBitsToFloat(w & 0xffff0000u) * h[s].y;
+        }
+        acc = subgroupAdd(acc);
+        if (lane == 0u) red[sg * 25u + r] = acc;
+    }
+    barrier();
+    if (tid < 25u) {
+        const uint64_t P = arg(4) + 4u * (uint64_t(i) * groups + g) * 25u;
+        F32(P).v[tid] = red[tid] + red[25u + tid];
+    }
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// HC pre from the partial sums of glm53_hc_post_mix: mix = (fn . H) * rs
+// with rs = 1 / sqrt(sum(H^2) / (4 hidden) + eps) (ds4 normalizes H first;
+// the products differ only in rounding), the Sinkhorn split on sixteen
+// lanes (lane j holds comb[j], src j % 4, dst j / 4), the weighted stream
+// sum and its RMSNorm with `norm`. One threadgroup of 256 per row, each
+// thread sixteen positions held in registers.
+// Grid m, 256 threads. Buffers: 0 partial [m][groups][25], 1 scale [3],
+// 2 base [24], 3 H, 4 norm, 5 split out [m][24], 6 xn out [m][hidden].
+// Params: 7 hidden, 8 iters, 9 hc_eps, 10 rms_eps, 11 groups.
+// ---------------------------------------------------------------------------
+#ifdef KERNEL_glm53_hc_pre2
+shared float mix_sh[25];
+shared float sp[24];
+shared float red[8];
+void main() {
+    const uint hidden = arg_u32(7);
+    const uint iters = arg_u32(8);
+    const float eps = arg_f32(9);
+    const float rms_eps = arg_f32(10);
+    const uint groups = arg_u32(11);
+    const uint i = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationIndex;
+    const uint lane = gl_SubgroupInvocationID;
+    if (tid < 25u) {
+        const uint64_t P = arg(0) + 4u * uint64_t(i) * groups * 25u;
+        float acc = 0.0;
+        for (uint g = 0u; g < groups; g++) acc += F32(P).v[g * 25u + tid];
+        mix_sh[tid] = acc;
+    }
+    barrier();
+    if (gl_SubgroupID == 0u) {
+        const float rs = inversesqrt(mix_sh[24] / float(4u * hidden) + rms_eps);
+        const float s0 = F32(arg(1)).v[0], s1 = F32(arg(1)).v[1], s2 = F32(arg(1)).v[2];
+        if (lane < 4u) {
+            sp[lane] = 1.0 / (1.0 + exp(-(mix_sh[lane] * rs * s0 + F32(arg(2)).v[lane]))) + eps;
+            sp[4u + lane] = 2.0 / (1.0 + exp(-(mix_sh[4u + lane] * rs * s1 + F32(arg(2)).v[4u + lane])));
+        }
+        const uint j = lane & 15u;
+        float c = mix_sh[8u + j] * rs * s2 + F32(arg(2)).v[8u + j];
+        // Row softmax over src (lanes j with the same j / 4), plus eps.
+        float mx = max(c, subgroupShuffleXor(c, 1u));
+        mx = max(mx, subgroupShuffleXor(mx, 2u));
+        c = exp(c - mx);
+        float sum = c + subgroupShuffleXor(c, 1u);
+        sum += subgroupShuffleXor(sum, 2u);
+        c = c * (1.0 / sum) + eps;
+        // Column normalization (lanes with the same j % 4), then rows and
+        // columns alternately.
+        for (uint it = 0u; it < iters; it++) {
+            if (it > 0u) {
+                float rsum = c + subgroupShuffleXor(c, 1u);
+                rsum += subgroupShuffleXor(rsum, 2u);
+                c *= 1.0 / (rsum + eps);
+            }
+            float csum = c + subgroupShuffleXor(c, 4u);
+            csum += subgroupShuffleXor(csum, 8u);
+            c *= 1.0 / (csum + eps);
+        }
+        if (lane < 16u) sp[8u + lane] = c;
+    }
+    barrier();
+    if (tid < 24u) F32(arg(5)).v[24u * i + tid] = sp[tid];
+    const uint64_t Hs = arg(3) + 16u * uint64_t(i) * hidden;
+    const float p0 = sp[0], p1 = sp[1], p2 = sp[2], p3 = sp[3];
+    vec4 x[4];
+    float ss = 0.0;
+    [[unroll]] for (uint q = 0u; q < 4u; q++) {
+        const uint d = 16u * tid + 4u * q;
+        x[q] = F32x4(Hs + 4u * d).v[0] * p0 + F32x4(Hs + 4u * (hidden + d)).v[0] * p1 +
+               F32x4(Hs + 4u * (2u * hidden + d)).v[0] * p2 + F32x4(Hs + 4u * (3u * hidden + d)).v[0] * p3;
+        ss += dot(x[q], x[q]);
+    }
+    ss = subgroupAdd(ss);
+    if (lane == 0u) red[gl_SubgroupID] = ss;
+    barrier();
+    const float total = subgroupAdd(lane < 8u ? red[lane] : 0.0);
+    const float scale = inversesqrt(total / float(hidden) + rms_eps);
+    const uint64_t O = arg(6) + 4u * uint64_t(i) * hidden;
+    [[unroll]] for (uint q = 0u; q < 4u; q++) {
+        const uint d = 16u * tid + 4u * q;
+        F32x4(O + 4u * d).v[0] = x[q] * scale * F32x4(arg(4) + 4u * d).v[0];
+    }
+}
+#endif
